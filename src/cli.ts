@@ -1,0 +1,294 @@
+#!/usr/bin/env node
+
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+import {
+  type Attention,
+  Catalog,
+  type DocumentKind,
+} from "./catalog.js";
+
+const DOCUMENT_KINDS = new Set<DocumentKind>([
+  "definition",
+  "brief",
+  "research",
+  "decision",
+  "plan",
+  "contract",
+  "handoff",
+  "progress",
+  "verification",
+  "review",
+  "pr",
+  "showcase",
+  "other",
+]);
+
+const ATTENTION_STATES = new Set<Attention>([
+  "none",
+  "review",
+  "approval",
+  "failure",
+  "changes_requested",
+]);
+
+const usage = `mdmaid-show manages a local catalog of Markdown artifacts.
+
+Usage:
+  mdmaid-show workspace add <root> --id <id> [--name <name>]
+      [--artifact-root <path> ...]
+  mdmaid-show workspace list
+  mdmaid-show register <file.md> --workspace <id>
+      [--task <id>] [--kind <kind>] [--title <title>]
+      [--attention <state>]
+  mdmaid-show list [--workspace <id>] [--task <id>]
+`;
+
+interface Writer {
+  write(value: string): unknown;
+}
+
+export interface RunOptions {
+  statePath?: string;
+}
+
+class UsageError extends Error {}
+
+export async function run(
+  args: string[],
+  stdout: Writer,
+  stderr: Writer,
+  options: RunOptions = {},
+): Promise<number> {
+  try {
+    if (
+      args.length === 0 ||
+      args[0] === "help" ||
+      args[0] === "--help" ||
+      args[0] === "-h"
+    ) {
+      stdout.write(usage);
+      return 0;
+    }
+
+    const statePath = options.statePath ?? defaultStatePath();
+    const catalog = await Catalog.open(statePath);
+    const command = args[0];
+
+    if (command === "workspace") {
+      return await runWorkspace(catalog, args.slice(1), stdout);
+    }
+    if (command === "register") {
+      return await runRegister(catalog, args.slice(1), stdout);
+    }
+    if (command === "list") {
+      return runList(catalog, args.slice(1), stdout);
+    }
+
+    throw new UsageError(`unknown command ${command}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stderr.write(`error: ${message}\n`);
+    if (error instanceof UsageError) {
+      stderr.write(usage);
+      return 2;
+    }
+    return 1;
+  }
+}
+
+async function runWorkspace(
+  catalog: Catalog,
+  args: string[],
+  stdout: Writer,
+): Promise<number> {
+  const action = args[0];
+  if (action === "list") {
+    for (const workspace of catalog.listWorkspaces()) {
+      stdout.write(`${workspace.id}\t${workspace.name}\t${workspace.root}\n`);
+    }
+    return 0;
+  }
+  if (action !== "add") {
+    throw new UsageError("workspace action must be add or list");
+  }
+
+  const parsed = parseArguments(args.slice(1));
+  const root = parsed.positionals[0];
+  if (!root) {
+    throw new UsageError("workspace root is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("workspace add accepts one root");
+  }
+  const id = requiredOption(parsed, "id");
+  const name = firstOption(parsed, "name") ?? id;
+  const artifactRoots = parsed.options.get("artifact-root") ?? [root];
+  rejectUnknownOptions(parsed, new Set(["id", "name", "artifact-root"]));
+
+  const workspace = await catalog.addWorkspace({
+    id,
+    name,
+    root,
+    artifactRoots,
+  });
+  stdout.write(`workspace ${workspace.id} added: ${workspace.root}\n`);
+  return 0;
+}
+
+async function runRegister(
+  catalog: Catalog,
+  args: string[],
+  stdout: Writer,
+): Promise<number> {
+  const parsed = parseArguments(args);
+  const path = parsed.positionals[0];
+  if (!path) {
+    throw new UsageError("document path is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("register accepts one document path");
+  }
+  rejectUnknownOptions(
+    parsed,
+    new Set(["workspace", "task", "kind", "title", "attention"]),
+  );
+
+  const kind = (firstOption(parsed, "kind") ?? "other") as DocumentKind;
+  if (!DOCUMENT_KINDS.has(kind)) {
+    throw new UsageError(`unknown document kind ${kind}`);
+  }
+  const attention = (firstOption(parsed, "attention") ??
+    "none") as Attention;
+  if (!ATTENTION_STATES.has(attention)) {
+    throw new UsageError(`unknown attention state ${attention}`);
+  }
+
+  const taskId = firstOption(parsed, "task");
+  const document = await catalog.registerDocument({
+    workspaceId: requiredOption(parsed, "workspace"),
+    ...(taskId ? { taskId } : {}),
+    kind,
+    title: firstOption(parsed, "title") ?? basename(path, ".md"),
+    path,
+    attention,
+  });
+  stdout.write(`registered ${document.id}: ${document.path}\n`);
+  return 0;
+}
+
+function runList(
+  catalog: Catalog,
+  args: string[],
+  stdout: Writer,
+): number {
+  const parsed = parseArguments(args);
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("list accepts options only");
+  }
+  rejectUnknownOptions(parsed, new Set(["workspace", "task"]));
+  const workspace = firstOption(parsed, "workspace");
+  const task = firstOption(parsed, "task");
+
+  const documents = catalog.listDocuments().filter((document) => {
+    if (workspace && document.workspaceId !== workspace) {
+      return false;
+    }
+    if (task && document.taskId !== task) {
+      return false;
+    }
+    return true;
+  });
+  for (const document of documents) {
+    stdout.write(
+      [
+        document.id,
+        document.workspaceId,
+        document.taskId ?? "-",
+        document.kind,
+        document.attention,
+        document.title,
+        document.path,
+      ].join("\t") + "\n",
+    );
+  }
+  return 0;
+}
+
+interface ParsedArguments {
+  positionals: string[];
+  options: Map<string, string[]>;
+}
+
+function parseArguments(args: string[]): ParsedArguments {
+  const parsed: ParsedArguments = {
+    positionals: [],
+    options: new Map(),
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === undefined) {
+      continue;
+    }
+    if (!value.startsWith("--")) {
+      parsed.positionals.push(value);
+      continue;
+    }
+    const name = value.slice(2);
+    const optionValue = args[index + 1];
+    if (!name || optionValue === undefined || optionValue.startsWith("--")) {
+      throw new UsageError(`option --${name || "unknown"} requires a value`);
+    }
+    const values = parsed.options.get(name) ?? [];
+    values.push(optionValue);
+    parsed.options.set(name, values);
+    index += 1;
+  }
+  return parsed;
+}
+
+function firstOption(
+  parsed: ParsedArguments,
+  name: string,
+): string | undefined {
+  return parsed.options.get(name)?.[0];
+}
+
+function requiredOption(parsed: ParsedArguments, name: string): string {
+  const value = firstOption(parsed, name);
+  if (!value) {
+    throw new UsageError(`--${name} is required`);
+  }
+  return value;
+}
+
+function rejectUnknownOptions(
+  parsed: ParsedArguments,
+  allowed: Set<string>,
+): void {
+  for (const [name, values] of parsed.options) {
+    if (!allowed.has(name)) {
+      throw new UsageError(`unknown option --${name}`);
+    }
+    if (name !== "artifact-root" && values.length > 1) {
+      throw new UsageError(`option --${name} may be used only once`);
+    }
+  }
+}
+
+function defaultStatePath(): string {
+  const stateHome =
+    process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+  return resolve(stateHome, "mdmaid.show", "catalog.json");
+}
+
+const entryPath = process.argv[1];
+if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
+  process.exitCode = await run(
+    process.argv.slice(2),
+    process.stdout,
+    process.stderr,
+  );
+}

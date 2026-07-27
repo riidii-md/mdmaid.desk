@@ -1,0 +1,22 @@
+{
+  "name": "mdmaid.show",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent local presentation workspace for agent-produced Markdown artifacts",
+  "bin": {
+    "mdmaid-show": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/catalog.test.js dist/cli.test.js",
+    "check": "npm run test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "typescript": "^5.8.3"
+  }
+}
