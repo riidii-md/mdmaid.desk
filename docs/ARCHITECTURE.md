@@ -2,9 +2,10 @@
 
 ## Purpose
 
-Mdmaid.show turns durable Markdown files into a persistent local review
-surface. Producers register artifacts; humans discover and read them in a
-browser; workflow systems record any resulting decision separately.
+Mdmaid.desk turns durable Markdown files into a persistent local review
+surface. Producers register artifacts; humans discover and read them in a web
+or terminal workspace; external systems record any resulting decisions
+separately.
 
 ## Project Boundaries
 
@@ -12,18 +13,20 @@ browser; workflow systems record any resulting decision separately.
 mdmaid
   Markdown and Mermaid renderer
 
-mdmaid.show
-  Daemon, catalog, watcher, stable URLs, browser workspace, CLI/API
+mdmaid.desk
+  Daemon, catalog, watcher, stable URLs, web/TUI workspaces, CLI/API
 
 mdmaid.nvim
   Optional Neovim client
 
 agentctl
-  Agent configuration, workflow, task state, routing, artifact events,
-  and approvals
+  Agent and harness configuration only
+
+harnesses and tools
+  Document producers using generic CLI/API or watched artifact roots
 ```
 
-Mdmaid.show must work without Neovim and without an active agent process.
+Mdmaid.desk must work without Neovim, agentctl, or an active agent process.
 
 ## Artifact Lifecycle
 
@@ -38,7 +41,7 @@ stateDiagram-v2
 ```
 
 Generation, registration, presentation, and approval are separate operations.
-Approval is not part of mdmaid.show catalog state.
+Approval is not part of mdmaid.desk catalog state.
 
 ## Current Foundation
 
@@ -71,7 +74,7 @@ The catalog stores metadata only. Markdown remains at its original path.
 Use one user-level daemon with multiple workspaces:
 
 ```text
-~/.local/state/mdmaid.show/
+~/.local/state/mdmaid.desk/
   daemon.json
   catalog.json
   logs/
@@ -80,14 +83,14 @@ Use one user-level daemon with multiple workspaces:
 Target commands:
 
 ```bash
-mdmaid-show daemon ensure
-mdmaid-show daemon status
-mdmaid-show daemon stop
+mdmaid-desk daemon ensure
+mdmaid-desk daemon status
+mdmaid-desk daemon stop
 
-mdmaid-show workspace add /path/to/repository
-mdmaid-show register plan.md
-mdmaid-show open plan.md
-mdmaid-show list --task PROJECT-123
+mdmaid-desk workspace add /path/to/repository
+mdmaid-desk register plan.md
+mdmaid-desk open plan.md
+mdmaid-desk list --task PROJECT-123
 ```
 
 `daemon ensure` is idempotent. The daemon publishes its PID, loopback host,
@@ -118,14 +121,14 @@ unlink  mark missing until reconciliation
 
 Watchers are limited to configured artifact roots and Markdown files.
 
-## Agent Integration
+## Producer Integration
 
-Agentctl emits a provider-neutral event:
+Any harness or tool can emit a producer-neutral registration payload:
 
 ```json
 {
   "schema_version": 1,
-  "event": "artifact.produced",
+  "producer": "codex",
   "task_id": "PROJECT-123",
   "kind": "plan",
   "path": "/absolute/path/to/plan.md",
@@ -133,7 +136,8 @@ Agentctl emits a provider-neutral event:
 }
 ```
 
-An adapter translates the event into registration and optional opening.
+The producer name is opaque metadata. Adding another harness does not require a
+mdmaid.desk release. Registration and opening remain separate operations.
 
 Suggested attention values:
 
@@ -180,7 +184,7 @@ Status: started.
 - ignore policy;
 - watcher recovery after restart.
 
-### 5. Browser Workspace
+### 5. Web and TUI Workspaces
 
 - task and workspace navigation;
 - attention queue;
@@ -190,7 +194,7 @@ Status: started.
 
 ### 6. Clients
 
-- agentctl presentation adapter;
+- generic harness and shell integrations;
 - mdmaid.nvim daemon mode;
 - generic shell integration.
 
@@ -204,4 +208,5 @@ The first coherent release is complete when:
 4. multiple tabs display independent documents;
 5. registration never implies approval;
 6. the daemon cannot read outside registered artifact roots;
-7. agentctl and mdmaid.nvim can both act as clients.
+7. generic harnesses and mdmaid.nvim can act as clients;
+8. the same reading workflow is available in web and TUI clients.

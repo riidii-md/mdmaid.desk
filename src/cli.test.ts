@@ -20,7 +20,7 @@ function output(): {
 }
 
 test("adds a workspace, registers a document, and lists it", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mdmaid-show-cli-"));
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-"));
   const workspace = join(root, "workspace");
   const statePath = join(root, "state", "catalog.json");
   const documentPath = join(workspace, "plan.md");
@@ -83,7 +83,7 @@ test("adds a workspace, registers a document, and lists it", async () => {
 });
 
 test("returns a usage error for incomplete commands", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mdmaid-show-cli-error-"));
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-error-"));
   const stdout = output();
   const stderr = output();
 
@@ -94,4 +94,14 @@ test("returns a usage error for incomplete commands", async () => {
     2,
   );
   assert.match(stderr.text(), /workspace root is required/);
+});
+
+test("uses the mdmaid-desk executable name in help output", async () => {
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(await run(["--help"], stdout, stderr), 0);
+  assert.match(stdout.text(), /mdmaid-desk/);
+  assert.doesNotMatch(stdout.text(), /mdmaid-show/);
+  assert.equal(stderr.text(), "");
 });

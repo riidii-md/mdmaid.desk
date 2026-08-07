@@ -11,7 +11,7 @@ async function fixture(): Promise<{
   statePath: string;
   workspace: string;
 }> {
-  const root = await mkdtemp(join(tmpdir(), "mdmaid-show-"));
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-"));
   const workspace = join(root, "workspace");
   await mkdir(join(workspace, "reports"), { recursive: true });
   const statePath = join(root, "state", "catalog.json");
@@ -76,7 +76,7 @@ test("rejects documents outside registered artifact roots", async () => {
 
 test("rejects symlink escapes from registered artifact roots", async () => {
   const { catalog, workspace } = await fixture();
-  const outsideDir = await mkdtemp(join(tmpdir(), "mdmaid-show-outside-"));
+  const outsideDir = await mkdtemp(join(tmpdir(), "mdmaid-desk-outside-"));
   const outsidePath = join(outsideDir, "secret.md");
   await writeFile(outsidePath, "# Secret\n", "utf8");
   await symlink(outsideDir, join(workspace, "linked"));
@@ -133,7 +133,7 @@ test("rejects non-Markdown and oversized files", async () => {
 });
 
 test("rejects malformed persisted catalog entries", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mdmaid-show-invalid-state-"));
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-invalid-state-"));
   const statePath = join(root, "catalog.json");
   await writeFile(
     statePath,
