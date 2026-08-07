@@ -9,7 +9,8 @@ local CLI/API.
 ## Boundaries
 
 - `mdmaid` owns rendering primitives.
-- `agentctl` owns workflow state, routing, artifact policy, and approvals.
+- `agentctl` is a configurator only.
+- Harnesses and tools produce documents through generic interfaces.
 - `mdmaid.nvim` owns Neovim-specific interaction.
 - Opening or registering a document never grants workflow approval.
 
