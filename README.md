@@ -1,10 +1,10 @@
-# mdmaid.show
+# mdmaid.desk
 
-`mdmaid.show` is a persistent local presentation workspace for Markdown
-artifacts produced by CLI agents, editors, and scripts.
+`mdmaid.desk` is a persistent local document inbox and reading workspace for
+Markdown artifacts produced by harnesses, editors, and scripts.
 
-The repository name is `mdmaid.show`; its initial executable is
-`mdmaid-show`.
+The repository name is `mdmaid.desk`; its initial executable is
+`mdmaid-desk`.
 
 ## Status
 
@@ -24,7 +24,7 @@ URLs, and document library UI are the next milestones.
 
 ## Responsibility
 
-`mdmaid.show` owns:
+`mdmaid.desk` owns:
 
 - the persistent local daemon;
 - workspace and document catalogs;
@@ -43,8 +43,9 @@ It does not own:
 - Markdown rendering internals;
 - editor-specific keymaps.
 
-`mdmaid` remains the rendering engine. `agentctl` emits artifact events and
-approval policy. `mdmaid.nvim` may become an optional client.
+`mdmaid` remains the rendering engine. `agentctl` is a configurator only.
+Harnesses and tools register documents directly through generic CLI/API
+interfaces. `mdmaid.nvim` may become an optional client.
 
 ## Development
 
@@ -95,24 +96,27 @@ node dist/cli.js list --task PROJECT-123
 The default catalog path is:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/mdmaid.show/catalog.json
+${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/catalog.json
 ```
 
 ## Target Interaction
 
 ```mermaid
 flowchart LR
-    A[agentctl] -->|artifact event| S[mdmaid.show]
+    A[Harnesses and tools] -->|register document| S[mdmaid.desk]
+    CFG[agentctl] -.->|optional configuration| A
     N[mdmaid.nvim] -->|register or open| S
     X[Scripts] -->|register| S
-    S --> C[(Catalog)]
+    S --> CAT[(Catalog)]
     S --> M[mdmaid renderer]
-    S --> B[Browser workspace]
-    B --> H[Human]
-    H -->|explicit decision| A
+    S --> W[Web workspace]
+    S --> T[TUI workspace]
+    W --> H[Human]
+    T --> H
+    H -->|reading status and tags| S
 ```
 
-Document registration and browser presentation never imply workflow approval.
+Document registration and presentation never imply workflow approval.
 
 ## Documentation
 
@@ -125,11 +129,11 @@ Document registration and browser presentation never imply workflow approval.
 Current naming:
 
 ```text
-Product/UI:  mdmaid.show
-Repository:  mdmaid.show
-Package:     mdmaid.show
-CLI:         mdmaid-show
+Product/UI:  mdmaid.desk
+Repository:  mdmaid.desk
+Package:     mdmaid.desk
+CLI:         mdmaid-desk
 ```
 
-A future `mdmaid show ...` umbrella command may delegate to this package, but
+A future `mdmaid desk ...` umbrella command may delegate to this package, but
 the repositories and release cycles remain separate.

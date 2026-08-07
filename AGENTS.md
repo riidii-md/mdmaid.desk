@@ -2,9 +2,9 @@
 
 ## Scope
 
-This repository owns the persistent mdmaid.show presentation service:
-catalog, daemon, watcher, stable document routes, browser workspace, and local
-CLI/API.
+This repository owns the persistent mdmaid.desk presentation service:
+catalog, daemon, watcher, stable document routes, web and TUI workspaces, and
+local CLI/API.
 
 ## Boundaries
 
