@@ -1,11 +1,11 @@
 {
-  "name": "mdmaid.show",
+  "name": "mdmaid.desk",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Persistent local presentation workspace for agent-produced Markdown artifacts",
+  "description": "Persistent local document inbox and reading workspace for Markdown artifacts",
   "bin": {
-    "mdmaid-show": "dist/cli.js"
+    "mdmaid-desk": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

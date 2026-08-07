@@ -2,7 +2,7 @@
 
 ## Scope
 
-Mdmaid.show reads local Markdown and serves rendered content to a local browser.
+Mdmaid.desk reads local Markdown and serves rendered content to local clients.
 Both the filesystem boundary and browser boundary are security-sensitive.
 
 ## Current Controls

@@ -34,16 +34,16 @@ const ATTENTION_STATES = new Set<Attention>([
   "changes_requested",
 ]);
 
-const usage = `mdmaid-show manages a local catalog of Markdown artifacts.
+const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 
 Usage:
-  mdmaid-show workspace add <root> --id <id> [--name <name>]
+  mdmaid-desk workspace add <root> --id <id> [--name <name>]
       [--artifact-root <path> ...]
-  mdmaid-show workspace list
-  mdmaid-show register <file.md> --workspace <id>
+  mdmaid-desk workspace list
+  mdmaid-desk register <file.md> --workspace <id>
       [--task <id>] [--kind <kind>] [--title <title>]
       [--attention <state>]
-  mdmaid-show list [--workspace <id>] [--task <id>]
+  mdmaid-desk list [--workspace <id>] [--task <id>]
 `;
 
 interface Writer {
@@ -281,7 +281,7 @@ function rejectUnknownOptions(
 function defaultStatePath(): string {
   const stateHome =
     process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-  return resolve(stateHome, "mdmaid.show", "catalog.json");
+  return resolve(stateHome, "mdmaid.desk", "catalog.json");
 }
 
 const entryPath = process.argv[1];
