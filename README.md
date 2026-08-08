@@ -8,7 +8,7 @@ The repository name is `mdmaid.desk`; its initial executable is
 
 ## Status
 
-The repository contains the shared domain and storage foundation:
+The repository contains the first usable shared-service vertical slice:
 
 - persistent workspace metadata;
 - Markdown document registration;
@@ -20,10 +20,18 @@ The repository contains the shared domain and storage foundation:
 - tags, archive, and missing-document state;
 - transactional SQLite migrations and one-time JSON catalog import;
 - user-only catalog permissions;
-- `workspace add`, `workspace list`, `register`, and `list` commands.
+- authenticated loopback HTTP API and stable document/workspace routes;
+- sanitized `mdmaid` HTML and terminal rendering;
+- responsive browser queue, project/status filters, search, reader, and actions;
+- terminal-native queue, filters, search, reader, and lifecycle actions;
+- Server-Sent Event refreshes for both clients;
+- atomic, user-only daemon discovery state so the TUI reuses a running service;
+- `workspace`, `register`, `list`, `web`, and `tui` commands.
 
-The user-level daemon, directory watcher, rendering integration, stable browser
-URLs, and document library UI are the next milestones.
+Background `daemon ensure/status/stop`, directory watching, stdin-managed
+enqueue, comments, and editing remain planned milestones. `web` currently runs
+the persistent service in the foreground; `tui` attaches to it when present and
+uses an embedded loopback service otherwise.
 
 ## Responsibility
 
@@ -95,6 +103,26 @@ List documents:
 node dist/cli.js list --workspace example
 node dist/cli.js list --task PROJECT-123
 ```
+
+Run the browser workspace as a foreground local service:
+
+```bash
+node dist/cli.js web
+node dist/cli.js web --port 43127
+```
+
+The command prints an authenticated browser URL and publishes a user-only
+`daemon.json` beside the catalog for local clients. Stop it with `Ctrl-C`.
+
+Run the terminal workspace:
+
+```bash
+node dist/cli.js tui
+```
+
+The TUI reuses the running web daemon when available, so both clients share
+catalog events and reading state. Keys are shown in its footer; the main flow
+uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
 
 The default catalog path is:
 

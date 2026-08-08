@@ -28,6 +28,7 @@ async function fixture(): Promise<ServerFixture> {
       "<script>globalThis.pwned = true</script>",
       "",
       "[unsafe](javascript:alert(1))",
+      "\u001b]52;c;terminal-injection\u0007",
       "",
       "```mermaid",
       "graph LR",
@@ -162,6 +163,7 @@ test("renders authorized Markdown for web and terminal targets", async () => {
     assert.match(terminalBody.data.content, /Visible plan/);
     assert.ok(["veol", "beautiful-mermaid", "source"].includes(terminalBody.data.backend));
     assert.ok(Array.isArray(terminalBody.data.warnings));
+    assert.doesNotMatch(terminalBody.data.content, /[\u001b\u0007]/);
   } finally {
     await closeFixture(value);
   }
@@ -268,6 +270,12 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
 
+    const anotherBrowser = await fetch(
+      new URL("/?token=test-token", value.server.url),
+      { redirect: "manual" },
+    );
+    assert.equal(anotherBrowser.status, 303);
+
     const page = await fetch(new URL("/", value.server.url), {
       headers: { cookie: cookie.split(";")[0] ?? "" },
     });
@@ -308,6 +316,64 @@ test("rejects cross-origin cookie mutations and oversized JSON", async () => {
       body: JSON.stringify({ padding: "x".repeat(70_000) }),
     });
     assert.equal(oversized.status, 413);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("serves the browser workspace and local visual assets", async () => {
+  const value = await fixture();
+  try {
+    const bootstrap = await fetch(
+      new URL("/?token=test-token", value.server.url),
+      { redirect: "manual" },
+    );
+    const cookie = (bootstrap.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    const headers = { cookie };
+
+    const page = await fetch(new URL("/", value.server.url), { headers });
+    const html = await page.text();
+    assert.match(html, /data-testid="project-nav"/);
+    assert.match(html, /data-testid="document-queue"/);
+    assert.match(html, /data-testid="document-reader"/);
+    assert.match(html, /\/assets\/app\.css/);
+    assert.match(html, /\/assets\/app\.js/);
+    assert.match(html, /\/assets\/mermaid\.min\.js/);
+
+    const workspacePage = await fetch(new URL("/w/example", value.server.url), {
+      headers,
+    });
+    assert.equal(workspacePage.status, 200);
+    assert.match(await workspacePage.text(), /data-workspace-id="example"/);
+
+    const css = await fetch(new URL("/assets/app.css", value.server.url), {
+      headers,
+    });
+    assert.equal(css.status, 200);
+    assert.match(css.headers.get("content-type") ?? "", /text\/css/);
+    assert.match(await css.text(), /Departure Mono/);
+
+    const app = await fetch(new URL("/assets/app.js", value.server.url), {
+      headers,
+    });
+    assert.equal(app.status, 200);
+    assert.match(app.headers.get("content-type") ?? "", /javascript/);
+    assert.match(await app.text(), /mdmaid\.desk web client/);
+
+    const mermaid = await fetch(
+      new URL("/assets/mermaid.min.js", value.server.url),
+      { headers },
+    );
+    assert.equal(mermaid.status, 200);
+    assert.match(mermaid.headers.get("content-type") ?? "", /javascript/);
+
+    const font = await fetch(
+      new URL("/assets/departure-mono.woff2", value.server.url),
+      { headers },
+    );
+    assert.equal(font.status, 200);
+    assert.equal(font.headers.get("content-type"), "font/woff2");
+    assert.ok((await font.arrayBuffer()).byteLength > 1_000);
   } finally {
     await closeFixture(value);
   }

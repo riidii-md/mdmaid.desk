@@ -4,7 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import type { DeskApiClient } from "./api-client.js";
 import { run } from "./cli.js";
+import {
+  daemonDescriptorPath,
+  readDaemonDescriptor,
+} from "./daemon-state.js";
+import type {
+  DeskServerOptions,
+  RunningDeskServer,
+} from "./server.js";
 
 function output(): {
   write: (value: string) => void;
@@ -110,6 +119,108 @@ test("uses the mdmaid-desk executable name in help output", async () => {
   assert.equal(stderr.text(), "");
 });
 
+test("runs the web service until shutdown and prints its browser URL", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-"));
+  const stdout = output();
+  const stderr = output();
+  let started: DeskServerOptions | undefined;
+  let closed = false;
+
+  const exit = await run(["web", "--port", "43121"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      started = options;
+      return fakeServer(() => {
+        closed = true;
+      });
+    },
+    waitForShutdown: async () => {
+      const descriptor = await readDaemonDescriptor(
+        daemonDescriptorPath(join(root, "catalog.sqlite3")),
+      );
+      assert.equal(descriptor?.port, 43121);
+      assert.equal(descriptor?.token, "test-token");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(started?.host, "127.0.0.1");
+  assert.equal(started?.port, 43121);
+  assert.match(stdout.text(), /mdmaid\.desk web: http:\/\/127\.0\.0\.1:43121\/\?token=/);
+  assert.equal(stderr.text(), "");
+  assert.equal(closed, true);
+  assert.equal(
+    await readDaemonDescriptor(
+      daemonDescriptorPath(join(root, "catalog.sqlite3")),
+    ),
+    undefined,
+  );
+});
+
+test("runs the terminal workspace through the same daemon API", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-tui-"));
+  const stdout = output();
+  const stderr = output();
+  let clientSeen: DeskApiClient | undefined;
+  let closed = false;
+
+  const exit = await run(["tui"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async () => fakeServer(() => {
+      closed = true;
+    }),
+    runTui: async (client) => {
+      clientSeen = client;
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.ok(clientSeen);
+  assert.equal(stderr.text(), "");
+  assert.equal(closed, true);
+});
+
+test("reuses the running daemon for the terminal workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-tui-live-"));
+  const stdout = output();
+  const stderr = output();
+  const sharedClient = new (await import("./api-client.js")).DeskApiClient(
+    "http://127.0.0.1:43121",
+    "shared-token",
+  );
+  let clientSeen: DeskApiClient | undefined;
+
+  const exit = await run(["tui"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemon: async () => sharedClient,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+    runTui: async (client) => {
+      clientSeen = client;
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(clientSeen, sharedClient);
+  assert.equal(stderr.text(), "");
+});
+
+test("validates web command arguments", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-error-"));
+  const stdout = output();
+  const stderr = output();
+  const statePath = join(root, "catalog.sqlite3");
+
+  assert.equal(await run(["web", "extra"], stdout, stderr, { statePath }), 2);
+  assert.equal(
+    await run(["web", "--port", "70000"], stdout, stderr, { statePath }),
+    2,
+  );
+  assert.match(stderr.text(), /web accepts options only/);
+  assert.match(stderr.text(), /port must be an integer between 0 and 65535/);
+});
+
 test("reports usage errors for invalid commands and options", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-usage-"));
   const statePath = join(root, "catalog.sqlite3");
@@ -175,3 +286,16 @@ test("reports usage errors for invalid commands and options", async () => {
     assert.match(stderr.text(), entry.message);
   }
 });
+
+function fakeServer(onClose: () => void): RunningDeskServer {
+  return {
+    host: "127.0.0.1",
+    port: 43121,
+    token: "test-token",
+    url: "http://127.0.0.1:43121",
+    webUrl: "http://127.0.0.1:43121/?token=test-token",
+    close: async () => {
+      onClose();
+    },
+  };
+}

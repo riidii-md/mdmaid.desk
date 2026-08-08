@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -6,6 +7,9 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { renderMarkdown } from "mdmaid";
 import { renderMarkdownToTui } from "mdmaid/tui";
@@ -17,11 +21,22 @@ import {
   type DocumentFilters,
   type RegisterDocumentInput,
 } from "./catalog.js";
+import { WEB_STYLES } from "./web-styles.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
 const SESSION_COOKIE = "mdmaid_desk_session";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
+const WEB_CLIENT_PATH = fileURLToPath(new URL("./web-client.js", import.meta.url));
+const MDMAID_ENTRY = fileURLToPath(import.meta.resolve("mdmaid"));
+const MDMAID_ROOT = resolve(dirname(MDMAID_ENTRY), "../..");
+const MDMAID_REQUIRE = createRequire(MDMAID_ENTRY);
+const MERMAID_PATH = MDMAID_REQUIRE.resolve("mermaid/dist/mermaid.min.js");
+const FONT_PATH = resolve(
+  MDMAID_ROOT,
+  "assets/fonts/DepartureMono-Regular.woff2",
+);
+const FAVICON_PATH = resolve(MDMAID_ROOT, "assets/icons/favicon.svg");
 
 export interface DeskServerOptions {
   catalog: Catalog;
@@ -60,6 +75,35 @@ class HttpError extends Error {
   }
 }
 
+class EventHub {
+  readonly #clients = new Set<ServerResponse>();
+
+  subscribe(request: IncomingMessage, response: ServerResponse): void {
+    response.statusCode = 200;
+    response.setHeader("content-type", "text/event-stream; charset=utf-8");
+    response.setHeader("connection", "keep-alive");
+    response.write("event: ready\ndata: {}\n\n");
+    this.#clients.add(response);
+    request.on("close", () => {
+      this.#clients.delete(response);
+    });
+  }
+
+  publish(type: string, data: object): void {
+    const payload = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const client of this.#clients) {
+      client.write(payload);
+    }
+  }
+
+  close(): void {
+    for (const client of this.#clients) {
+      client.end();
+    }
+    this.#clients.clear();
+  }
+}
+
 export async function startDeskServer(
   options: DeskServerOptions,
 ): Promise<RunningDeskServer> {
@@ -76,17 +120,14 @@ export async function startDeskServer(
     throw new Error("server token must contain at least 8 characters");
   }
 
-  let bootstrapAvailable = true;
+  const events = new EventHub();
   const server = createServer((request, response) => {
     void handleRequest(
       request,
       response,
       options.catalog,
       token,
-      () => bootstrapAvailable,
-      () => {
-        bootstrapAvailable = false;
-      },
+      events,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
@@ -114,7 +155,10 @@ export async function startDeskServer(
     token,
     url,
     webUrl: `${url}/?token=${encodeURIComponent(token)}`,
-    close: () => closeServer(server),
+    close: async () => {
+      events.close();
+      await closeServer(server);
+    },
   };
 }
 
@@ -123,8 +167,7 @@ async function handleRequest(
   response: ServerResponse,
   catalog: Catalog,
   token: string,
-  canBootstrap: () => boolean,
-  consumeBootstrap: () => void,
+  events: EventHub,
 ): Promise<void> {
   applySecurityHeaders(response);
   const baseUrl = `http://${request.headers.host ?? "127.0.0.1"}`;
@@ -142,14 +185,15 @@ async function handleRequest(
 
   if (
     request.method === "GET" &&
-    (url.pathname === "/" || /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname)) &&
+    (url.pathname === "/" ||
+      /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname)) &&
     url.searchParams.has("token")
   ) {
     const candidate = url.searchParams.get("token") ?? "";
-    if (!canBootstrap() || !safeEqual(candidate, token)) {
+    if (!safeEqual(candidate, token)) {
       throw new HttpError(401, "unauthorized", "Authentication required");
     }
-    consumeBootstrap();
     response.statusCode = 303;
     response.setHeader("location", url.pathname);
     response.setHeader(
@@ -168,9 +212,21 @@ async function handleRequest(
 
   if (
     request.method === "GET" &&
-    (url.pathname === "/" || /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname))
+    (url.pathname === "/" ||
+      /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname))
   ) {
     sendHtml(response, 200, workspaceHtml(url.pathname));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/events") {
+    events.subscribe(request, response);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/assets/")) {
+    await serveAsset(response, url.pathname);
     return;
   }
 
@@ -210,6 +266,7 @@ async function handleRequest(
       const document = await catalog.registerDocument(body);
       response.setHeader("location", `/api/v1/documents/${document.id}`);
       sendJson(response, 201, { data: publicDocument(document) });
+      events.publish("catalog", { action: "registered", documentId: document.id });
     } catch (error) {
       if (error instanceof Error) {
         throw new HttpError(
@@ -264,9 +321,9 @@ async function handleRequest(
       data: {
         document: publicDocument(document),
         target,
-        content: rendered.output,
+        content: stripTerminalControls(rendered.output),
         backend: rendered.backend,
-        warnings: rendered.warnings,
+        warnings: rendered.warnings.map(stripTerminalControls),
       },
     });
     return;
@@ -292,7 +349,12 @@ async function handleRequest(
       throw new HttpError(404, "not_found", "Action not found");
     }
     try {
-      sendJson(response, 200, { data: publicDocument(await operation()) });
+      const document = await operation();
+      sendJson(response, 200, { data: publicDocument(document) });
+      events.publish("catalog", {
+        action,
+        documentId: document.id,
+      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -318,6 +380,10 @@ async function handleRequest(
         body.tags,
       );
       sendJson(response, 200, { data: publicDocument(document) });
+      events.publish("catalog", {
+        action: "tags",
+        documentId: document.id,
+      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -523,6 +589,15 @@ function sanitizeRenderedHtml(content: string): string {
   });
 }
 
+function stripTerminalControls(value: string): string {
+  return value
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b[PX^_][\s\S]*?\u001b\\/g, "")
+    .replace(/\u001b./g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -581,7 +656,7 @@ function hasOnlyKeys(
 function applySecurityHeaders(response: ServerResponse): void {
   response.setHeader(
     "content-security-policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   );
   response.setHeader("x-content-type-options", "nosniff");
   response.setHeader("x-frame-options", "DENY");
@@ -605,17 +680,131 @@ function sendHtml(response: ServerResponse, status: number, body: string): void 
   response.end(body);
 }
 
+async function serveAsset(
+  response: ServerResponse,
+  pathname: string,
+): Promise<void> {
+  if (pathname === "/assets/app.css") {
+    sendAsset(response, "text/css; charset=utf-8", WEB_STYLES);
+    return;
+  }
+  if (pathname === "/assets/app.js") {
+    sendAsset(
+      response,
+      "text/javascript; charset=utf-8",
+      await readFile(WEB_CLIENT_PATH),
+    );
+    return;
+  }
+  if (pathname === "/assets/mermaid.min.js") {
+    sendAsset(
+      response,
+      "text/javascript; charset=utf-8",
+      await readFile(MERMAID_PATH),
+    );
+    return;
+  }
+  if (pathname === "/assets/departure-mono.woff2") {
+    sendAsset(response, "font/woff2", await readFile(FONT_PATH));
+    return;
+  }
+  if (pathname === "/assets/favicon.svg") {
+    sendAsset(response, "image/svg+xml", await readFile(FAVICON_PATH));
+    return;
+  }
+  throw new HttpError(404, "not_found", "Asset not found");
+}
+
+function sendAsset(
+  response: ServerResponse,
+  contentType: string,
+  body: string | Buffer,
+): void {
+  response.statusCode = 200;
+  response.setHeader("content-type", contentType);
+  response.setHeader("cache-control", "private, max-age=300");
+  response.end(body);
+}
+
 function workspaceHtml(pathname: string): string {
   const documentId = pathname.startsWith("/d/") ? pathname.slice(3) : "";
+  const workspaceId = pathname.startsWith("/w/") ? pathname.slice(3) : "";
   return `<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>mdmaid.desk</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="preload" href="/assets/departure-mono.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script defer src="/assets/mermaid.min.js"></script>
+    <script type="module" src="/assets/app.js"></script>
   </head>
-  <body data-document-id="${documentId}">
-    <main><h1>mdmaid.desk</h1><p>Loading document workspace…</p></main>
+  <body data-document-id="${documentId}" data-workspace-id="${workspaceId}">
+    <header class="topbar">
+      <div class="brand">
+        <strong>mdmaid.desk</strong>
+        <span>document workspace</span>
+      </div>
+      <div class="top-actions">
+        <span id="live-status" class="live offline">○ connecting</span>
+        <button id="theme-toggle" class="icon-button" type="button" aria-label="Toggle theme">◐</button>
+      </div>
+    </header>
+    <div class="workspace">
+      <aside class="sidebar">
+        <h2>projects</h2>
+        <nav id="project-nav" class="project-nav" data-testid="project-nav"></nav>
+        <div class="shortcut-card">
+          <div><kbd>/</kbd> search</div>
+          <div><kbd>j</kbd> <kbd>k</kbd> scroll</div>
+          <div><kbd>m</kbd> mark read</div>
+          <div><kbd>u</kbd> unread</div>
+          <div><kbd>b</kbd> back</div>
+        </div>
+      </aside>
+      <main class="main">
+        <section id="queue-panel">
+          <div class="queue-header">
+            <div class="queue-title-row">
+              <div>
+                <span class="eyebrow">persistent reading queue</span>
+                <h1>What needs your eyes?</h1>
+              </div>
+              <p>opening means reading · only you mark done</p>
+            </div>
+            <div class="controls">
+              <input id="search" class="search" type="search" placeholder="search title, task, tag, producer…" autocomplete="off">
+              <div class="status-filters" aria-label="Reading status">
+                <button class="status-filter active" type="button" data-status-filter="all">all <span class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="unread">unread <span class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="reading">reading <span class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="done">done <span class="count">0</span></button>
+              </div>
+            </div>
+          </div>
+          <div id="document-queue" class="document-queue" data-testid="document-queue"></div>
+          <div id="queue-empty" class="empty" hidden>No documents match this view.</div>
+        </section>
+        <article id="document-reader" class="reader" data-testid="document-reader" hidden>
+          <div class="reader-toolbar">
+            <button id="reader-back" class="action" type="button">← queue</button>
+            <div class="reader-actions">
+              <button id="mark-read" class="action" type="button">✓ mark read</button>
+              <button id="mark-unread" class="action" type="button">○ unread</button>
+              <button id="archive" class="action" type="button">archive</button>
+            </div>
+          </div>
+          <header class="reader-heading">
+            <span class="eyebrow">document</span>
+            <h1 id="reader-title">Document</h1>
+            <p id="reader-meta"></p>
+          </header>
+          <div id="reader-content" class="reader-content"></div>
+        </article>
+      </main>
+    </div>
   </body>
 </html>`;
 }
