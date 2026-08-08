@@ -67,6 +67,7 @@ Use one user-level daemon with multiple workspaces:
 
 ```text
 ~/.local/state/mdmaid.desk/
+  auth-token
   daemon.json
   catalog.sqlite3
   logs/
@@ -93,6 +94,12 @@ foreground `mdmaid-desk web` command. It atomically publishes a mode-`0600`
 descriptor, and `mdmaid-desk tui` health-checks and reuses that service. The
 background `ensure`, `status`, and `stop` process-management commands are the
 next daemon-lifecycle step.
+
+The optional browser origin `https://mdmaid.desk.localhost/` is terminated by
+a trusted local reverse proxy and forwarded to the loopback daemon. Browser
+origin checks use the explicitly configured origin rather than forwarded
+headers. The daemon keeps a stable random mode-`0600` authentication token so
+browser sessions and local API authentication survive service restarts.
 
 ## Stable Routes
 

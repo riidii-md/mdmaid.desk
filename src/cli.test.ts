@@ -146,6 +146,7 @@ test("runs the web service until shutdown and prints its browser URL", async () 
   assert.equal(exit, 0);
   assert.equal(started?.host, "127.0.0.1");
   assert.equal(started?.port, 43121);
+  assert.match(started?.token ?? "", /^[A-Za-z0-9_-]{43}$/);
   assert.match(stdout.text(), /mdmaid\.desk web: http:\/\/127\.0\.0\.1:43121\/\?token=/);
   assert.equal(stderr.text(), "");
   assert.equal(closed, true);
@@ -155,6 +156,40 @@ test("runs the web service until shutdown and prints its browser URL", async () 
     ),
     undefined,
   );
+});
+
+test("configures the canonical localhost HTTPS proxy origin", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-https-"));
+  const stdout = output();
+  const stderr = output();
+  let started: DeskServerOptions | undefined;
+
+  const exit = await run(
+    ["web", "--public-url", "https://mdmaid.desk.localhost"],
+    stdout,
+    stderr,
+    {
+      statePath: join(root, "catalog.sqlite3"),
+      startServer: async (options) => {
+        started = options;
+        return fakeServer(() => undefined, {
+          webUrl: `https://mdmaid.desk.localhost/?token=${options.token ?? ""}`,
+        });
+      },
+      waitForShutdown: async () => undefined,
+    },
+  );
+
+  assert.equal(exit, 0);
+  assert.equal(started?.host, "127.0.0.1");
+  assert.equal(started?.port, 43127);
+  assert.equal(started?.publicUrl, "https://mdmaid.desk.localhost");
+  assert.match(
+    stdout.text(),
+    /mdmaid\.desk web: https:\/\/mdmaid\.desk\.localhost\/\?token=/,
+  );
+  assert.match(stdout.text(), /proxy target: http:\/\/127\.0\.0\.1:43121/);
+  assert.equal(stderr.text(), "");
 });
 
 test("runs the terminal workspace through the same daemon API", async () => {
@@ -217,8 +252,18 @@ test("validates web command arguments", async () => {
     await run(["web", "--port", "70000"], stdout, stderr, { statePath }),
     2,
   );
+  assert.equal(
+    await run(
+      ["web", "--public-url", "https://example.com"],
+      stdout,
+      stderr,
+      { statePath },
+    ),
+    2,
+  );
   assert.match(stderr.text(), /web accepts options only/);
   assert.match(stderr.text(), /port must be an integer between 0 and 65535/);
+  assert.match(stderr.text(), /public URL must be an HTTPS \.localhost origin/);
 });
 
 test("reports usage errors for invalid commands and options", async () => {
@@ -287,7 +332,10 @@ test("reports usage errors for invalid commands and options", async () => {
   }
 });
 
-function fakeServer(onClose: () => void): RunningDeskServer {
+function fakeServer(
+  onClose: () => void,
+  overrides: Partial<RunningDeskServer> = {},
+): RunningDeskServer {
   return {
     host: "127.0.0.1",
     port: 43121,
@@ -297,5 +345,6 @@ function fakeServer(onClose: () => void): RunningDeskServer {
     close: async () => {
       onClose();
     },
+    ...overrides,
   };
 }

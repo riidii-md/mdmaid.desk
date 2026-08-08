@@ -5,7 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Catalog, type Document } from "./catalog.js";
-import { startDeskServer, type RunningDeskServer } from "./server.js";
+import {
+  startDeskServer,
+  type DeskServerOptions,
+  type RunningDeskServer,
+} from "./server.js";
 
 interface ServerFixture {
   catalog: Catalog;
@@ -15,7 +19,9 @@ interface ServerFixture {
   workspace: string;
 }
 
-async function fixture(): Promise<ServerFixture> {
+async function fixture(
+  serverOptions: Omit<DeskServerOptions, "catalog"> = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-server-"));
   const workspace = join(root, "workspace");
   const documentPath = join(workspace, "plan.md");
@@ -63,6 +69,7 @@ async function fixture(): Promise<ServerFixture> {
     host: "127.0.0.1",
     port: 0,
     token: "test-token",
+    ...serverOptions,
   });
   return { catalog, document, root, server, workspace };
 }
@@ -269,6 +276,7 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(cookie, /mdmaid_desk_session=/);
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
+    assert.doesNotMatch(cookie, /Secure/);
 
     const anotherBrowser = await fetch(
       new URL("/?token=test-token", value.server.url),
@@ -290,6 +298,79 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     );
     assert.equal(route.status, 200);
     assert.match(await route.text(), new RegExp(value.document.id));
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("uses the configured localhost HTTPS origin for browser security", async () => {
+  const value = await fixture({
+    publicUrl: "https://mdmaid.desk.localhost",
+  });
+  try {
+    assert.equal(
+      value.server.webUrl,
+      "https://mdmaid.desk.localhost/?token=test-token",
+    );
+
+    const bootstrap = await fetch(
+      new URL("/?token=test-token", value.server.url),
+      { redirect: "manual" },
+    );
+    const cookie = bootstrap.headers.get("set-cookie") ?? "";
+    assert.equal(bootstrap.status, 303);
+    assert.match(cookie, /Secure/);
+    assert.equal(
+      bootstrap.headers.get("strict-transport-security"),
+      "max-age=31536000",
+    );
+
+    const accepted = await fetch(
+      new URL(`/api/v1/documents/${value.document.id}/read`, value.server.url),
+      {
+        method: "POST",
+        headers: {
+          cookie: cookie.split(";")[0] ?? "",
+          origin: "https://mdmaid.desk.localhost",
+        },
+      },
+    );
+    assert.equal(accepted.status, 200);
+
+    const rejected = await fetch(
+      new URL(`/api/v1/documents/${value.document.id}/unread`, value.server.url),
+      {
+        method: "POST",
+        headers: {
+          cookie: cookie.split(";")[0] ?? "",
+          origin: value.server.url,
+        },
+      },
+    );
+    assert.equal(rejected.status, 403);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("rejects unsafe public web origins", async () => {
+  const value = await fixture();
+  try {
+    for (const publicUrl of [
+      "http://mdmaid.desk.localhost",
+      "https://example.com",
+      "https://mdmaid.desk.localhost/path",
+      "https://user:password@mdmaid.desk.localhost",
+    ]) {
+      await assert.rejects(
+        startDeskServer({
+          catalog: value.catalog,
+          publicUrl,
+          token: "another-test-token",
+        }),
+        /public URL must be an HTTPS \.localhost origin/,
+      );
+    }
   } finally {
     await closeFixture(value);
   }

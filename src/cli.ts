@@ -18,10 +18,12 @@ import {
   writeDaemonDescriptor,
 } from "./daemon-state.js";
 import {
+  normalizePublicUrl,
   startDeskServer,
   type DeskServerOptions,
   type RunningDeskServer,
 } from "./server.js";
+import { readOrCreateAuthToken } from "./auth-state.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
@@ -58,7 +60,7 @@ Usage:
       [--task <id>] [--kind <kind>] [--title <title>]
       [--attention <state>]
   mdmaid-desk list [--workspace <id>] [--task <id>]
-  mdmaid-desk web [--port <port>]
+  mdmaid-desk web [--port <port>] [--public-url <https://name.localhost>]
   mdmaid-desk tui
 `;
 
@@ -140,15 +142,28 @@ async function runWeb(
   if (parsed.positionals.length > 0) {
     throw new UsageError("web accepts options only");
   }
-  rejectUnknownOptions(parsed, new Set(["port"]));
-  const port = parsePort(firstOption(parsed, "port") ?? "0");
+  rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
+  const publicUrl = parsePublicUrl(firstOption(parsed, "public-url"));
+  const port = parsePort(
+    firstOption(parsed, "port") ?? (publicUrl ? "43127" : "0"),
+  );
+  const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
-  const server = await startServer({ catalog, host: "127.0.0.1", port });
+  const server = await startServer({
+    catalog,
+    host: "127.0.0.1",
+    port,
+    token,
+    ...(publicUrl ? { publicUrl } : {}),
+  });
   const descriptor = descriptorForServer(server);
   const descriptorPath = daemonDescriptorPath(statePath);
   try {
     await writeDaemonDescriptor(descriptorPath, descriptor);
     stdout.write(`mdmaid.desk web: ${server.webUrl}\n`);
+    if (publicUrl) {
+      stdout.write(`proxy target: ${server.url}\n`);
+    }
     stdout.write("Press Ctrl-C to stop the local service.\n");
     await (options.waitForShutdown ?? waitForShutdown)(server);
   } finally {
@@ -199,6 +214,19 @@ function parsePort(value: string): number {
     throw new UsageError("port must be an integer between 0 and 65535");
   }
   return port;
+}
+
+function parsePublicUrl(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  try {
+    return normalizePublicUrl(value);
+  } catch (error) {
+    throw new UsageError(
+      error instanceof Error ? error.message : "invalid public URL",
+    );
+  }
 }
 
 function waitForShutdown(_server: RunningDeskServer): Promise<void> {
