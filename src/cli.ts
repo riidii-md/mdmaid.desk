@@ -75,19 +75,23 @@ export async function run(
 
     const statePath = options.statePath ?? defaultStatePath();
     const catalog = await Catalog.open(statePath);
-    const command = args[0];
+    try {
+      const command = args[0];
 
-    if (command === "workspace") {
-      return await runWorkspace(catalog, args.slice(1), stdout);
-    }
-    if (command === "register") {
-      return await runRegister(catalog, args.slice(1), stdout);
-    }
-    if (command === "list") {
-      return runList(catalog, args.slice(1), stdout);
-    }
+      if (command === "workspace") {
+        return await runWorkspace(catalog, args.slice(1), stdout);
+      }
+      if (command === "register") {
+        return await runRegister(catalog, args.slice(1), stdout);
+      }
+      if (command === "list") {
+        return runList(catalog, args.slice(1), stdout);
+      }
 
-    throw new UsageError(`unknown command ${command}`);
+      throw new UsageError(`unknown command ${command}`);
+    } finally {
+      catalog.close();
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     stderr.write(`error: ${message}\n`);
@@ -281,7 +285,7 @@ function rejectUnknownOptions(
 function defaultStatePath(): string {
   const stateHome =
     process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-  return resolve(stateHome, "mdmaid.desk", "catalog.json");
+  return resolve(stateHome, "mdmaid.desk", "catalog.sqlite3");
 }
 
 const entryPath = process.argv[1];
