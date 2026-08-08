@@ -45,29 +45,21 @@ Approval is not part of mdmaid.desk catalog state.
 
 ## Current Foundation
 
-The initial catalog is a single-writer JSON state file.
+The catalog uses a versioned SQLite database behind a storage interface.
+Workspaces authorize canonical artifact roots. Documents retain stable IDs,
+content hashes, revisions, reading progress, tags, archive state, and missing
+state. Reading status is derived from progress on the current revision:
 
-```yaml
-schemaVersion: 1
-workspaces:
-  - id: example
-    name: Example
-    root: /canonical/repository/path
-    artifactRoots:
-      - /canonical/repository/path/docs
-documents:
-  - id: doc-content-derived-id
-    workspaceId: example
-    taskId: PROJECT-123
-    kind: plan
-    title: Implementation plan
-    path: /canonical/repository/path/docs/plan.md
-    attention: approval
-    createdAt: 2026-07-27T09:00:00Z
-    updatedAt: 2026-07-27T09:10:00Z
+```text
+completedRevision == revision  -> Done
+openedRevision == revision     -> Reading
+otherwise                      -> Unread
 ```
 
-The catalog stores metadata only. Markdown remains at its original path.
+Changing document content increments its revision and makes it Unread.
+Metadata-only updates preserve progress. Existing version 1 JSON catalogs are
+imported in one transaction and retained as `catalog.json.migrated`.
+Markdown content remains at its authorized original path.
 
 ## Target Daemon
 
@@ -76,7 +68,7 @@ Use one user-level daemon with multiple workspaces:
 ```text
 ~/.local/state/mdmaid.desk/
   daemon.json
-  catalog.json
+  catalog.sqlite3
   logs/
 ```
 
@@ -153,13 +145,16 @@ changes_requested
 
 ### 1. Catalog Foundation
 
-Status: started.
+Status: complete.
 
 - workspace registration;
 - document registration;
 - persistence;
 - path containment;
 - idempotency;
+- revision-aware reading progress;
+- tags, filters, archive, and missing state;
+- transactional SQLite schema and JSON migration;
 - CLI list operations.
 
 ### 2. Daemon Lifecycle

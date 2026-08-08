@@ -45,6 +45,8 @@ Terminal rendering must land in `mdmaid` before the terminal document pane is
 implemented here. See
 [mdmaid PR #4](https://github.com/OleksandrBesan/mdmaid/pull/4).
 
+Status: landed upstream.
+
 The expected renderer order is:
 
 1. Veol `--plain` when the optional binary is available.
@@ -269,6 +271,8 @@ added later after web and TUI behavior is stable.
 - make Veol optional and source fallback mandatory.
 
 ### 2. Shared domain and storage
+
+Status: complete.
 
 - add tests for revision-derived Unread/Reading/Done;
 - introduce a storage interface and SQLite migrations;

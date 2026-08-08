@@ -8,7 +8,7 @@ The repository name is `mdmaid.desk`; its initial executable is
 
 ## Status
 
-The repository contains the first catalog foundation:
+The repository contains the shared domain and storage foundation:
 
 - persistent workspace metadata;
 - Markdown document registration;
@@ -16,7 +16,10 @@ The repository contains the first catalog foundation:
 - workspace and artifact-root containment;
 - symlink-escape protection;
 - document size limits;
-- atomic catalog writes with user-only permissions;
+- revision-aware Unread, Reading, and Done state;
+- tags, archive, and missing-document state;
+- transactional SQLite migrations and one-time JSON catalog import;
+- user-only catalog permissions;
 - `workspace add`, `workspace list`, `register`, and `list` commands.
 
 The user-level daemon, directory watcher, rendering integration, stable browser
@@ -96,7 +99,7 @@ node dist/cli.js list --task PROJECT-123
 The default catalog path is:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/catalog.json
+${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/catalog.sqlite3
 ```
 
 ## Target Interaction
