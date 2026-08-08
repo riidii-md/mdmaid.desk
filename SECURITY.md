@@ -21,10 +21,11 @@ Both the filesystem boundary and browser boundary are security-sensitive.
 - protected APIs require a random bearer token or HTTP-only same-site browser
   cookie;
 - persistent authentication and daemon discovery files use mode `0600`;
-- an optional public browser URL must be an HTTPS `.localhost` origin;
-- HTTPS browser cookies are `Secure` and mutation requests require the exact
-  configured origin;
-- reverse-proxy forwarding headers are not part of the trust boundary;
+- browser URLs must use an HTTP or HTTPS `.localhost` origin;
+- browser mutation requests require the exact configured origin;
+- HTTPS browser cookies are additionally marked `Secure` and responses include
+  HSTS;
+- forwarding headers are not part of the trust boundary;
 - rendered HTML is sanitized and served with a restrictive CSP.
 
 ## Required Before Daemon Release

@@ -26,7 +26,7 @@ The repository contains the first usable shared-service vertical slice:
 - terminal-native queue, filters, search, reader, and lifecycle actions;
 - Server-Sent Event refreshes for both clients;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
-- optional secure `https://mdmaid.desk.localhost/` browser origin;
+- memorable `http://mdmaid.desk.localhost:43127/` browser origin;
 - `workspace`, `register`, `list`, `web`, and `tui` commands.
 
 Background `daemon ensure/status/stop`, directory watching, stdin-managed
@@ -109,30 +109,27 @@ Run the browser workspace as a foreground local service:
 
 ```bash
 node dist/cli.js web
-node dist/cli.js web --port 43127
 ```
 
-The command prints an authenticated browser URL and publishes a user-only
-`daemon.json` beside the catalog for local clients. Stop it with `Ctrl-C`.
+The command binds only to loopback on the stable port `43127` and prints an
+authenticated URL such as:
 
-For a memorable local HTTPS URL, put a trusted local reverse proxy in front of
-the loopback service. The included Caddy example maps the canonical
-`https://mdmaid.desk.localhost/` origin to port `43127`:
-
-```bash
-caddy start --config examples/Caddyfile
-node dist/cli.js web --public-url https://mdmaid.desk.localhost
+```text
+http://mdmaid.desk.localhost:43127/?token=...
 ```
 
-Trust Caddy's local certificate authority once with `caddy trust`, or install
-the same Caddyfile in a user service. The `.localhost` name resolves locally
-without an `/etc/hosts` entry. The web command validates the public origin,
-uses secure cookies and exact-origin mutation checks, and prints the one-time
-authenticated URL to open. Its persistent random authentication token is kept
-as a user-only `auth-token` file beside the catalog, so existing browser
-sessions survive service restarts.
+No proxy, certificate, DNS, or `/etc/hosts` setup is required. After the first
+authenticated open, the browser redirects to the clean URL, which can be
+bookmarked. The service publishes a user-only `daemon.json` for local clients
+and keeps its persistent random authentication token in a user-only
+`auth-token` file, so browser sessions survive service restarts. Stop the
+foreground service with `Ctrl-C`.
 
-See [Local HTTPS](docs/LOCAL_HTTPS.md) for the proxy boundary and setup details.
+Use `--port` to select another loopback port. An advanced `--public-url` option
+accepts HTTP or HTTPS `.localhost` origins; a direct HTTP origin must use the
+same port as the service.
+
+See [Local browser URL](docs/LOCAL_WEB.md) for details.
 
 Run the terminal workspace:
 

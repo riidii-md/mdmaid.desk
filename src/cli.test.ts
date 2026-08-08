@@ -130,9 +130,14 @@ test("runs the web service until shutdown and prints its browser URL", async () 
     statePath: join(root, "catalog.sqlite3"),
     startServer: async (options) => {
       started = options;
-      return fakeServer(() => {
-        closed = true;
-      });
+      return fakeServer(
+        () => {
+          closed = true;
+        },
+        {
+          webUrl: `${options.publicUrl}/?token=test-token`,
+        },
+      );
     },
     waitForShutdown: async () => {
       const descriptor = await readDaemonDescriptor(
@@ -146,8 +151,12 @@ test("runs the web service until shutdown and prints its browser URL", async () 
   assert.equal(exit, 0);
   assert.equal(started?.host, "127.0.0.1");
   assert.equal(started?.port, 43121);
+  assert.equal(started?.publicUrl, "http://mdmaid.desk.localhost:43121");
   assert.match(started?.token ?? "", /^[A-Za-z0-9_-]{43}$/);
-  assert.match(stdout.text(), /mdmaid\.desk web: http:\/\/127\.0\.0\.1:43121\/\?token=/);
+  assert.match(
+    stdout.text(),
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43121\/\?token=/,
+  );
   assert.equal(stderr.text(), "");
   assert.equal(closed, true);
   assert.equal(
@@ -158,37 +167,36 @@ test("runs the web service until shutdown and prints its browser URL", async () 
   );
 });
 
-test("configures the canonical localhost HTTPS proxy origin", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-https-"));
+test("uses the canonical direct localhost HTTP origin by default", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-http-"));
   const stdout = output();
   const stderr = output();
   let started: DeskServerOptions | undefined;
 
-  const exit = await run(
-    ["web", "--public-url", "https://mdmaid.desk.localhost"],
-    stdout,
-    stderr,
-    {
-      statePath: join(root, "catalog.sqlite3"),
-      startServer: async (options) => {
-        started = options;
-        return fakeServer(() => undefined, {
-          webUrl: `https://mdmaid.desk.localhost/?token=${options.token ?? ""}`,
-        });
-      },
-      waitForShutdown: async () => undefined,
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      started = options;
+      return fakeServer(() => undefined, {
+        port: options.port ?? 0,
+        webUrl: `${options.publicUrl}/?token=${options.token ?? ""}`,
+      });
     },
-  );
+    waitForShutdown: async () => undefined,
+  });
 
   assert.equal(exit, 0);
   assert.equal(started?.host, "127.0.0.1");
   assert.equal(started?.port, 43127);
-  assert.equal(started?.publicUrl, "https://mdmaid.desk.localhost");
+  assert.equal(
+    started?.publicUrl,
+    "http://mdmaid.desk.localhost:43127",
+  );
   assert.match(
     stdout.text(),
-    /mdmaid\.desk web: https:\/\/mdmaid\.desk\.localhost\/\?token=/,
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
   );
-  assert.match(stdout.text(), /proxy target: http:\/\/127\.0\.0\.1:43121/);
+  assert.doesNotMatch(stdout.text(), /proxy target/);
   assert.equal(stderr.text(), "");
 });
 
@@ -254,7 +262,22 @@ test("validates web command arguments", async () => {
   );
   assert.equal(
     await run(
-      ["web", "--public-url", "https://example.com"],
+      ["web", "--public-url", "http://example.com"],
+      stdout,
+      stderr,
+      { statePath },
+    ),
+    2,
+  );
+  assert.equal(
+    await run(
+      [
+        "web",
+        "--port",
+        "43127",
+        "--public-url",
+        "http://mdmaid.desk.localhost:43128",
+      ],
       stdout,
       stderr,
       { statePath },
@@ -263,7 +286,11 @@ test("validates web command arguments", async () => {
   );
   assert.match(stderr.text(), /web accepts options only/);
   assert.match(stderr.text(), /port must be an integer between 0 and 65535/);
-  assert.match(stderr.text(), /public URL must be an HTTPS \.localhost origin/);
+  assert.match(
+    stderr.text(),
+    /public URL must be an HTTP or HTTPS \.localhost origin/,
+  );
+  assert.match(stderr.text(), /HTTP public URL port must match server port/);
 });
 
 test("reports usage errors for invalid commands and options", async () => {
