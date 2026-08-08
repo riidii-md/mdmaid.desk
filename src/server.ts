@@ -42,6 +42,7 @@ export interface DeskServerOptions {
   catalog: Catalog;
   host?: string;
   port?: number;
+  publicUrl?: string;
   token?: string;
 }
 
@@ -109,6 +110,10 @@ export async function startDeskServer(
 ): Promise<RunningDeskServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 0;
+  const publicOrigin =
+    options.publicUrl === undefined
+      ? undefined
+      : normalizePublicUrl(options.publicUrl);
   if (!LOOPBACK_HOSTS.has(host)) {
     throw new Error("mdmaid.desk server must bind to a loopback host");
   }
@@ -128,6 +133,7 @@ export async function startDeskServer(
       options.catalog,
       token,
       events,
+      publicOrigin,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
@@ -154,7 +160,7 @@ export async function startDeskServer(
     port: address.port,
     token,
     url,
-    webUrl: `${url}/?token=${encodeURIComponent(token)}`,
+    webUrl: `${publicOrigin ?? url}/?token=${encodeURIComponent(token)}`,
     close: async () => {
       events.close();
       await closeServer(server);
@@ -168,9 +174,11 @@ async function handleRequest(
   catalog: Catalog,
   token: string,
   events: EventHub,
+  publicOrigin: string | undefined,
 ): Promise<void> {
-  applySecurityHeaders(response);
-  const baseUrl = `http://${request.headers.host ?? "127.0.0.1"}`;
+  applySecurityHeaders(response, publicOrigin !== undefined);
+  const baseUrl =
+    publicOrigin ?? `http://${request.headers.host ?? "127.0.0.1"}`;
   const url = new URL(request.url ?? "/", baseUrl);
 
   if (
@@ -198,7 +206,7 @@ async function handleRequest(
     response.setHeader("location", url.pathname);
     response.setHeader(
       "set-cookie",
-      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`,
+      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${publicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=86400`,
     );
     response.end();
     return;
@@ -391,6 +399,27 @@ async function handleRequest(
   }
 
   throw new HttpError(404, "not_found", "Route not found");
+}
+
+export function normalizePublicUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("public URL must be an HTTPS .localhost origin");
+  }
+  if (
+    url.protocol !== "https:" ||
+    (url.hostname !== "localhost" && !url.hostname.endsWith(".localhost")) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error("public URL must be an HTTPS .localhost origin");
+  }
+  return url.origin;
 }
 
 function authenticate(
@@ -653,7 +682,10 @@ function hasOnlyKeys(
   return Object.keys(value).every((key) => allowedSet.has(key));
 }
 
-function applySecurityHeaders(response: ServerResponse): void {
+function applySecurityHeaders(
+  response: ServerResponse,
+  securePublicOrigin: boolean,
+): void {
   response.setHeader(
     "content-security-policy",
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
@@ -662,6 +694,9 @@ function applySecurityHeaders(response: ServerResponse): void {
   response.setHeader("x-frame-options", "DENY");
   response.setHeader("referrer-policy", "no-referrer");
   response.setHeader("cache-control", "no-store");
+  if (securePublicOrigin) {
+    response.setHeader("strict-transport-security", "max-age=31536000");
+  }
 }
 
 function sendJson(

@@ -26,6 +26,7 @@ The repository contains the first usable shared-service vertical slice:
 - terminal-native queue, filters, search, reader, and lifecycle actions;
 - Server-Sent Event refreshes for both clients;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
+- optional secure `https://mdmaid.desk.localhost/` browser origin;
 - `workspace`, `register`, `list`, `web`, and `tui` commands.
 
 Background `daemon ensure/status/stop`, directory watching, stdin-managed
@@ -114,6 +115,25 @@ node dist/cli.js web --port 43127
 The command prints an authenticated browser URL and publishes a user-only
 `daemon.json` beside the catalog for local clients. Stop it with `Ctrl-C`.
 
+For a memorable local HTTPS URL, put a trusted local reverse proxy in front of
+the loopback service. The included Caddy example maps the canonical
+`https://mdmaid.desk.localhost/` origin to port `43127`:
+
+```bash
+caddy start --config examples/Caddyfile
+node dist/cli.js web --public-url https://mdmaid.desk.localhost
+```
+
+Trust Caddy's local certificate authority once with `caddy trust`, or install
+the same Caddyfile in a user service. The `.localhost` name resolves locally
+without an `/etc/hosts` entry. The web command validates the public origin,
+uses secure cookies and exact-origin mutation checks, and prints the one-time
+authenticated URL to open. Its persistent random authentication token is kept
+as a user-only `auth-token` file beside the catalog, so existing browser
+sessions survive service restarts.
+
+See [Local HTTPS](docs/LOCAL_HTTPS.md) for the proxy boundary and setup details.
+
 Run the terminal workspace:
 
 ```bash
@@ -124,10 +144,13 @@ The TUI reuses the running web daemon when available, so both clients share
 catalog events and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
 
-The default catalog path is:
+The default state directory is:
 
 ```text
-${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/catalog.sqlite3
+${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
+  auth-token
+  catalog.sqlite3
+  daemon.json  # present while the web service is running
 ```
 
 ## Target Interaction

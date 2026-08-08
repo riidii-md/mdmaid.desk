@@ -17,18 +17,21 @@ Both the filesystem boundary and browser boundary are security-sensitive.
 - catalog writes are atomic;
 - new catalog files use mode `0600`;
 - new catalog directories use mode `0700`.
+- the server binds only to loopback addresses;
+- protected APIs require a random bearer token or HTTP-only same-site browser
+  cookie;
+- persistent authentication and daemon discovery files use mode `0600`;
+- an optional public browser URL must be an HTTPS `.localhost` origin;
+- HTTPS browser cookies are `Secure` and mutation requests require the exact
+  configured origin;
+- reverse-proxy forwarding headers are not part of the trust boundary;
+- rendered HTML is sanitized and served with a restrictive CSP.
 
 ## Required Before Daemon Release
 
-- bind to `127.0.0.1` by default;
-- authenticate mutation requests using a local random token or Unix socket;
-- reject unexpected browser origins;
 - do not enable permissive CORS;
-- apply API body and field limits;
-- sanitize agent-generated raw HTML;
 - define a strict Mermaid security profile;
-- use a restrictive Content Security Policy;
-- avoid exposing absolute paths in browser responses;
+- avoid exposing absolute paths in any future browser responses;
 - reject special files and path changes between validation and read;
 - add catalog locking or enforce one daemon writer;
 - test stale daemon and state-file recovery.
