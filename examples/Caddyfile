@@ -1,4 +1,0 @@
-mdmaid.desk.localhost {
-	tls internal
-	reverse_proxy 127.0.0.1:43127
-}

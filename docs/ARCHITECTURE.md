@@ -95,11 +95,12 @@ descriptor, and `mdmaid-desk tui` health-checks and reuses that service. The
 background `ensure`, `status`, and `stop` process-management commands are the
 next daemon-lifecycle step.
 
-The optional browser origin `https://mdmaid.desk.localhost/` is terminated by
-a trusted local reverse proxy and forwarded to the loopback daemon. Browser
-origin checks use the explicitly configured origin rather than forwarded
-headers. The daemon keeps a stable random mode-`0600` authentication token so
-browser sessions and local API authentication survive service restarts.
+The foreground browser service uses the stable direct origin
+`http://mdmaid.desk.localhost:43127/`. The special-use `.localhost` name maps
+back to loopback, so it needs no DNS, hosts-file, proxy, or certificate setup.
+Browser origin checks use that explicit origin rather than forwarding headers.
+The daemon keeps a stable random mode-`0600` authentication token so browser
+sessions and local API authentication survive service restarts.
 
 ## Stable Routes
 

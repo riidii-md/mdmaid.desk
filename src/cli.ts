@@ -60,7 +60,8 @@ Usage:
       [--task <id>] [--kind <kind>] [--title <title>]
       [--attention <state>]
   mdmaid-desk list [--workspace <id>] [--task <id>]
-  mdmaid-desk web [--port <port>] [--public-url <https://name.localhost>]
+  mdmaid-desk web [--port <port>]
+      [--public-url <http[s]://name.localhost[:port]>]
   mdmaid-desk tui
 `;
 
@@ -143,10 +144,16 @@ async function runWeb(
     throw new UsageError("web accepts options only");
   }
   rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
-  const publicUrl = parsePublicUrl(firstOption(parsed, "public-url"));
-  const port = parsePort(
-    firstOption(parsed, "port") ?? (publicUrl ? "43127" : "0"),
+  const configuredPublicUrl = parsePublicUrl(
+    firstOption(parsed, "public-url"),
   );
+  const configuredPort = firstOption(parsed, "port");
+  const port = parsePort(
+    configuredPort ?? inferDirectHttpPort(configuredPublicUrl) ?? "43127",
+  );
+  const publicUrl =
+    configuredPublicUrl ?? `http://mdmaid.desk.localhost:${port}`;
+  validateDirectHttpPort(publicUrl, port);
   const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
   const server = await startServer({
@@ -161,7 +168,7 @@ async function runWeb(
   try {
     await writeDaemonDescriptor(descriptorPath, descriptor);
     stdout.write(`mdmaid.desk web: ${server.webUrl}\n`);
-    if (publicUrl) {
+    if (publicUrl.startsWith("https://")) {
       stdout.write(`proxy target: ${server.url}\n`);
     }
     stdout.write("Press Ctrl-C to stop the local service.\n");
@@ -226,6 +233,23 @@ function parsePublicUrl(value: string | undefined): string | undefined {
     throw new UsageError(
       error instanceof Error ? error.message : "invalid public URL",
     );
+  }
+}
+
+function inferDirectHttpPort(publicUrl: string | undefined): string | undefined {
+  if (!publicUrl?.startsWith("http://")) {
+    return undefined;
+  }
+  return new URL(publicUrl).port || "80";
+}
+
+function validateDirectHttpPort(publicUrl: string, port: number): void {
+  if (!publicUrl.startsWith("http://")) {
+    return;
+  }
+  const publicPort = Number(new URL(publicUrl).port || "80");
+  if (publicPort !== port) {
+    throw new UsageError("HTTP public URL port must match server port");
   }
 }
 

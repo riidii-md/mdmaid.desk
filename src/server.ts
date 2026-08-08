@@ -114,6 +114,7 @@ export async function startDeskServer(
     options.publicUrl === undefined
       ? undefined
       : normalizePublicUrl(options.publicUrl);
+  const securePublicOrigin = publicOrigin?.startsWith("https://") ?? false;
   if (!LOOPBACK_HOSTS.has(host)) {
     throw new Error("mdmaid.desk server must bind to a loopback host");
   }
@@ -134,6 +135,7 @@ export async function startDeskServer(
       token,
       events,
       publicOrigin,
+      securePublicOrigin,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
@@ -175,8 +177,9 @@ async function handleRequest(
   token: string,
   events: EventHub,
   publicOrigin: string | undefined,
+  securePublicOrigin: boolean,
 ): Promise<void> {
-  applySecurityHeaders(response, publicOrigin !== undefined);
+  applySecurityHeaders(response, securePublicOrigin);
   const baseUrl =
     publicOrigin ?? `http://${request.headers.host ?? "127.0.0.1"}`;
   const url = new URL(request.url ?? "/", baseUrl);
@@ -206,7 +209,7 @@ async function handleRequest(
     response.setHeader("location", url.pathname);
     response.setHeader(
       "set-cookie",
-      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${publicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=86400`,
+      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=86400`,
     );
     response.end();
     return;
@@ -406,10 +409,12 @@ export function normalizePublicUrl(value: string): string {
   try {
     url = new URL(value);
   } catch {
-    throw new Error("public URL must be an HTTPS .localhost origin");
+    throw new Error(
+      "public URL must be an HTTP or HTTPS .localhost origin",
+    );
   }
   if (
-    url.protocol !== "https:" ||
+    !["http:", "https:"].includes(url.protocol) ||
     (url.hostname !== "localhost" && !url.hostname.endsWith(".localhost")) ||
     url.username !== "" ||
     url.password !== "" ||
@@ -417,7 +422,9 @@ export function normalizePublicUrl(value: string): string {
     url.search !== "" ||
     url.hash !== ""
   ) {
-    throw new Error("public URL must be an HTTPS .localhost origin");
+    throw new Error(
+      "public URL must be an HTTP or HTTPS .localhost origin",
+    );
   }
   return url.origin;
 }

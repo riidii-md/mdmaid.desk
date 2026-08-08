@@ -353,11 +353,46 @@ test("uses the configured localhost HTTPS origin for browser security", async ()
   }
 });
 
+test("uses a direct localhost HTTP origin without certificate-only headers", async () => {
+  const value = await fixture({
+    publicUrl: "http://mdmaid.desk.localhost:43127",
+  });
+  try {
+    assert.equal(
+      value.server.webUrl,
+      "http://mdmaid.desk.localhost:43127/?token=test-token",
+    );
+
+    const bootstrap = await fetch(
+      new URL("/?token=test-token", value.server.url),
+      { redirect: "manual" },
+    );
+    const cookie = bootstrap.headers.get("set-cookie") ?? "";
+    assert.equal(bootstrap.status, 303);
+    assert.doesNotMatch(cookie, /Secure/);
+    assert.equal(bootstrap.headers.get("strict-transport-security"), null);
+
+    const accepted = await fetch(
+      new URL(`/api/v1/documents/${value.document.id}/read`, value.server.url),
+      {
+        method: "POST",
+        headers: {
+          cookie: cookie.split(";")[0] ?? "",
+          origin: "http://mdmaid.desk.localhost:43127",
+        },
+      },
+    );
+    assert.equal(accepted.status, 200);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("rejects unsafe public web origins", async () => {
   const value = await fixture();
   try {
     for (const publicUrl of [
-      "http://mdmaid.desk.localhost",
+      "ftp://mdmaid.desk.localhost",
       "https://example.com",
       "https://mdmaid.desk.localhost/path",
       "https://user:password@mdmaid.desk.localhost",
@@ -368,7 +403,7 @@ test("rejects unsafe public web origins", async () => {
           publicUrl,
           token: "another-test-token",
         }),
-        /public URL must be an HTTPS \.localhost origin/,
+        /public URL must be an HTTP or HTTPS \.localhost origin/,
       );
     }
   } finally {
