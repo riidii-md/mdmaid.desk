@@ -281,12 +281,17 @@ Status: complete.
 
 ### 3. Daemon and API
 
+Status: initial foreground service and versioned API complete. Background
+`ensure/status/stop`, enqueue, and watcher work remain.
+
 - implement single-instance ensure/status/stop;
 - bind to loopback with authenticated local access;
 - add generic registration/enqueue and versioned endpoints;
 - add document-scoped events and render endpoints.
 
 ### 4. Web workspace
+
+Status: initial queue/reader vertical slice complete.
 
 - build queue/project/filter views;
 - add safe stable document rendering;
@@ -295,12 +300,19 @@ Status: complete.
 
 ### 5. TUI workspace
 
+Status: initial queue/reader vertical slice complete using published `mdmaid`
+terminal rendering.
+
 - select a terminal framework through a resize/ANSI/SSE/testability spike;
 - build queue/project/filter navigation;
 - integrate mdmaid terminal rendering;
 - add status/tag/archive actions and live updates.
 
 ### 6. Clients and parity
+
+Status: in progress. Web and TUI share the daemon API, discovery descriptor,
+reading actions, filters, and live catalog events. Generic CLI mutations and
+Neovim migration remain.
 
 - route CLI automation through the daemon;
 - migrate `mdmaid.nvim` to public daemon/rendering interfaces;

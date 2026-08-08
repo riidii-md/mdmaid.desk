@@ -88,6 +88,12 @@ mdmaid-desk list --task PROJECT-123
 `daemon ensure` is idempotent. The daemon publishes its PID, loopback host,
 port, and protocol version through `daemon.json`.
 
+The current vertical slice implements the same discovery contract through the
+foreground `mdmaid-desk web` command. It atomically publishes a mode-`0600`
+descriptor, and `mdmaid-desk tui` health-checks and reuses that service. The
+background `ensure`, `status`, and `stop` process-management commands are the
+next daemon-lifecycle step.
+
 ## Stable Routes
 
 ```text

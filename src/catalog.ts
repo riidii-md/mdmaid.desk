@@ -94,6 +94,7 @@ export interface RegisterDocumentInput {
 interface InspectedDocument {
   path: string;
   contentHash: string;
+  content: Buffer;
 }
 
 export class Catalog {
@@ -148,6 +149,35 @@ export class Catalog {
     return this.#storage
       .listDocuments(validated)
       .map((document) => presentDocument(document));
+  }
+
+  getDocument(id: string): Document | undefined {
+    validateDocumentId(id);
+    const document = this.#storage.getDocument(id);
+    return document ? presentDocument(document) : undefined;
+  }
+
+  async readDocument(
+    id: string,
+  ): Promise<{ content: string; document: Document }> {
+    validateDocumentId(id);
+    const stored = this.#storage.getDocument(id);
+    if (!stored) {
+      throw new Error(`unknown document ${id}`);
+    }
+    const workspace = this.#storage.getWorkspace(stored.workspaceId);
+    if (!workspace) {
+      throw new Error(`unknown workspace ${stored.workspaceId}`);
+    }
+    const inspected = await inspectMarkdownDocument(
+      stored.path,
+      workspace,
+      this.#maxDocumentBytes,
+    );
+    return {
+      content: inspected.content.toString("utf8"),
+      document: presentDocument(stored),
+    };
   }
 
   async addWorkspace(input: AddWorkspaceInput): Promise<Workspace> {
@@ -630,6 +660,7 @@ async function inspectMarkdownDocument(
   return {
     path: documentPath,
     contentHash: createHash("sha256").update(content).digest("hex"),
+    content,
   };
 }
 

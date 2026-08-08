@@ -19,9 +19,12 @@
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.1.0",
+    "@types/sanitize-html": "^2.16.1",
     "typescript": "^5.8.3"
   },
   "dependencies": {
-    "better-sqlite3": "^12.11.1"
+    "better-sqlite3": "^12.11.1",
+    "mdmaid": "^0.1.15",
+    "sanitize-html": "^2.17.6"
   }
 }

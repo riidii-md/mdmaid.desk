@@ -9,6 +9,20 @@ import {
   Catalog,
   type DocumentKind,
 } from "./catalog.js";
+import { DeskApiClient } from "./api-client.js";
+import {
+  connectToDaemon,
+  daemonDescriptorPath,
+  descriptorForServer,
+  removeDaemonDescriptor,
+  writeDaemonDescriptor,
+} from "./daemon-state.js";
+import {
+  startDeskServer,
+  type DeskServerOptions,
+  type RunningDeskServer,
+} from "./server.js";
+import { runTui as runTerminalWorkspace } from "./tui.js";
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
   "definition",
@@ -44,6 +58,8 @@ Usage:
       [--task <id>] [--kind <kind>] [--title <title>]
       [--attention <state>]
   mdmaid-desk list [--workspace <id>] [--task <id>]
+  mdmaid-desk web [--port <port>]
+  mdmaid-desk tui
 `;
 
 interface Writer {
@@ -52,6 +68,10 @@ interface Writer {
 
 export interface RunOptions {
   statePath?: string;
+  connectDaemon?: (statePath: string) => Promise<DeskApiClient | undefined>;
+  startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
+  runTui?: (client: DeskApiClient) => Promise<void>;
+  waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
 }
 
 class UsageError extends Error {}
@@ -74,6 +94,9 @@ export async function run(
     }
 
     const statePath = options.statePath ?? defaultStatePath();
+    if (args[0] === "tui") {
+      return await runTerminal(statePath, args.slice(1), options);
+    }
     const catalog = await Catalog.open(statePath);
     try {
       const command = args[0];
@@ -86,6 +109,9 @@ export async function run(
       }
       if (command === "list") {
         return runList(catalog, args.slice(1), stdout);
+      }
+      if (command === "web") {
+        return await runWeb(catalog, statePath, args.slice(1), stdout, options);
       }
 
       throw new UsageError(`unknown command ${command}`);
@@ -101,6 +127,90 @@ export async function run(
     }
     return 1;
   }
+}
+
+async function runWeb(
+  catalog: Catalog,
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(args);
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("web accepts options only");
+  }
+  rejectUnknownOptions(parsed, new Set(["port"]));
+  const port = parsePort(firstOption(parsed, "port") ?? "0");
+  const startServer = options.startServer ?? startDeskServer;
+  const server = await startServer({ catalog, host: "127.0.0.1", port });
+  const descriptor = descriptorForServer(server);
+  const descriptorPath = daemonDescriptorPath(statePath);
+  try {
+    await writeDaemonDescriptor(descriptorPath, descriptor);
+    stdout.write(`mdmaid.desk web: ${server.webUrl}\n`);
+    stdout.write("Press Ctrl-C to stop the local service.\n");
+    await (options.waitForShutdown ?? waitForShutdown)(server);
+  } finally {
+    try {
+      await removeDaemonDescriptor(descriptorPath, descriptor);
+    } finally {
+      await server.close();
+    }
+  }
+  return 0;
+}
+
+async function runTerminal(
+  statePath: string,
+  args: string[],
+  options: RunOptions,
+): Promise<number> {
+  if (args.length > 0) {
+    throw new UsageError("tui accepts no arguments");
+  }
+  const running = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (running) {
+    await (options.runTui ?? runTerminalWorkspace)(running);
+    return 0;
+  }
+  const catalog = await Catalog.open(statePath);
+  const startServer = options.startServer ?? startDeskServer;
+  try {
+    const server = await startServer({ catalog, host: "127.0.0.1", port: 0 });
+    try {
+      const client = new DeskApiClient(server.url, server.token);
+      await (options.runTui ?? runTerminalWorkspace)(client);
+    } finally {
+      await server.close();
+    }
+  } finally {
+    catalog.close();
+  }
+  return 0;
+}
+
+function parsePort(value: string): number {
+  if (!/^\d+$/.test(value)) {
+    throw new UsageError("port must be an integer between 0 and 65535");
+  }
+  const port = Number(value);
+  if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) {
+    throw new UsageError("port must be an integer between 0 and 65535");
+  }
+  return port;
+}
+
+function waitForShutdown(_server: RunningDeskServer): Promise<void> {
+  return new Promise((resolveShutdown) => {
+    const finish = (): void => {
+      process.off("SIGINT", finish);
+      process.off("SIGTERM", finish);
+      resolveShutdown();
+    };
+    process.once("SIGINT", finish);
+    process.once("SIGTERM", finish);
+  });
 }
 
 async function runWorkspace(
