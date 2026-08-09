@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import type { ReadStream, WriteStream } from "node:tty";
+import { stripVTControlCharacters } from "node:util";
 import test from "node:test";
 import stringWidth from "string-width";
 
@@ -14,6 +15,7 @@ import {
   applyTuiReader,
   createTuiState,
   handleTuiKey,
+  handleTuiMouse,
   replaceTuiDocuments,
   renderTui,
   runTui,
@@ -99,7 +101,7 @@ test("filters by status, project, and terminal search input", () => {
 
 test("renders the web-inspired responsive queue and reader workspace", () => {
   const queue = createTuiState(documents, workspaces);
-  const queueFrame = renderTui(queue, 128, 28);
+  const queueFrame = renderTui(queue, 128, 28, { color: true });
   assert.equal(queueFrame.split("\n").length, 28);
   assert.match(queueFrame, /mdmaid\.desk/);
   assert.match(queueFrame, /DOCUMENT INBOX/);
@@ -108,6 +110,7 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.match(queueFrame, /Daemon plan/);
   assert.match(queueFrame, /Terminal review/);
   assert.match(queueFrame, /j\/k/);
+  assert.match(queueFrame, /\u001b\[38;2;143;181;175m/);
 
   const compactFrame = renderTui(queue, 68, 22);
   assert.equal(compactFrame.split("\n").length, 22);
@@ -127,6 +130,15 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.match(readerFrame, /DOCUMENT READER/);
   assert.match(readerFrame, /\u001b\[[0-9;]*m/);
   assert.match(readerFrame, /m.*read/);
+  assert.doesNotMatch(readerFrame, / DOCUMENT /);
+  const plainReaderLines = readerFrame
+    .split("\n")
+    .map((line) => stripVTControlCharacters(line));
+  assert.match(plainReaderLines[4] ?? "", /1-3 \/ 3/);
+  assert.equal(
+    plainReaderLines.find((line) => line.includes("Rendered terminal document."))?.indexOf("Rendered"),
+    1,
+  );
   for (const line of readerFrame.split("\n")) {
     assert.equal(stringWidth(line), 100);
   }
@@ -136,6 +148,118 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   ]);
   assert.equal(handleTuiKey(reader, "b").state.mode, "queue");
   assert.deepEqual(handleTuiKey(reader, "q").effects, [{ type: "quit" }]);
+});
+
+test("supports mouse navigation, direct actions, wheel, and page scrolling", () => {
+  const queue = createTuiState(documents, workspaces);
+
+  assert.equal(
+    handleTuiMouse(queue, { button: "left", x: 0, y: 0 }, 128, 28).state,
+    queue,
+  );
+  assert.equal(
+    handleTuiMouse(queue, { button: "wheel-down", x: 50, y: 12 }, 128, 28)
+      .state.selectedIndex,
+    1,
+  );
+  assert.equal(
+    handleTuiMouse(queue, { button: "wheel-up", x: 50, y: 12 }, 128, 28)
+      .state.selectedIndex,
+    0,
+  );
+
+  const project = handleTuiMouse(
+    queue,
+    { button: "left", x: 10, y: 8 },
+    128,
+    28,
+  );
+  assert.equal(project.state.workspaceFilter, "beta");
+  assert.equal(
+    handleTuiMouse(project.state, { button: "left", x: 10, y: 6 }, 128, 28)
+      .state.workspaceFilter,
+    undefined,
+  );
+
+  const status = handleTuiMouse(
+    queue,
+    { button: "left", x: 10, y: 14 },
+    128,
+    28,
+  );
+  assert.equal(status.state.statusFilter, "reading");
+  assert.deepEqual(
+    handleTuiMouse(queue, { button: "left", x: 77, y: 7 }, 128, 28)
+      .effects,
+    [],
+  );
+  assert.deepEqual(
+    handleTuiMouse(queue, { button: "left", x: 80, y: 7 }, 128, 28)
+      .effects,
+    [{ type: "open", documentId: documents[1]!.id }],
+  );
+
+  const opened = handleTuiMouse(
+    queue,
+    { button: "left", x: 30, y: 7 },
+    128,
+    28,
+  );
+  assert.deepEqual(opened.effects, [
+    { type: "open", documentId: documents[0]!.id },
+  ]);
+
+  const reader = applyTuiReader(
+    queue,
+    documents[0]!,
+    Array.from({ length: 40 }, (_, index) => `line ${index + 1}`).join("\n"),
+    "beautiful-mermaid",
+    [],
+  );
+  const wheel = handleTuiMouse(
+    reader,
+    { button: "wheel-down", x: 50, y: 12 },
+    100,
+    24,
+  );
+  assert.equal(wheel.state.scroll, 3);
+  assert.equal(
+    handleTuiMouse(wheel.state, { button: "wheel-up", x: 50, y: 12 }, 100, 24)
+      .state.scroll,
+    0,
+  );
+  assert.equal(
+    handleTuiMouse(
+      { ...reader, scroll: 999 },
+      { button: "wheel-down", x: 50, y: 12 },
+      100,
+      24,
+    ).state.scroll,
+    25,
+  );
+  assert.equal(handleTuiKey(reader, "pagedown").state.scroll, 10);
+  assert.equal(handleTuiKey(wheel.state, "pageup").state.scroll, 0);
+
+  const markedRead = handleTuiMouse(
+    reader,
+    { button: "left", x: 17, y: 23 },
+    100,
+    24,
+  );
+  assert.deepEqual(markedRead.effects, [
+    { type: "action", action: "read", documentId: documents[0]!.id },
+  ]);
+
+  assert.deepEqual(
+    handleTuiMouse(queue, { button: "left", x: 15, y: 27 }, 128, 28)
+      .effects,
+    [{ type: "open", documentId: documents[0]!.id }],
+  );
+  assert.equal(
+    handleTuiMouse(queue, { button: "left", x: 50, y: 27 }, 128, 28)
+      .state.searching,
+    true,
+  );
 });
 
 test("preserves selection and allows only safe document styling", () => {
@@ -241,8 +365,11 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
     output: output as unknown as WriteStream,
   });
   await eventually(() => onCatalog !== undefined);
-  input.write("j\r");
+  input.write("\u001b[<0;10");
+  input.write(";7M");
   await eventually(() => renders === 1 && actions.some((value) => value.startsWith("opened:")));
+  input.write("\u001b[<65;10;7M\u001b[<64;10;7M\u001b[6~\u001b[5~");
+  input.write("\u001b[<0;10;7m");
   const listsBeforeEvent = lists;
   onCatalog?.({ action: "tags", documentId: documents[1]!.id });
   await eventually(() => lists > listsBeforeEvent);
@@ -254,6 +381,9 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   assert.match(terminal, /Rendered by mdmaid/);
   assert.match(terminal, /\u001b\[\?1049h/);
   assert.match(terminal, /\u001b\[\?1049l/);
+  assert.match(terminal, /\u001b\[\?1000h\u001b\[\?1006h/);
+  assert.match(terminal, /\u001b\[\?1006l\u001b\[\?1000l/);
+  assert.equal(terminal.match(/\u001b\[2J/g)?.length, 1);
   assert.deepEqual(renderPreferences, { color: true, unicode: true });
 });
 
