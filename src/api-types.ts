@@ -41,6 +41,11 @@ export interface HealthData {
 
 export type RenderTarget = "web" | "terminal";
 
+export interface TerminalRenderPreferences {
+  color?: boolean;
+  unicode?: boolean;
+}
+
 export interface WebRender {
   document: PublicDocument;
   target: "web";

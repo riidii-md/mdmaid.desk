@@ -22,6 +22,7 @@ import {
   type RegisterDocumentInput,
 } from "./catalog.js";
 import { WEB_STYLES } from "./web-styles.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
@@ -327,14 +328,25 @@ async function handleRequest(
       return;
     }
     const width = parseWidth(url.searchParams.get("width"));
-    const rendered = await renderMarkdownToTui(content, { width });
+    const color = parseRenderBoolean(url.searchParams.get("color"), "color", false);
+    const unicode = parseRenderBoolean(
+      url.searchParams.get("unicode"),
+      "unicode",
+      true,
+    );
+    const rendered = await renderMarkdownToTui(content, {
+      backend: "beautiful-mermaid",
+      color,
+      unicode,
+      width,
+    });
     sendJson(response, 200, {
       data: {
         document: publicDocument(document),
         target,
-        content: stripTerminalControls(rendered.output),
+        content: sanitizeTerminalText(rendered.output, { preserveSgr: true }),
         backend: rendered.backend,
-        warnings: rendered.warnings.map(stripTerminalControls),
+        warnings: rendered.warnings.map((warning) => sanitizeTerminalText(warning)),
       },
     });
     return;
@@ -549,6 +561,27 @@ function parseWidth(value: string | null): number {
   return width;
 }
 
+function parseRenderBoolean(
+  value: string | null,
+  name: string,
+  fallback: boolean,
+): boolean {
+  if (value === null) {
+    return fallback;
+  }
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  throw new HttpError(
+    400,
+    "invalid_render_option",
+    `${name} must be true or false`,
+  );
+}
+
 async function readDocument(
   catalog: Catalog,
   id: string,
@@ -623,15 +656,6 @@ function sanitizeRenderedHtml(content: string): string {
     },
     allowProtocolRelative: false,
   });
-}
-
-function stripTerminalControls(value: string): string {
-  return value
-    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\u001b[PX^_][\s\S]*?\u001b\\/g, "")
-    .replace(/\u001b./g, "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

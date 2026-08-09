@@ -8,6 +8,7 @@ import type {
   PublicDocument,
   PublicWorkspace,
   RenderTarget,
+  TerminalRenderPreferences,
   TerminalRender,
   WebRender,
 } from "./api-types.js";
@@ -79,6 +80,7 @@ export class DeskApiClient {
     id: string,
     target: "terminal",
     width?: number,
+    preferences?: TerminalRenderPreferences,
   ): Promise<TerminalRender>;
   async renderDocument(
     id: string,
@@ -89,6 +91,7 @@ export class DeskApiClient {
     id: string,
     target: RenderTarget,
     width = 100,
+    preferences: TerminalRenderPreferences = {},
   ): Promise<TerminalRender | WebRender> {
     assertDocumentId(id);
     if (!Number.isSafeInteger(width) || width < 20 || width > 1_000) {
@@ -97,6 +100,12 @@ export class DeskApiClient {
     const query = new URLSearchParams({ target });
     if (target === "terminal") {
       query.set("width", String(width));
+      if (preferences.color !== undefined) {
+        query.set("color", String(preferences.color));
+      }
+      if (preferences.unicode !== undefined) {
+        query.set("unicode", String(preferences.unicode));
+      }
     }
     const value = await this.#request(
       `/api/v1/documents/${encodeURIComponent(id)}/render?${query.toString()}`,

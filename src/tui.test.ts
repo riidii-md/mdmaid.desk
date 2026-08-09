@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import type { ReadStream, WriteStream } from "node:tty";
 import test from "node:test";
+import stringWidth from "string-width";
 
 import type {
   CatalogEvent,
@@ -96,26 +97,39 @@ test("filters by status, project, and terminal search input", () => {
   assert.deepEqual(typedQ.effects, []);
 });
 
-test("renders queue and reader frames with lifecycle actions", () => {
+test("renders the web-inspired responsive queue and reader workspace", () => {
   const queue = createTuiState(documents, workspaces);
-  const queueFrame = renderTui(queue, 80, 20);
-  assert.equal(queueFrame.split("\n").length, 20);
+  const queueFrame = renderTui(queue, 128, 28);
+  assert.equal(queueFrame.split("\n").length, 28);
   assert.match(queueFrame, /mdmaid\.desk/);
+  assert.match(queueFrame, /DOCUMENT INBOX/);
+  assert.match(queueFrame, /PROJECTS/);
+  assert.match(queueFrame, /STATUS/);
   assert.match(queueFrame, /Daemon plan/);
   assert.match(queueFrame, /Terminal review/);
-  assert.match(queueFrame, /j\/k select/);
+  assert.match(queueFrame, /j\/k/);
+
+  const compactFrame = renderTui(queue, 68, 22);
+  assert.equal(compactFrame.split("\n").length, 22);
+  assert.match(compactFrame, /2 documents/);
+  assert.doesNotMatch(compactFrame, /PROJECTS/);
 
   const reader = applyTuiReader(
     queue,
     documents[0]!,
-    "# Daemon plan\n\nRendered terminal document.",
-    "source",
+    "\u001b[1mDaemon plan\u001b[22m\n\nRendered terminal document.",
+    "beautiful-mermaid",
     [],
   );
-  const readerFrame = renderTui(reader, 80, 18);
+  const readerFrame = renderTui(reader, 100, 24, { color: true });
   assert.match(readerFrame, /Daemon plan/);
   assert.match(readerFrame, /Rendered terminal document/);
-  assert.match(readerFrame, /m read/);
+  assert.match(readerFrame, /DOCUMENT READER/);
+  assert.match(readerFrame, /\u001b\[[0-9;]*m/);
+  assert.match(readerFrame, /m.*read/);
+  for (const line of readerFrame.split("\n")) {
+    assert.equal(stringWidth(line), 100);
+  }
 
   assert.deepEqual(handleTuiKey(reader, "m").effects, [
     { type: "action", action: "read", documentId: documents[0]?.id },
@@ -124,7 +138,7 @@ test("renders queue and reader frames with lifecycle actions", () => {
   assert.deepEqual(handleTuiKey(reader, "q").effects, [{ type: "quit" }]);
 });
 
-test("preserves selection across daemon refreshes and strips terminal controls", () => {
+test("preserves selection and allows only safe document styling", () => {
   let state = createTuiState(documents, workspaces);
   state = handleTuiKey(state, "j").state;
   const refreshed = replaceTuiDocuments(state, [
@@ -136,6 +150,23 @@ test("preserves selection across daemon refreshes and strips terminal controls",
   const frame = renderTui(refreshed, 80, 20);
   assert.doesNotMatch(frame, /[\u001b\u0007]/);
   assert.doesNotMatch(frame, /payload\u0007/);
+
+  const styledReader = applyTuiReader(
+    refreshed,
+    documents[0]!,
+    "\u001b[36mTrusted heading\u001b[39m\n\u001b]52;c;stolen\u0007Unsafe",
+    "beautiful-mermaid",
+    [],
+  );
+  const styledFrame = renderTui(styledReader, 80, 20, { color: true });
+  assert.match(styledFrame, /\u001b\[36mTrusted heading\u001b\[39m/);
+  assert.doesNotMatch(styledFrame, /\u001b\]52|stolen|\u0007/);
+
+  const plainAsciiFrame = renderTui(styledReader, 80, 20, {
+    color: false,
+    unicode: false,
+  });
+  assert.doesNotMatch(plainAsciiFrame, /\u001b|[┌┐└┘─│●◐✓]/);
 });
 
 test("runs the interactive TUI through render, events, actions, and clean exit", async () => {
@@ -144,6 +175,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   Object.defineProperties(output, {
     columns: { value: 80 },
     rows: { value: 20 },
+    isTTY: { value: true },
   });
   let terminal = "";
   output.on("data", (chunk: Buffer) => {
@@ -153,6 +185,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   let current = structuredClone(documents);
   const actions: string[] = [];
   let renders = 0;
+  let renderPreferences: { color?: boolean; unicode?: boolean } | undefined;
   let lists = 0;
   let onCatalog: ((event: CatalogEvent) => void) | undefined;
   const client = {
@@ -161,8 +194,14 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
       return structuredClone(current);
     },
     listWorkspaces: async () => structuredClone(workspaces),
-    renderDocument: async (id: string) => {
+    renderDocument: async (
+      id: string,
+      _target: string,
+      _width: number,
+      preferences: { color?: boolean; unicode?: boolean },
+    ) => {
       renders += 1;
+      renderPreferences = preferences;
       return {
         document: current.find((document) => document.id === id)!,
         target: "terminal" as const,
@@ -197,6 +236,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   } as unknown as DeskApiClient;
 
   const running = runTui(client, {
+    env: { TERM: "xterm-256color" },
     input: input as unknown as ReadStream,
     output: output as unknown as WriteStream,
   });
@@ -214,6 +254,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   assert.match(terminal, /Rendered by mdmaid/);
   assert.match(terminal, /\u001b\[\?1049h/);
   assert.match(terminal, /\u001b\[\?1049l/);
+  assert.deepEqual(renderPreferences, { color: true, unicode: true });
 });
 
 async function eventually(predicate: () => boolean): Promise<void> {
