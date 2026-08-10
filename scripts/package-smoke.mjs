@@ -13,7 +13,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const temporaryRoot = mkdtempSync(join(tmpdir(), "mdmaid-desk-package-"));
 const npmEnvironment = {
   ...process.env,
@@ -27,6 +26,14 @@ function execute(command, args, options = {}) {
     stdio: ["ignore", "pipe", "inherit"],
     ...options,
   }).trim();
+}
+
+function executeNpm(args, options = {}) {
+  const npmCli = process.env.npm_execpath;
+  if (!npmCli) {
+    throw new Error("package smoke must run through npm run package:smoke");
+  }
+  return execute(process.execPath, [npmCli, ...args], options);
 }
 
 function parsePackResult(output) {
@@ -64,7 +71,9 @@ function verifyArchive(result) {
       throw new Error(`published archive is missing ${required}`);
     }
   }
-  const leakedTest = [...paths].find((path) => /\.test\.(?:js|d\.ts|js\.map)$/.test(path));
+  const leakedTest = [...paths].find((path) =>
+    /\.test\.(?:js|d\.ts|js\.map)$/.test(path),
+  );
   if (leakedTest) {
     throw new Error(`published archive contains test output: ${leakedTest}`);
   }
@@ -121,7 +130,10 @@ async function stopChild(child) {
   await Promise.race([
     exited,
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("installed daemon did not stop")), 5_000),
+      setTimeout(
+        () => reject(new Error("installed daemon did not stop")),
+        5_000,
+      ),
     ),
   ]);
 }
@@ -131,8 +143,7 @@ async function main() {
     readFileSync(join(packageRoot, "package.json"), "utf8"),
   );
   const packResult = parsePackResult(
-    execute(
-      npm,
+    executeNpm(
       [
         "pack",
         "--json",
@@ -148,8 +159,7 @@ async function main() {
   const archive = join(temporaryRoot, packResult.filename);
   const installRoot = join(temporaryRoot, "install");
   mkdirSync(installRoot);
-  execute(
-    npm,
+  executeNpm(
     [
       "install",
       "--prefix",
@@ -161,17 +171,16 @@ async function main() {
     { cwd: temporaryRoot, env: npmEnvironment },
   );
 
-  const installedRoot = join(
-    installRoot,
-    "node_modules",
-    "mdmaid-desk",
-  );
+  const installedRoot = join(installRoot, "node_modules", "mdmaid-desk");
   const installedCli = join(installedRoot, "dist", "cli.js");
   if (!existsSync(installedCli)) {
     throw new Error("installed package does not contain the CLI entrypoint");
   }
 
-  const installedVersion = execute(process.execPath, [installedCli, "--version"]);
+  const installedVersion = execute(process.execPath, [
+    installedCli,
+    "--version",
+  ]);
   if (installedVersion !== packageJson.version) {
     throw new Error(
       `installed CLI reported ${installedVersion}, expected ${packageJson.version}`,
