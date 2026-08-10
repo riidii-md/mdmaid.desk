@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import type { DeskApiClient } from "./api-client.js";
-import { run } from "./cli.js";
+import { isEntrypoint, run } from "./cli.js";
 import {
   daemonDescriptorPath,
   readDaemonDescriptor,
@@ -117,6 +118,38 @@ test("uses the mdmaid-desk executable name in help output", async () => {
   assert.match(stdout.text(), /mdmaid-desk/);
   assert.doesNotMatch(stdout.text(), /mdmaid-show/);
   assert.equal(stderr.text(), "");
+});
+
+test("prints the published package version without opening the catalog", async () => {
+  const stdout = output();
+  const stderr = output();
+  const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  const packageJson = JSON.parse(
+    await readFile(join(packageRoot, "package.json"), "utf8"),
+  ) as { version?: unknown };
+
+  assert.equal(await run(["--version"], stdout, stderr), 0);
+  assert.equal(stdout.text(), `${packageJson.version}\n`);
+  assert.equal(stderr.text(), "");
+});
+
+test("recognizes an installed entrypoint reached through a filesystem alias", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-entrypoint-"));
+  const realDirectory = join(root, "real");
+  const aliasDirectory = join(root, "alias");
+  const realEntrypoint = join(realDirectory, "cli.js");
+  await mkdir(realDirectory);
+  await writeFile(realEntrypoint, "// entrypoint\n", "utf8");
+  await symlink(
+    realDirectory,
+    aliasDirectory,
+    process.platform === "win32" ? "junction" : "dir",
+  );
+
+  assert.equal(
+    isEntrypoint(pathToFileURL(realEntrypoint).href, join(aliasDirectory, "cli.js")),
+    true,
+  );
 });
 
 test("runs the web service until shutdown and prints its browser URL", async () => {

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   type Attention,
@@ -24,6 +25,7 @@ import {
   type RunningDeskServer,
 } from "./server.js";
 import { readOrCreateAuthToken } from "./auth-state.js";
+import { readPackageVersion } from "./package-info.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
@@ -53,6 +55,7 @@ const ATTENTION_STATES = new Set<Attention>([
 const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 
 Usage:
+  mdmaid-desk --version
   mdmaid-desk workspace add <root> --id <id> [--name <name>]
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
@@ -93,6 +96,14 @@ export async function run(
       args[0] === "-h"
     ) {
       stdout.write(usage);
+      return 0;
+    }
+
+    if (
+      args.length === 1 &&
+      (args[0] === "version" || args[0] === "--version" || args[0] === "-V")
+    ) {
+      stdout.write(`${readPackageVersion()}\n`);
       return 0;
     }
 
@@ -451,10 +462,20 @@ function defaultStatePath(): string {
 }
 
 const entryPath = process.argv[1];
-if (entryPath && import.meta.url === pathToFileURL(entryPath).href) {
+if (entryPath && isEntrypoint(import.meta.url, entryPath)) {
   process.exitCode = await run(
     process.argv.slice(2),
     process.stdout,
     process.stderr,
   );
+}
+
+export function isEntrypoint(moduleUrl: string, entryPath: string): boolean {
+  try {
+    return (
+      realpathSync(fileURLToPath(moduleUrl)) === realpathSync(resolve(entryPath))
+    );
+  } catch {
+    return moduleUrl === pathToFileURL(resolve(entryPath)).href;
+  }
 }

@@ -13,12 +13,173 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [22.x, 24.x]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm run check
+
+  package-smoke:
+    name: Package smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+          cache: npm
+      - run: npm ci
+      - run: npm run package:smoke
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+    needs: [test, package-smoke]
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: mdmaid-desk-npm-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # After the first package publish, configure npm trusted publishing as:
+      # OleksandrBesan/mdmaid.desk, workflow ci.yml, environment prod.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm run package:smoke
+
+      - name: Plan release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          tag="v$version"
+
+          package_exists=false
+          if npm view "$package_name" name --json >/dev/null 2>&1; then
+            package_exists=true
+          fi
+
+          package_published=false
+          if npm view "$package_name@$version" version --json >/dev/null 2>&1; then
+            package_published=true
+          fi
+
+          tag_exists=false
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            tag_exists=true
+          fi
+
+          release_exists=false
+          if gh release view "$tag" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+
+          if [ "$package_published" = true ] && [ "$tag_exists" = true ] && [ "$release_exists" = true ]; then
+            mode=bump
+          elif [ "$package_published" = true ]; then
+            mode=recover
+          else
+            mode=initial
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "package_exists=$package_exists" >> "$GITHUB_OUTPUT"
+          echo "Release mode: $mode"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        if: steps.release.outputs.mode == 'bump'
+        run: npm version patch -m "v%s [skip ci]"
+
+      - name: Inspect target version
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$package_name@$version" version --json >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "$package_name@$version is already published"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require bootstrap token for the first package
+        if: steps.release.outputs.package_exists != 'true' && steps.target.outputs.published != 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::The first publish needs a prod environment NPM_TOKEN. Afterward, configure npm trusted publishing and remove the token."
+            exit 1
+          fi
+
+      - name: Bootstrap package on npm
+        if: steps.release.outputs.package_exists != 'true' && steps.target.outputs.published != 'true'
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish to npm with trusted publishing
+        if: steps.release.outputs.package_exists == 'true' && steps.target.outputs.published != 'true'
+        run: npm publish --access public
+
+      - name: Push version and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.target.outputs.version }}"
+          tag="v$version"
+          if ! git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            git tag --annotate "$tag" --message "$tag"
+          fi
+          git push origin HEAD:main
+          git push origin "$tag"
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.target.outputs.version }}"
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag already has a GitHub release"
+          else
+            gh release create "$tag" --verify-tag --generate-notes --title "mdmaid.desk $tag"
+          fi
