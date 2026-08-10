@@ -10,6 +10,8 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
+import { syncDirectory } from "./fs-durability.js";
+
 const MAX_AUTH_TOKEN_BYTES = 128;
 const AUTH_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
@@ -115,15 +117,6 @@ async function readAuthToken(path: string): Promise<string | undefined> {
     throw new Error("Invalid auth token");
   }
   return token;
-}
-
-async function syncDirectory(path: string): Promise<void> {
-  const handle = await open(path, constants.O_RDONLY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
 }
 
 async function unlinkIfPresent(path: string): Promise<void> {
