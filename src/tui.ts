@@ -1,5 +1,9 @@
 import type { ReadStream, WriteStream } from "node:tty";
 
+import { Chalk, type ChalkInstance } from "chalk";
+import sliceAnsi from "slice-ansi";
+import stringWidth from "string-width";
+
 import type { DeskApiClient } from "./api-client.js";
 import type {
   DocumentAction,
@@ -7,6 +11,7 @@ import type {
   PublicWorkspace,
   ReadingStatus,
 } from "./api-types.js";
+import { sanitizeTerminalText } from "./terminal-text.js";
 
 type TuiMode = "queue" | "reader";
 type StatusFilter = "all" | ReadingStatus;
@@ -44,8 +49,22 @@ export interface TuiTransition {
 }
 
 export interface TuiIo {
+  color?: boolean;
+  env?: NodeJS.ProcessEnv;
   input?: ReadStream;
   output?: WriteStream;
+  unicode?: boolean;
+}
+
+export interface TuiRenderOptions {
+  color?: boolean;
+  unicode?: boolean;
+}
+
+export interface TuiMouseEvent {
+  button: "left" | "wheel-down" | "wheel-up";
+  x: number;
+  y: number;
 }
 
 export function createTuiState(
@@ -124,26 +143,96 @@ export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   return handleQueueKey(state, key);
 }
 
-export function renderTui(state: TuiState, width: number, height: number): string {
+export function handleTuiMouse(
+  state: TuiState,
+  event: TuiMouseEvent,
+  width: number,
+  height: number,
+): TuiTransition {
+  if (
+    !Number.isSafeInteger(event.x) ||
+    !Number.isSafeInteger(event.y) ||
+    event.x < 1 ||
+    event.y < 1
+  ) {
+    return { state, effects: [] };
+  }
+  if (event.button === "wheel-down") {
+    return state.mode === "reader"
+      ? {
+          state: clampReaderScroll(
+            { ...state, scroll: state.scroll + 3 },
+            height,
+          ),
+          effects: [],
+        }
+      : moveQueueSelection(state, 3);
+  }
+  if (event.button === "wheel-up") {
+    return state.mode === "reader"
+      ? {
+          state: clampReaderScroll(
+            { ...state, scroll: Math.max(0, state.scroll - 3) },
+            height,
+          ),
+          effects: [],
+        }
+      : moveQueueSelection(state, -3);
+  }
+
+  const safeWidth = clamp(Math.floor(width), 40, 1_000);
+  const safeHeight = clamp(Math.floor(height), 8, 500);
+  if (event.y === safeHeight - 1) {
+    const key = footerKeyAt(state, event.x);
+    return key ? handleTuiKey(state, key) : { state, effects: [] };
+  }
+  if (state.mode === "reader") {
+    return { state, effects: [] };
+  }
+  return handleQueueMouse(state, event, safeWidth, safeHeight);
+}
+
+export function renderTui(
+  state: TuiState,
+  width: number,
+  height: number,
+  options: TuiRenderOptions = {},
+): string {
   const safeWidth = clamp(Math.floor(width), 40, 1_000);
   const safeHeight = clamp(Math.floor(height), 8, 500);
   const innerWidth = safeWidth - 2;
-  const top = `+${"-".repeat(innerWidth)}+`;
-  const title = state.mode === "reader" ? renderReaderTitle(state) : "mdmaid.desk / document queue";
+  const borders = createBorders(options.unicode !== false);
+  const theme = createTuiTheme(options.color === true);
+  const top = theme.line(
+    `${borders.topLeft}${borders.horizontal.repeat(innerWidth)}${borders.topRight}`,
+  );
+  const bottom = theme.line(
+    `${borders.bottomLeft}${borders.horizontal.repeat(innerWidth)}${borders.bottomRight}`,
+  );
+  const divider = theme.line(
+    `${borders.middleLeft}${borders.horizontal.repeat(innerWidth)}${borders.middleRight}`,
+  );
+  const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
   const footer = state.mode === "reader"
-    ? "j/k scroll  m read  u unread  a archive  b queue  q quit"
+    ? renderShortcutBar(
+        [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+        theme,
+      )
     : state.searching
-      ? `search: ${state.search}_  enter apply  esc clear`
-      : "j/k select  enter open  s status  p project  / search  q quit";
-  const bodyHeight = safeHeight - 5;
+      ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
+      : renderShortcutBar(
+          [["j/k", "move"], ["enter", "open"], ["s", "status"], ["p", "project"], ["/", "search"], ["q", "quit"]],
+          theme,
+        );
+  const bodyHeight = safeHeight - 6;
   const body = state.mode === "reader"
-    ? readerLines(state, innerWidth, bodyHeight)
-    : queueLines(state, innerWidth, bodyHeight);
-  const lines = [top, boxLine(title, innerWidth), boxLine("", innerWidth)];
+    ? readerLines(state, innerWidth, bodyHeight, theme, borders)
+    : queueLines(state, innerWidth, bodyHeight, theme, borders);
+  const lines = [top, boxLine(title, innerWidth, borders, theme), divider];
   for (let index = 0; index < bodyHeight; index += 1) {
-    lines.push(boxLine(body[index] ?? "", innerWidth));
+    lines.push(boxLine(body[index] ?? "", innerWidth, borders, theme));
   }
-  lines.push(boxLine(footer, innerWidth), top);
+  lines.push(divider, boxLine(footer, innerWidth, borders, theme), bottom);
   return lines.join("\n");
 }
 
@@ -153,6 +242,10 @@ export async function runTui(
 ): Promise<void> {
   const input = io.input ?? process.stdin;
   const output = io.output ?? process.stdout;
+  const env = io.env ?? process.env;
+  const color = !("NO_COLOR" in env) &&
+    (io.color ?? Boolean(output.isTTY && env.TERM !== "dumb"));
+  const unicode = io.unicode ?? env.TERM !== "dumb";
   let state = createTuiState(
     await client.listDocuments(),
     await client.listWorkspaces(),
@@ -162,11 +255,30 @@ export async function runTui(
   let finished = false;
   let processing = Promise.resolve();
   let refreshing = Promise.resolve();
+  let resizeTimer: NodeJS.Timeout | undefined;
+  let renderedWidth = readerRenderWidth(output.columns ?? 100);
+  let inputBuffer = "";
+  let previousFrame: string[] | undefined;
 
   const draw = (): void => {
     const width = output.columns ?? 100;
     const height = output.rows ?? 30;
-    output.write(`\u001b[H\u001b[2J${renderTui(state, width, height)}`);
+    const frame = renderTui(state, width, height, { color, unicode });
+    const lines = frame.split("\n");
+    if (!previousFrame) {
+      output.write(`\u001b[H\u001b[2J${frame}`);
+    } else {
+      const updates: string[] = [];
+      for (let index = 0; index < lines.length; index += 1) {
+        if (lines[index] !== previousFrame[index]) {
+          updates.push(`\u001b[${index + 1};1H${lines[index] ?? ""}\u001b[K`);
+        }
+      }
+      if (updates.length > 0) {
+        output.write(updates.join(""));
+      }
+    }
+    previousFrame = lines;
   };
   const cleanup = (): void => {
     if (finished) {
@@ -174,13 +286,16 @@ export async function runTui(
     }
     finished = true;
     input.off("data", onData);
-    process.off("SIGWINCH", draw);
+    process.off("SIGWINCH", onResize);
     eventController.abort();
+    if (resizeTimer) {
+      clearTimeout(resizeTimer);
+    }
     if (input.isTTY) {
       input.setRawMode(Boolean(wasRaw));
     }
     input.pause();
-    output.write("\u001b[?25h\u001b[?1049l");
+    output.write("\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[?1049l");
   };
 
   const execute = async (effect: TuiEffect): Promise<void> => {
@@ -193,8 +308,10 @@ export async function runTui(
         const rendered = await client.renderDocument(
           effect.documentId,
           "terminal",
-          clamp((output.columns ?? 100) - 4, 20, 1_000),
+          readerRenderWidth(output.columns ?? 100),
+          { color, unicode },
         );
+        renderedWidth = readerRenderWidth(output.columns ?? 100);
         state = applyTuiReader(
           state,
           rendered.document,
@@ -222,26 +339,87 @@ export async function runTui(
   };
 
   const onData = (chunk: Buffer | string): void => {
-    for (const key of decodeKeys(chunk.toString())) {
+    inputBuffer += chunk.toString();
+    const decoded = decodeInput(inputBuffer);
+    inputBuffer = decoded.remainder;
+    let changed = false;
+    for (const inputEvent of decoded.events) {
       if (finished) {
         return;
       }
-      const transition = handleTuiKey(state, key);
-      state = transition.state;
-      draw();
+      const transition = inputEvent.type === "mouse"
+        ? handleTuiMouse(
+            state,
+            inputEvent.event,
+            output.columns ?? 100,
+            output.rows ?? 30,
+          )
+        : handleTuiKey(state, inputEvent.key);
+      state = clampReaderScroll(transition.state, output.rows ?? 30);
+      changed = true;
       for (const effect of transition.effects) {
         processing = processing.then(() => execute(effect));
       }
     }
+    if (changed) {
+      draw();
+    }
   };
 
-  output.write("\u001b[?1049h\u001b[?25l");
+  const onResize = (): void => {
+    draw();
+    if (!state.reader) {
+      return;
+    }
+    const nextWidth = readerRenderWidth(output.columns ?? 100);
+    if (nextWidth === renderedWidth) {
+      return;
+    }
+    if (resizeTimer) {
+      clearTimeout(resizeTimer);
+    }
+    resizeTimer = setTimeout(() => {
+      const documentId = state.reader?.document.id;
+      if (!documentId || finished) {
+        return;
+      }
+      processing = processing.then(async () => {
+        try {
+          const rendered = await client.renderDocument(
+            documentId,
+            "terminal",
+            nextWidth,
+            { color, unicode },
+          );
+          renderedWidth = nextWidth;
+          const scroll = state.scroll;
+          state = applyTuiReader(
+            state,
+            rendered.document,
+            rendered.content,
+            rendered.backend,
+            rendered.warnings,
+          );
+          state = { ...state, scroll };
+          draw();
+        } catch (error) {
+          state = {
+            ...state,
+            message: error instanceof Error ? error.message : "Resize render failed",
+          };
+          draw();
+        }
+      });
+    }, 80);
+  };
+
+  output.write("\u001b[?1049h\u001b[?25l\u001b[?1000h\u001b[?1006h");
   if (input.isTTY) {
     input.setRawMode(true);
   }
   input.resume();
   input.on("data", onData);
-  process.on("SIGWINCH", draw);
+  process.on("SIGWINCH", onResize);
   draw();
   void client
     .subscribeCatalog(() => {
@@ -314,23 +492,10 @@ function handleSearchKey(state: TuiState, key: string): TuiTransition {
 
 function handleQueueKey(state: TuiState, key: string): TuiTransition {
   if (key === "j" || key === "down") {
-    return {
-      state: {
-        ...state,
-        selectedIndex: clamp(
-          state.selectedIndex + 1,
-          0,
-          Math.max(0, state.visibleDocuments.length - 1),
-        ),
-      },
-      effects: [],
-    };
+    return moveQueueSelection(state, 1);
   }
   if (key === "k" || key === "up") {
-    return {
-      state: { ...state, selectedIndex: Math.max(0, state.selectedIndex - 1) },
-      effects: [],
-    };
+    return moveQueueSelection(state, -1);
   }
   if (key === "enter") {
     const document = state.visibleDocuments[state.selectedIndex];
@@ -381,6 +546,15 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       effects: [],
     };
   }
+  if (key === "pagedown") {
+    return { state: { ...state, scroll: state.scroll + 10 }, effects: [] };
+  }
+  if (key === "pageup") {
+    return {
+      state: { ...state, scroll: Math.max(0, state.scroll - 10) },
+      effects: [],
+    };
+  }
   const actions: Partial<Record<string, DocumentAction>> = {
     m: "read",
     u: "unread",
@@ -396,6 +570,36 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     };
   }
   return { state, effects: [] };
+}
+
+function moveQueueSelection(state: TuiState, amount: number): TuiTransition {
+  return {
+    state: {
+      ...state,
+      selectedIndex: clamp(
+        state.selectedIndex + amount,
+        0,
+        Math.max(0, state.visibleDocuments.length - 1),
+      ),
+    },
+    effects: [],
+  };
+}
+
+function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
+  if (!state.reader) {
+    return state;
+  }
+  const safeHeight = clamp(Math.floor(terminalHeight), 8, 500);
+  const bodyHeight = safeHeight - 6;
+  const headerLength = state.message ? 4 : 3;
+  const available = Math.max(1, bodyHeight - headerLength);
+  const contentLines = sanitizeTerminalText(state.reader.content).split("\n").length;
+  const warningLines = state.reader.warnings.length > 0
+    ? state.reader.warnings.length + 1
+    : 0;
+  const maximum = Math.max(0, contentLines + warningLines - available);
+  return { ...state, scroll: clamp(state.scroll, 0, maximum) };
 }
 
 function applyFilters(state: TuiState): TuiState {
@@ -432,98 +636,643 @@ function applyFilters(state: TuiState): TuiState {
   };
 }
 
-function queueLines(state: TuiState, width: number, height: number): string[] {
-  const workspace = state.workspaceFilter ?? "all projects";
-  const summary = `${workspace} / ${state.statusFilter} / ${state.visibleDocuments.length} documents`;
-  if (state.visibleDocuments.length === 0) {
-    return [summary, "", "No documents match this view."];
+interface TuiBorders {
+  bottomLeft: string;
+  bottomRight: string;
+  horizontal: string;
+  middleLeft: string;
+  middleRight: string;
+  topLeft: string;
+  topRight: string;
+  vertical: string;
+}
+
+interface TuiTheme {
+  accent: ChalkInstance;
+  brand: ChalkInstance;
+  color: boolean;
+  done: ChalkInstance;
+  ink: ChalkInstance;
+  line: ChalkInstance;
+  muted: ChalkInstance;
+  reading: ChalkInstance;
+  styles: ChalkInstance;
+}
+
+function createBorders(unicode: boolean): TuiBorders {
+  return unicode
+    ? {
+        bottomLeft: "└",
+        bottomRight: "┘",
+        horizontal: "─",
+        middleLeft: "├",
+        middleRight: "┤",
+        topLeft: "┌",
+        topRight: "┐",
+        vertical: "│",
+      }
+    : {
+        bottomLeft: "+",
+        bottomRight: "+",
+        horizontal: "-",
+        middleLeft: "+",
+        middleRight: "+",
+        topLeft: "+",
+        topRight: "+",
+        vertical: "|",
+      };
+}
+
+function createTuiTheme(color: boolean): TuiTheme {
+  const styles = new Chalk({ level: color ? 3 : 0 });
+  return {
+    accent: styles.rgb(255, 119, 88),
+    brand: styles.rgb(255, 119, 88).bold,
+    color,
+    done: styles.rgb(105, 198, 154),
+    ink: styles,
+    line: styles.rgb(143, 181, 175),
+    muted: styles.rgb(170, 166, 154),
+    reading: styles.rgb(124, 160, 255),
+    styles,
+  };
+}
+
+function renderWorkspaceTitle(
+  state: TuiState,
+  width: number,
+  theme: TuiTheme,
+  unicode: boolean,
+): string {
+  const section = state.mode === "reader" ? "DOCUMENT READER" : "DOCUMENT INBOX";
+  const left = `${theme.brand("mdmaid.desk")} ${theme.muted("/")} ${theme.styles.bold(section)}`;
+  const right = theme.done(`${unicode ? "●" : "*"} LIVE`);
+  return spread(left, right, width);
+}
+
+function renderShortcutBar(
+  shortcuts: readonly (readonly [string, string])[],
+  theme: TuiTheme,
+): string {
+  return shortcuts
+    .map(([key, action]) => `${theme.accent(theme.styles.bold(key))} ${theme.muted(action)}`)
+    .join(theme.muted("   "));
+}
+
+function queueLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  theme: TuiTheme,
+  borders: TuiBorders,
+): string[] {
+  const showSidebar = width >= 96;
+  if (!showSidebar) {
+    return queueMainLines(state, width, height, theme, borders);
   }
-  const rows = state.visibleDocuments.map((document, index) => {
-    const marker = index === state.selectedIndex ? ">" : " ";
-    const status = document.status === "unread" ? "NEW" : document.status === "reading" ? "READING" : "DONE";
-    return `${marker} [${status}] ${document.title}  ${document.workspaceId}/${document.kind}`;
-  });
-  const available = Math.max(1, height - 2);
-  const start = clamp(
-    state.selectedIndex - Math.floor(available / 2),
-    0,
-    Math.max(0, rows.length - available),
+
+  const sidebarWidth = 25;
+  const mainWidth = width - sidebarWidth - 1;
+  const sidebar = sidebarLines(
+    state,
+    sidebarWidth,
+    height,
+    theme,
+    borders.vertical === "│",
   );
-  return [truncate(summary, width), "", ...rows.slice(start, start + available)];
+  const main = queueMainLines(state, mainWidth, height, theme, borders);
+  return Array.from({ length: height }, (_, index) =>
+    `${fitLine(sidebar[index] ?? "", sidebarWidth)}${theme.line(borders.vertical)}${fitLine(main[index] ?? "", mainWidth)}`,
+  );
 }
 
-function readerLines(state: TuiState, width: number, height: number): string[] {
-  if (!state.reader) {
-    return ["Document is not loaded."];
+function handleQueueMouse(
+  state: TuiState,
+  event: TuiMouseEvent,
+  safeWidth: number,
+  safeHeight: number,
+): TuiTransition {
+  const innerWidth = safeWidth - 2;
+  const bodyHeight = safeHeight - 6;
+  const bodyIndex = event.y - 4;
+  if (bodyIndex < 0 || bodyIndex >= bodyHeight) {
+    return { state, effects: [] };
   }
+
+  const showSidebar = innerWidth >= 96;
+  const sidebarWidth = showSidebar ? 25 : 0;
+  if (
+    showSidebar &&
+    event.x >= 2 &&
+    event.x < 2 + sidebarWidth
+  ) {
+    if (bodyIndex === 2) {
+      return {
+        state: applyFilters({ ...state, workspaceFilter: undefined }),
+        effects: [],
+      };
+    }
+    const workspaceIndex = bodyIndex - 3;
+    const workspace = state.workspaces[workspaceIndex];
+    if (workspace) {
+      return {
+        state: applyFilters({ ...state, workspaceFilter: workspace.id }),
+        effects: [],
+      };
+    }
+    const statusIndex = bodyIndex - (6 + state.workspaces.length);
+    const statuses: StatusFilter[] = ["all", "unread", "reading", "done"];
+    const status = statuses[statusIndex];
+    if (status) {
+      return {
+        state: applyFilters({ ...state, statusFilter: status }),
+        effects: [],
+      };
+    }
+    return { state, effects: [] };
+  }
+
+  const mainX = showSidebar ? 2 + sidebarWidth + 1 : 2;
+  const mainWidth = showSidebar ? innerWidth - sidebarWidth - 1 : innerWidth;
+  const relativeX = event.x - mainX;
+  const cardLine = bodyIndex - 2;
+  if (relativeX < 0 || relativeX >= mainWidth || cardLine < 0) {
+    return { state, effects: [] };
+  }
+  const lineInCard = cardLine % 5;
+  if (lineInCard >= 4) {
+    return { state, effects: [] };
+  }
+
+  const metrics = queuePageMetrics(state, mainWidth, bodyHeight);
+  let column = 0;
+  if (metrics.columns === 2) {
+    if (relativeX === metrics.firstWidth) {
+      return { state, effects: [] };
+    }
+    column = relativeX > metrics.firstWidth ? 1 : 0;
+  }
+  const row = Math.floor(cardLine / 5);
+  const documentIndex =
+    (metrics.startRow + row) * metrics.columns + column;
+  const document = state.visibleDocuments[documentIndex];
+  if (!document) {
+    return { state, effects: [] };
+  }
+  return {
+    state: { ...state, selectedIndex: documentIndex },
+    effects: [{ type: "open", documentId: document.id }],
+  };
+}
+
+function footerKeyAt(state: TuiState, x: number): string | undefined {
+  if (state.searching || x < 2) {
+    return undefined;
+  }
+  const shortcuts: Array<readonly [string, string, string | undefined]> =
+    state.mode === "reader"
+      ? [
+          ["j/k", "scroll", undefined],
+          ["m", "read", "m"],
+          ["u", "unread", "u"],
+          ["a", "archive", "a"],
+          ["b", "queue", "b"],
+          ["q", "quit", "q"],
+        ]
+      : [
+          ["j/k", "move", undefined],
+          ["enter", "open", "enter"],
+          ["s", "status", "s"],
+          ["p", "project", "p"],
+          ["/", "search", "/"],
+          ["q", "quit", "q"],
+        ];
+  let cursor = 2;
+  for (const [label, action, key] of shortcuts) {
+    const end = cursor + stringWidth(`${label} ${action}`);
+    if (x >= cursor && x < end) {
+      return key;
+    }
+    cursor = end + 3;
+  }
+  return undefined;
+}
+
+function sidebarLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  theme: TuiTheme,
+  unicode: boolean,
+): string[] {
+  const lines: string[] = [theme.accent(theme.styles.bold(" PROJECTS")), ""];
+  lines.push(
+    navigationLine(
+      "All documents",
+      state.documents.length,
+      state.workspaceFilter === undefined,
+      width,
+      theme,
+      unicode,
+    ),
+  );
+  for (const workspace of state.workspaces) {
+    lines.push(
+      navigationLine(
+        workspace.name,
+        workspace.documentCount,
+        state.workspaceFilter === workspace.id,
+        width,
+        theme,
+        unicode,
+      ),
+    );
+  }
+  lines.push("", theme.accent(theme.styles.bold(" STATUS")), "");
+  const counts: Record<StatusFilter, number> = {
+    all: state.documents.length,
+    unread: state.documents.filter(({ status }) => status === "unread").length,
+    reading: state.documents.filter(({ status }) => status === "reading").length,
+    done: state.documents.filter(({ status }) => status === "done").length,
+  };
+  const labels: Record<StatusFilter, string> = {
+    all: "All",
+    unread: "New",
+    reading: "Reading",
+    done: "Done",
+  };
+  for (const status of ["all", "unread", "reading", "done"] as const) {
+    lines.push(
+      navigationLine(
+        labels[status],
+        counts[status],
+        state.statusFilter === status,
+        width,
+        theme,
+        unicode,
+        status === "all" ? undefined : status,
+      ),
+    );
+  }
+  return lines.slice(0, height);
+}
+
+function navigationLine(
+  label: string,
+  count: number,
+  selected: boolean,
+  width: number,
+  theme: TuiTheme,
+  unicode: boolean,
+  status?: ReadingStatus,
+): string {
+  const marker = selected ? (unicode ? "●" : "*") : " ";
+  const markerStyle = status ? statusStyle(theme, status) : theme.accent;
+  const safeLabel = sanitizeTerminalText(label).replace(/\s+/g, " ");
+  const text = selected ? theme.styles.bold(safeLabel) : theme.muted(safeLabel);
+  return spread(` ${markerStyle(marker)} ${text}`, theme.muted(String(count)), width - 1);
+}
+
+interface QueuePageMetrics {
+  columns: 1 | 2;
+  firstWidth: number;
+  rowsPerPage: number;
+  startRow: number;
+  totalRows: number;
+}
+
+function queuePageMetrics(
+  state: TuiState,
+  width: number,
+  height: number,
+): QueuePageMetrics {
+  const columns = width >= 84 ? 2 : 1;
+  const gap = columns === 2 ? 1 : 0;
+  const firstWidth = columns === 2 ? Math.floor((width - gap) / 2) : width;
+  const rowsPerPage = Math.max(1, Math.floor((height - 2 + 1) / 5));
+  const selectedRow = Math.floor(state.selectedIndex / columns);
+  const totalRows = Math.ceil(state.visibleDocuments.length / columns);
+  const startRow = clamp(
+    selectedRow - Math.floor(rowsPerPage / 2),
+    0,
+    Math.max(0, totalRows - rowsPerPage),
+  );
+  return { columns, firstWidth, rowsPerPage, startRow, totalRows };
+}
+
+function queueMainLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  theme: TuiTheme,
+  borders: TuiBorders,
+): string[] {
+  const count = state.visibleDocuments.length;
+  const project = state.workspaceFilter
+    ? state.workspaces.find(({ id }) => id === state.workspaceFilter)?.name ?? state.workspaceFilter
+    : "All projects";
+  const filter = state.statusFilter === "all" ? "All statuses" : statusLabel(state.statusFilter);
+  const view = state.search ? `${project} · ${filter} · “${state.search}”` : `${project} · ${filter}`;
+  const lines = [
+    spread(
+      theme.styles.bold(`${count} ${count === 1 ? "document" : "documents"}`),
+      theme.muted(view),
+      width,
+    ),
+    state.message ? theme.accent(`! ${sanitizeTerminalText(state.message)}`) : "",
+  ];
+  if (count === 0) {
+    lines.push("", theme.muted("No documents match this view."));
+    return lines;
+  }
+
+  const metrics = queuePageMetrics(state, width, height);
+  const { columns, firstWidth, rowsPerPage, startRow, totalRows } = metrics;
+  const gap = columns === 2 ? 1 : 0;
+  const secondWidth = width - firstWidth - gap;
+
+  for (let row = startRow; row < Math.min(totalRows, startRow + rowsPerPage); row += 1) {
+    const firstIndex = row * columns;
+    const first = renderDocumentCard(
+      state.visibleDocuments[firstIndex]!,
+      firstWidth,
+      firstIndex === state.selectedIndex,
+      theme,
+      borders,
+    );
+    const secondDocument = columns === 2
+      ? state.visibleDocuments[firstIndex + 1]
+      : undefined;
+    const second = secondDocument
+      ? renderDocumentCard(
+          secondDocument,
+          secondWidth,
+          firstIndex + 1 === state.selectedIndex,
+          theme,
+          borders,
+        )
+      : Array.from({ length: first.length }, () => " ".repeat(secondWidth));
+    for (let line = 0; line < first.length; line += 1) {
+      lines.push(
+        columns === 2
+          ? `${first[line] ?? ""}${" ".repeat(gap)}${second[line] ?? ""}`
+          : first[line] ?? "",
+      );
+    }
+    if (row < Math.min(totalRows, startRow + rowsPerPage) - 1) {
+      lines.push("");
+    }
+  }
+  return lines.slice(0, height);
+}
+
+function renderDocumentCard(
+  document: PublicDocument,
+  width: number,
+  selected: boolean,
+  theme: TuiTheme,
+  borders: TuiBorders,
+): string[] {
+  const borderStyle = selected ? theme.accent : theme.line;
+  const status = statusStyle(theme, document.status);
+  const label = status(
+    `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
+  );
+  const topPrefix = `${borderStyle(`${borders.topLeft}${borders.horizontal}`)} ${label} `;
+  const topFill = Math.max(0, width - stringWidth(topPrefix) - 1);
+  const top = `${topPrefix}${borderStyle(`${borders.horizontal.repeat(topFill)}${borders.topRight}`)}`;
+  const marker = selected ? theme.accent("› ") : "  ";
+  const title = selected
+    ? theme.styles.bold(sanitizeTerminalText(document.title))
+    : theme.ink(sanitizeTerminalText(document.title));
+  const meta = [document.workspaceId, document.kind, document.taskId]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => sanitizeTerminalText(value))
+    .join(" · ");
+  const bodyWidth = Math.max(0, width - 2);
+  const left = status(borders.vertical);
+  const right = borderStyle(borders.vertical);
+  const titleLine = `${left}${fitLine(`${marker}${title}`, bodyWidth)}${right}`;
+  const metaLine = `${left}${fitLine(`  ${theme.muted(meta)}`, bodyWidth)}${right}`;
+  const bottom = borderStyle(
+    `${borders.bottomLeft}${borders.horizontal.repeat(Math.max(0, width - 2))}${borders.bottomRight}`,
+  );
+  return [top, titleLine, metaLine, bottom].map((line) => fitLine(line, width));
+}
+
+function readerLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  theme: TuiTheme,
+  borders: TuiBorders,
+): string[] {
+  if (!state.reader) {
+    return [theme.muted("Document is not loaded.")];
+  }
+  const { document } = state.reader;
+  const title = sanitizeTerminalText(document.title).replace(/\s+/g, " ");
+  const pill = statusStyle(theme, document.status)(
+    `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
+  );
   const meta = [
-    state.reader.document.workspaceId,
-    state.reader.document.taskId,
-    state.reader.document.kind,
+    document.workspaceId,
+    document.taskId,
+    document.kind,
     state.reader.backend,
-  ].filter(Boolean).join(" / ");
-  const warningLines = state.reader.warnings.map((warning) => `warning: ${warning}`);
-  const content = state.reader.content.split(/\r?\n/);
-  const all = [meta, ...warningLines, "", ...content];
-  const maxScroll = Math.max(0, all.length - height);
+  ].filter((value): value is string => Boolean(value)).join(" · ");
+  const heading = spread(
+    `${pill}  ${theme.styles.bold(title)}`,
+    theme.muted(`revision ${document.revision}`),
+    width,
+  );
+  const warningLines = state.reader.warnings.map((warning) =>
+    theme.accent(`warning: ${sanitizeTerminalText(warning)}`),
+  );
+  const content = sanitizeTerminalText(state.reader.content, {
+    preserveSgr: theme.color,
+  }).split("\n");
+  const all = warningLines.length > 0
+    ? [...warningLines, "", ...content]
+    : content;
+  const headerLength = state.message ? 4 : 3;
+  const available = Math.max(1, height - headerLength);
+  const maxScroll = Math.max(0, all.length - available);
   const scroll = clamp(state.scroll, 0, maxScroll);
-  return all.slice(scroll, scroll + height).map((line) => truncate(line, width));
-}
-
-function renderReaderTitle(state: TuiState): string {
-  if (!state.reader) {
-    return "mdmaid.desk / reader";
+  const visible = all.slice(scroll, scroll + available);
+  const progress = `${scroll + 1}-${Math.min(all.length, scroll + available)} / ${all.length}`;
+  const header = [
+    heading,
+    spread(
+      theme.muted(sanitizeTerminalText(meta)),
+      theme.muted(progress),
+      width,
+    ),
+  ];
+  if (state.message) {
+    header.push(theme.accent(`! ${sanitizeTerminalText(state.message)}`));
   }
-  return `mdmaid.desk / ${state.reader.document.title} [${state.reader.document.status}]`;
+  header.push("");
+  return [
+    ...header,
+    ...visible.map((line) => fitLine(line, width)),
+  ].slice(0, height);
 }
 
-function boxLine(value: string, width: number): string {
-  return `|${truncate(value, width).padEnd(width)}|`;
+function statusStyle(theme: TuiTheme, status: ReadingStatus): ChalkInstance {
+  if (status === "reading") {
+    return theme.reading;
+  }
+  if (status === "done") {
+    return theme.done;
+  }
+  return theme.accent;
+}
+
+function statusLabel(status: ReadingStatus): string {
+  if (status === "unread") {
+    return "New";
+  }
+  if (status === "reading") {
+    return "Reading";
+  }
+  return "Done";
+}
+
+function statusSymbol(status: ReadingStatus, unicode: boolean): string {
+  if (!unicode) {
+    if (status === "reading") {
+      return ">";
+    }
+    if (status === "done") {
+      return "x";
+    }
+    return "*";
+  }
+  if (status === "reading") {
+    return "◐";
+  }
+  if (status === "done") {
+    return "✓";
+  }
+  return "●";
+}
+
+function boxLine(
+  value: string,
+  width: number,
+  borders: TuiBorders,
+  theme: TuiTheme,
+): string {
+  return `${theme.line(borders.vertical)}${fitLine(value, width)}${theme.line(borders.vertical)}`;
+}
+
+function fitLine(value: string, width: number): string {
+  const fitted = truncate(value, width);
+  return `${fitted}${" ".repeat(Math.max(0, width - stringWidth(fitted)))}`;
+}
+
+function spread(left: string, right: string, width: number): string {
+  if (width <= 0) {
+    return "";
+  }
+  const safeRight = truncate(right, Math.max(0, Math.floor(width / 2)));
+  const leftWidth = Math.max(0, width - stringWidth(safeRight) - 1);
+  const safeLeft = truncate(left, leftWidth);
+  const gap = Math.max(1, width - stringWidth(safeLeft) - stringWidth(safeRight));
+  return truncate(`${safeLeft}${" ".repeat(gap)}${safeRight}`, width);
 }
 
 function truncate(value: string, width: number): string {
-  const safe = stripTerminalControls(value).replace(/[\r\n\t]/g, " ");
-  if (safe.length <= width) {
+  if (width <= 0) {
+    return "";
+  }
+  const safe = sanitizeTerminalText(value, { preserveSgr: true })
+    .replace(/[\r\n]/g, " ");
+  if (stringWidth(safe) <= width) {
     return safe;
   }
-  return width <= 1 ? safe.slice(0, width) : `${safe.slice(0, width - 1)}…`;
+  if (width === 1) {
+    return "…";
+  }
+  return `${sliceAnsi(safe, 0, width - 1)}…`;
 }
 
-function stripTerminalControls(value: string): string {
-  return value
-    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
-    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\u001b[PX^_][\s\S]*?\u001b\\/g, "")
-    .replace(/\u001b./g, "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
+function readerRenderWidth(width: number): number {
+  const safeWidth = clamp(Math.floor(width), 40, 1_000);
+  return clamp(safeWidth - 2, 20, 1_000);
 }
 
-function decodeKeys(value: string): string[] {
-  const keys: string[] = [];
+interface DecodedInput {
+  events: TuiInputEvent[];
+  remainder: string;
+}
+
+type TuiInputEvent =
+  | { type: "key"; key: string }
+  | { type: "mouse"; event: TuiMouseEvent };
+
+function decodeInput(value: string): DecodedInput {
+  const events: TuiInputEvent[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const rest = value.slice(index);
+    const mouse = rest.match(/^\u001b\[<(\d+);(\d+);(\d+)([Mm])/);
+    if (mouse) {
+      const code = Number(mouse[1]);
+      const x = Number(mouse[2]);
+      const y = Number(mouse[3]);
+      const terminator = mouse[4];
+      const button = decodeMouseButton(code, terminator);
+      if (button) {
+        events.push({ type: "mouse", event: { button, x, y } });
+      }
+      index += mouse[0].length - 1;
+      continue;
+    }
+    if (rest.startsWith("\u001b[<")) {
+      return { events, remainder: rest };
+    }
     if (rest.startsWith("\u001b[A")) {
-      keys.push("up");
+      events.push({ type: "key", key: "up" });
       index += 2;
     } else if (rest.startsWith("\u001b[B")) {
-      keys.push("down");
+      events.push({ type: "key", key: "down" });
       index += 2;
+    } else if (rest.startsWith("\u001b[5~")) {
+      events.push({ type: "key", key: "pageup" });
+      index += 3;
+    } else if (rest.startsWith("\u001b[6~")) {
+      events.push({ type: "key", key: "pagedown" });
+      index += 3;
     } else {
       const character = value[index] ?? "";
       if (character === "\r" || character === "\n") {
-        keys.push("enter");
+        events.push({ type: "key", key: "enter" });
       } else if (character === "\u001b") {
-        keys.push("escape");
+        events.push({ type: "key", key: "escape" });
       } else if (character === "\u0003") {
-        keys.push("ctrl-c");
+        events.push({ type: "key", key: "ctrl-c" });
       } else if (character === "\u007f" || character === "\b") {
-        keys.push("backspace");
+        events.push({ type: "key", key: "backspace" });
       } else {
-        keys.push(character);
+        events.push({ type: "key", key: character });
       }
     }
   }
-  return keys;
+  return { events, remainder: "" };
+}
+
+function decodeMouseButton(
+  code: number,
+  terminator: string | undefined,
+): TuiMouseEvent["button"] | undefined {
+  if (!Number.isSafeInteger(code) || code < 0 || terminator !== "M") {
+    return undefined;
+  }
+  if ((code & 64) !== 0) {
+    return (code & 1) === 0 ? "wheel-up" : "wheel-down";
+  }
+  return (code & 3) === 0 ? "left" : undefined;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

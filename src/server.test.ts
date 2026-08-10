@@ -160,7 +160,7 @@ test("renders authorized Markdown for web and terminal targets", async () => {
 
     const terminal = await authorized(
       value,
-      `/api/v1/documents/${value.document.id}/render?target=terminal&width=80`,
+      `/api/v1/documents/${value.document.id}/render?target=terminal&width=80&color=true&unicode=true`,
     );
     assert.equal(terminal.status, 200);
     const terminalBody = (await terminal.json()) as {
@@ -168,9 +168,18 @@ test("renders authorized Markdown for web and terminal targets", async () => {
     };
     assert.equal(terminalBody.data.target, "terminal");
     assert.match(terminalBody.data.content, /Visible plan/);
-    assert.ok(["veol", "beautiful-mermaid", "source"].includes(terminalBody.data.backend));
+    assert.equal(terminalBody.data.backend, "beautiful-mermaid");
     assert.ok(Array.isArray(terminalBody.data.warnings));
-    assert.doesNotMatch(terminalBody.data.content, /[\u001b\u0007]/);
+    assert.match(terminalBody.data.content, /\u001b\[[0-9;]*m/);
+    assert.match(terminalBody.data.content, /═/);
+    assert.doesNotMatch(terminalBody.data.content, /\u001b\]|\u0007|terminal-injection/);
+    assert.doesNotMatch(terminalBody.data.content, /\u001b\[[0-9;]*[A-HJKSTf]/);
+
+    const invalidPreference = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/render?target=terminal&color=rainbow`,
+    );
+    assert.equal(invalidPreference.status, 400);
   } finally {
     await closeFixture(value);
   }

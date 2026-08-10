@@ -49,9 +49,13 @@ test("uses the versioned daemon API for terminal client operations", async () =>
       (await client.listWorkspaces()).map(({ id }) => id),
       ["example"],
     );
-    const rendered = await client.renderDocument(document.id, "terminal", 78);
+    const rendered = await client.renderDocument(document.id, "terminal", 78, {
+      color: true,
+      unicode: false,
+    });
     assert.match(rendered.content, /Terminal plan/);
-    assert.ok(["veol", "beautiful-mermaid", "source"].includes(rendered.backend));
+    assert.match(rendered.content, /\u001b\[[0-9;]*m/);
+    assert.equal(rendered.backend, "beautiful-mermaid");
     assert.equal((await client.act(document.id, "opened")).status, "reading");
     assert.equal((await client.act(document.id, "read")).status, "done");
 
