@@ -11,6 +11,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 
 import { DeskApiClient } from "./api-client.js";
+import { syncDirectory } from "./fs-durability.js";
 import type { RunningDeskServer } from "./server.js";
 
 export const DESK_PROTOCOL_VERSION = 1;
@@ -75,12 +76,7 @@ export async function writeDaemonDescriptor(
     await chmod(temporary, 0o600);
     await rename(temporary, destination);
     created = false;
-    const directoryHandle = await open(directory, constants.O_RDONLY);
-    try {
-      await directoryHandle.sync();
-    } finally {
-      await directoryHandle.close();
-    }
+    await syncDirectory(directory);
   } finally {
     if (created) {
       await unlinkIfPresent(temporary);

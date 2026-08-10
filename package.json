@@ -1,9 +1,30 @@
 {
-  "name": "mdmaid.desk",
+  "name": "mdmaid-desk",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "Persistent local document inbox and reading workspace for Markdown artifacts",
+  "keywords": [
+    "markdown",
+    "mermaid",
+    "document-inbox",
+    "reader",
+    "tui",
+    "cli"
+  ],
+  "author": "Oleksandr Besan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OleksandrBesan/mdmaid.desk"
+  },
+  "homepage": "https://github.com/OleksandrBesan/mdmaid.desk#readme",
+  "bugs": {
+    "url": "https://github.com/OleksandrBesan/mdmaid.desk/issues"
+  },
+  "files": [
+    "dist",
+    "!dist/*.test.*"
+  ],
   "bin": {
     "mdmaid-desk": "dist/cli.js"
   },
@@ -11,10 +32,16 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/*.test.js",
     "test:coverage": "npm run build && node --test --experimental-test-coverage dist/*.test.js",
-    "check": "npm run test"
+    "check": "npm run test",
+    "package:smoke": "npm run build && node scripts/package-smoke.mjs",
+    "prepublishOnly": "npm run check && npm run package:smoke"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",

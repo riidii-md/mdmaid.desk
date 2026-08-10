@@ -61,6 +61,8 @@ interfaces. `mdmaid.nvim` may become an optional client.
 
 ## Development
 
+mdmaid.desk requires Node.js 22 or newer.
+
 ```bash
 npm install
 npm test
@@ -77,6 +79,27 @@ Run the CLI from the build:
 ```bash
 node dist/cli.js --help
 ```
+
+## Installation
+
+After the first public release, install the canonical npm package globally:
+
+```bash
+npm install --global mdmaid-desk
+mdmaid-desk --version
+mdmaid-desk web
+```
+
+In another terminal, open the same catalog through the terminal client:
+
+```bash
+mdmaid-desk tui
+```
+
+Homebrew is the planned first-class macOS installation and service path. Its
+formula will consume this same npm release so the two installers share one
+version and artifact lineage. See [Releasing and distribution](docs/RELEASING.md)
+for the rollout and one-time npm bootstrap.
 
 ## Current CLI
 
@@ -172,8 +195,10 @@ Document registration and presentation never imply workflow approval.
 ## Documentation
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
+- [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
+- [MIT license](LICENSE)
 
 ## Naming
 
@@ -182,7 +207,7 @@ Current naming:
 ```text
 Product/UI:  mdmaid.desk
 Repository:  mdmaid.desk
-Package:     mdmaid.desk
+Package:     mdmaid-desk
 CLI:         mdmaid-desk
 ```
 
