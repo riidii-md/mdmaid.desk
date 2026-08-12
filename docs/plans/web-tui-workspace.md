@@ -19,8 +19,8 @@ mdmaid
   Markdown/Mermaid rendering primitives for web and terminal targets
 
 mdmaid.desk
-  Persistent daemon, catalog, revisions, reading queue, tags, watcher,
-  stable document routes, web workspace, TUI workspace, CLI/API
+  Persistent catalog, optional daemon, revisions, reading queue, tags,
+  watcher, stable document routes, web workspace, TUI workspace, CLI/API
 
 mdmaid.nvim
   Neovim-specific client behavior
@@ -73,24 +73,33 @@ interface TerminalRenderResult {
 
 ```mermaid
 flowchart LR
-    P[Harnesses / editors / scripts] -->|CLI, API, stdin, watcher| D[mdmaid.desk daemon]
+    P[Harnesses / editors / scripts] -->|CLI / stdin| X[Transport selector]
     CFG[agentctl] -.->|optional configuration| P
 
-    D --> C[(SQLite catalog)]
+    X -->|healthy daemon| API[Authenticated local API]
+    X -->|no daemon| C[(SQLite catalog)]
+    API --> D[Optional mdmaid.desk daemon]
+    D --> C
     D --> F[(Authorized Markdown files)]
     D --> R[mdmaid rendering adapter]
     D --> E[Document-scoped event stream]
 
-    W[Web workspace] --> API[Versioned local API]
+    W[Web workspace] --> API
     T[TUI workspace] --> API
-    API --> D
     E --> W
     E --> T
 ```
 
-One daemon owns all mutations, migrations, filesystem watches, and live
-events. CLI, web, TUI, and Neovim are clients; they do not open the catalog
-directly.
+The SQLite catalog is durable independently of a daemon. A short-lived producer
+command can always add to the queue: it uses the authenticated API when a
+healthy daemon is discoverable and otherwise opens the catalog for one bounded
+transaction. Web, TUI, and future Neovim clients use the API for presentation
+and reading actions.
+
+While active, one optional daemon owns continuous behavior: filesystem
+watching, live events, HTTP routes, and future comment/edit coordination. CLI
+commands must prefer its API so mutations reach the daemon event stream. A
+daemon is never started permanently as a side effect of document ingress.
 
 ## Document ingress
 
@@ -117,6 +126,10 @@ some-harness-command | mdmaid-desk enqueue - \
 
 `producer` is opaque metadata, not a closed enum. Adding a harness must not
 require a `mdmaid.desk` release.
+
+Registration and enqueue must succeed after installation even if the user has
+never started the web workspace, TUI, or background daemon. The next web/TUI
+session reads the same catalog and displays all queued documents.
 
 ## Reading lifecycle
 
@@ -282,12 +295,16 @@ Status: complete.
 ### 3. Daemon and API
 
 Status: initial foreground service and versioned API complete. Background
-`ensure/status/stop`, enqueue, and watcher work remain.
+daemon lifecycle, enqueue, and watcher work remain.
 
-- implement single-instance ensure/status/stop;
+- route CLI mutations through a healthy daemon, with a direct-catalog fallback;
+- implement single-instance start/status/stop;
+- add explicit user-service install/uninstall without automatic installation;
 - bind to loopback with authenticated local access;
 - add generic registration/enqueue and versioned endpoints;
-- add document-scoped events and render endpoints.
+- add document-scoped events and render endpoints;
+- test startup races, stale descriptors, SQLite contention, and live event
+  delivery.
 
 ### 4. Web workspace
 
@@ -314,7 +331,8 @@ Status: in progress. Web and TUI share the daemon API, discovery descriptor,
 reading actions, filters, and live catalog events. Generic CLI mutations and
 Neovim migration remain.
 
-- route CLI automation through the daemon;
+- make CLI automation attach-first with a daemonless fallback;
+- make `web` reuse an existing daemon instead of starting a second service;
 - migrate `mdmaid.nvim` to public daemon/rendering interfaces;
 - run shared contract scenarios against web and TUI actions.
 
@@ -327,8 +345,13 @@ the owning workspace remains responsible for long-term source history.
 
 ## Acceptance criteria
 
-- One persistent user daemon serves multiple projects.
-- Any harness/tool can enqueue or register Markdown without an agentctl runtime.
+- Any harness/tool can enqueue or register Markdown without an agentctl runtime
+  or running daemon.
+- One optional user daemon serves multiple projects and live clients.
+- Starting or stopping the daemon does not change the persistent queue.
+- A running daemon receives CLI mutations through its API and publishes live
+  catalog events.
+- Permanent background service installation is an explicit user choice.
 - Project grouping, tags, filters, and the default reading queue persist.
 - Opening a successfully rendered revision marks Reading.
 - Only an explicit action marks the current revision Done.

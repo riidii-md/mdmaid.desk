@@ -29,16 +29,17 @@ The repository contains the first usable shared-service vertical slice:
 - memorable `http://mdmaid.desk.localhost:43127/` browser origin;
 - `workspace`, `register`, `list`, `web`, and `tui` commands.
 
-Background `daemon ensure/status/stop`, directory watching, stdin-managed
-enqueue, comments, and editing remain planned milestones. `web` currently runs
-the persistent service in the foreground; `tui` attaches to it when present and
-uses an embedded loopback service otherwise.
+Optional background `daemon start/status/stop/install/uninstall`, directory
+watching, stdin-managed enqueue, comments, and editing remain planned
+milestones. Document registration already works without a daemon. `web`
+currently runs the service in the foreground; `tui` attaches to it when present
+and uses an embedded loopback service otherwise.
 
 ## Responsibility
 
 `mdmaid.desk` owns:
 
-- the persistent local daemon;
+- the persistent catalog and optional local daemon;
 - workspace and document catalogs;
 - artifact-directory discovery;
 - stable document URLs;
