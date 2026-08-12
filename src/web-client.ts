@@ -92,6 +92,25 @@ export function queueCounts(
   );
 }
 
+export function visibleWorkspaces(
+  documents: WebDocument[],
+  workspaces: WebWorkspace[],
+): WebWorkspace[] {
+  const counts = new Map<string, number>();
+  for (const document of documents) {
+    if (document.archivedAt === null) {
+      counts.set(
+        document.workspaceId,
+        (counts.get(document.workspaceId) ?? 0) + 1,
+      );
+    }
+  }
+  return workspaces.flatMap((workspace) => {
+    const documentCount = counts.get(workspace.id) ?? 0;
+    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
+  });
+}
+
 async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
@@ -143,15 +162,20 @@ async function boot(): Promise<void> {
 
   function renderProjects(): void {
     projectNav.replaceChildren();
+    const workspaces = visibleWorkspaces(state.documents, state.workspaces);
+    if (
+      state.filters.workspaceId !== undefined &&
+      !workspaces.some(({ id }) => id === state.filters.workspaceId)
+    ) {
+      state.filters.workspaceId = undefined;
+    }
     const all = projectButton("all projects", state.documents.length, undefined);
     projectNav.append(all);
-    for (const workspace of state.workspaces) {
+    for (const workspace of workspaces) {
       projectNav.append(
         projectButton(
           workspace.name,
-          state.documents.filter(
-            ({ workspaceId }) => workspaceId === workspace.id,
-          ).length,
+          workspace.documentCount,
           workspace.id,
         ),
       );

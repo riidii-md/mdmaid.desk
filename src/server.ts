@@ -247,13 +247,14 @@ async function handleRequest(
   if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
     const documents = catalog.listDocuments();
     sendJson(response, 200, {
-      data: catalog.listWorkspaces().map((workspace) =>
-        publicWorkspace(
-          workspace,
-          documents.filter(({ workspaceId }) => workspaceId === workspace.id)
-            .length,
-        ),
-      ),
+      data: catalog.listWorkspaces().flatMap((workspace) => {
+        const documentCount = documents.filter(
+          ({ workspaceId }) => workspaceId === workspace.id,
+        ).length;
+        return documentCount === 0
+          ? []
+          : [publicWorkspace(workspace, documentCount)];
+      }),
     });
     return;
   }

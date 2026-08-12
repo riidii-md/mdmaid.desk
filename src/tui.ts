@@ -71,6 +71,7 @@ export function createTuiState(
   documents: PublicDocument[],
   workspaces: PublicWorkspace[],
 ): TuiState {
+  const visibleWorkspaces = workspacesForDocuments(documents, workspaces);
   const state: TuiState = {
     documents,
     mode: "queue",
@@ -79,7 +80,7 @@ export function createTuiState(
     selectedIndex: 0,
     statusFilter: "all",
     visibleDocuments: [],
-    workspaces,
+    workspaces: visibleWorkspaces,
     scroll: 0,
   };
   return applyFilters(state);
@@ -105,9 +106,21 @@ export function applyTuiReader(
 export function replaceTuiDocuments(
   state: TuiState,
   documents: PublicDocument[],
+  workspaces: PublicWorkspace[] = state.workspaces,
 ): TuiState {
   const selectedId = state.visibleDocuments[state.selectedIndex]?.id;
-  let next = applyFilters({ ...state, documents });
+  const visibleWorkspaces = workspacesForDocuments(documents, workspaces);
+  const workspaceFilter = visibleWorkspaces.some(
+    ({ id }) => id === state.workspaceFilter,
+  )
+    ? state.workspaceFilter
+    : undefined;
+  let next = applyFilters({
+    ...state,
+    documents,
+    workspaces: visibleWorkspaces,
+    workspaceFilter,
+  });
   const selectedIndex = selectedId
     ? next.visibleDocuments.findIndex(({ id }) => id === selectedId)
     : -1;
@@ -429,10 +442,7 @@ export async function runTui(
             client.listDocuments(),
             client.listWorkspaces(),
           ]);
-          state = {
-            ...replaceTuiDocuments(state, documents),
-            workspaces,
-          };
+          state = replaceTuiDocuments(state, documents, workspaces);
           draw();
         })
         .catch((error: unknown) => {
@@ -634,6 +644,23 @@ function applyFilters(state: TuiState): TuiState {
     ),
     visibleDocuments,
   };
+}
+
+function workspacesForDocuments(
+  documents: PublicDocument[],
+  workspaces: PublicWorkspace[],
+): PublicWorkspace[] {
+  const counts = new Map<string, number>();
+  for (const document of documents) {
+    counts.set(
+      document.workspaceId,
+      (counts.get(document.workspaceId) ?? 0) + 1,
+    );
+  }
+  return workspaces.flatMap((workspace) => {
+    const documentCount = counts.get(workspace.id) ?? 0;
+    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
+  });
 }
 
 interface TuiBorders {
