@@ -272,6 +272,60 @@ test("registers documents through validated producer-neutral input", async () =>
   }
 });
 
+test("adds workspaces through validated producer-neutral input", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-server-workspace-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "workspace-token",
+  });
+  const value = { catalog, root, server, workspace } as ServerFixture;
+  try {
+    const response = await authorized(value, "/api/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "created",
+        name: "Created",
+        root: workspace,
+        artifactRoots: [workspace],
+      }),
+    });
+    assert.equal(response.status, 201);
+    assert.equal(response.headers.get("location"), "/api/v1/workspaces/created");
+    assert.deepEqual(await response.json(), {
+      data: {
+        id: "created",
+        name: "Created",
+        documentCount: 0,
+        route: "/w/created",
+      },
+    });
+
+    const invalid = await authorized(value, "/api/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: "created", root: workspace }),
+    });
+    assert.equal(invalid.status, 422);
+    assert.deepEqual(await invalid.json(), {
+      error: {
+        code: "validation_error",
+        message: "Invalid workspace registration",
+      },
+    });
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
 test("bootstraps a browser cookie and serves secure workspace routes", async () => {
   const value = await fixture();
   try {

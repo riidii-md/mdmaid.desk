@@ -294,8 +294,9 @@ Status: complete.
 
 ### 3. Daemon and API
 
-Status: initial foreground service and versioned API complete. Background
-daemon lifecycle, enqueue, and watcher work remain.
+Status: versioned API, daemon-first writes, single-instance background
+lifecycle, and explicit user-service installation complete. Enqueue and watcher
+work remain.
 
 - route CLI mutations through a healthy daemon, with a direct-catalog fallback;
 - implement single-instance start/status/stop;
@@ -327,12 +328,12 @@ terminal rendering.
 
 ### 6. Clients and parity
 
-Status: in progress. Web and TUI share the daemon API, discovery descriptor,
-reading actions, filters, and live catalog events. Generic CLI mutations and
-Neovim migration remain.
+Status: in progress. Web, TUI, and generic CLI mutations share the daemon API,
+discovery descriptor, reading actions, filters, and live catalog events.
+Neovim migration remains.
 
-- make CLI automation attach-first with a daemonless fallback;
-- make `web` reuse an existing daemon instead of starting a second service;
+- keep CLI automation attach-first with a daemonless fallback;
+- keep `web` attached to an existing daemon instead of starting a second service;
 - migrate `mdmaid.nvim` to public daemon/rendering interfaces;
 - run shared contract scenarios against web and TUI actions.
 

@@ -5,11 +5,12 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import type { DeskApiClient } from "./api-client.js";
+import { DeskApiClient } from "./api-client.js";
 import { isEntrypoint, run } from "./cli.js";
 import {
   daemonDescriptorPath,
   readDaemonDescriptor,
+  type DaemonConnection,
 } from "./daemon-state.js";
 import type {
   DeskServerOptions,
@@ -93,6 +94,93 @@ test("adds a workspace, registers a document, and lists it", async () => {
   assert.match(stdout.text(), /workspace example added/);
   assert.match(stdout.text(), /registered doc-/);
   assert.match(stdout.text(), /PROJECT-123/);
+  assert.equal(stderr.text(), "");
+});
+
+test("routes producer writes through a live daemon without opening local storage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-producer-"));
+  const statePath = join(root, "missing", "catalog.sqlite3");
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "review.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Review\n", "utf8");
+  const calls: unknown[] = [];
+  const client = {
+    addWorkspace: async (input: unknown) => {
+      calls.push(["workspace", input]);
+      return { id: "example", name: "Example", documentCount: 0, route: "/w/example" };
+    },
+    registerDocument: async (input: unknown) => {
+      calls.push(["document", input]);
+      return {
+        id: "doc-0123456789abcdefabcd",
+        workspaceId: "example",
+        producer: "codex",
+        kind: "review",
+        title: "Review",
+        attention: "review",
+        tags: ["agent"],
+        revision: 1,
+        openedRevision: null,
+        completedRevision: null,
+        status: "unread",
+        archivedAt: null,
+        missingAt: null,
+        createdAt: "2026-08-12T00:00:00.000Z",
+        updatedAt: "2026-08-12T00:00:00.000Z",
+        route: "/d/doc-0123456789abcdefabcd",
+      };
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+  const options = { statePath, connectDaemon: async () => client };
+
+  assert.equal(
+    await run(
+      ["workspace", "add", workspace, "--id", "example", "--name", "Example"],
+      stdout,
+      stderr,
+      options,
+    ),
+    0,
+  );
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "review",
+        "--attention",
+        "review",
+        "--producer",
+        "codex",
+        "--tag",
+        "agent",
+      ],
+      stdout,
+      stderr,
+      options,
+    ),
+    0,
+  );
+
+  assert.deepEqual(calls, [
+    ["workspace", { id: "example", name: "Example", root: workspace, artifactRoots: [workspace] }],
+    ["document", {
+      workspaceId: "example",
+      producer: "codex",
+      kind: "review",
+      title: "review",
+      path: documentPath,
+      attention: "review",
+      tags: ["agent"],
+    }],
+  ]);
+  await assert.rejects(readFile(statePath), /ENOENT/);
   assert.equal(stderr.text(), "");
 });
 
@@ -200,6 +288,80 @@ test("runs the web service until shutdown and prints its browser URL", async () 
   );
 });
 
+test("reuses a running daemon when opening the web workspace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-live-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection();
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost:43121/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("exposes explicit daemon lifecycle and user-service commands", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-daemon-"));
+  const statePath = join(root, "catalog.sqlite3");
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection();
+  const calls: string[] = [];
+  const options = {
+    statePath,
+    connectDaemonInfo: async () => connection,
+    startDaemon: async (_statePath: string, port?: number) => {
+      calls.push(`start:${port ?? "auto"}`);
+      return connection;
+    },
+    stopDaemon: async () => {
+      calls.push("stop");
+      return true;
+    },
+    installUserService: async (_statePath: string, port?: number) => {
+      calls.push(`install:${port ?? "auto"}`);
+    },
+    uninstallUserService: async () => {
+      calls.push("uninstall");
+    },
+  };
+
+  assert.equal(
+    await run(["daemon", "start", "--port", "43210"], stdout, stderr, options),
+    0,
+  );
+  assert.equal(await run(["daemon", "status"], stdout, stderr, options), 0);
+  assert.equal(await run(["daemon", "stop"], stdout, stderr, options), 0);
+  assert.equal(
+    await run(["daemon", "install", "--port", "43211"], stdout, stderr, options),
+    0,
+  );
+  assert.equal(await run(["daemon", "uninstall"], stdout, stderr, options), 0);
+
+  assert.deepEqual(calls, [
+    "start:43210",
+    "stop",
+    "install:43211",
+    "uninstall",
+  ]);
+  assert.match(stdout.text(), /daemon started/);
+  assert.match(stdout.text(), /daemon running/);
+  assert.match(stdout.text(), /daemon stopped/);
+  assert.match(stdout.text(), /user service installed/);
+  assert.match(stdout.text(), /user service uninstalled/);
+  assert.equal(stderr.text(), "");
+});
+
 test("uses the canonical direct localhost HTTP origin by default", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-http-"));
   const stdout = output();
@@ -230,6 +392,46 @@ test("uses the canonical direct localhost HTTP origin by default", async () => {
     /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
   );
   assert.doesNotMatch(stdout.text(), /proxy target/);
+  assert.equal(stderr.text(), "");
+});
+
+test("lets the daemon choose an available port when the default is occupied", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-open-port-"));
+  const statePath = join(root, "catalog.sqlite3");
+  const stdout = output();
+  const stderr = output();
+  const attempted: number[] = [];
+
+  const exit = await run(
+    ["__daemon-serve", "--state-path", statePath],
+    stdout,
+    stderr,
+    {
+      startServer: async (options) => {
+        attempted.push(options.port ?? -1);
+        if (attempted.length === 1) {
+          const error = new Error("address in use") as NodeJS.ErrnoException;
+          error.code = "EADDRINUSE";
+          throw error;
+        }
+        return fakeServer(() => undefined, {
+          port: 49876,
+          url: "http://127.0.0.1:49876",
+          webUrl: "http://127.0.0.1:49876/?token=test-token",
+        });
+      },
+      waitForShutdown: async () => {
+        const descriptor = await readDaemonDescriptor(
+          daemonDescriptorPath(statePath),
+        );
+        assert.equal(descriptor?.port, 49876);
+      },
+    },
+  );
+
+  assert.equal(exit, 0);
+  assert.deepEqual(attempted, [43127, 0]);
+  assert.equal(stdout.text(), "");
   assert.equal(stderr.text(), "");
 });
 
@@ -406,5 +608,20 @@ function fakeServer(
       onClose();
     },
     ...overrides,
+  };
+}
+
+function fakeConnection(): DaemonConnection {
+  return {
+    client: new DeskApiClient("http://127.0.0.1:43121", "test-token"),
+    descriptor: {
+      protocolVersion: 1,
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 43121,
+      token: "test-token",
+      startedAt: "2026-08-12T00:00:00.000Z",
+    },
+    url: "http://127.0.0.1:43121",
   };
 }

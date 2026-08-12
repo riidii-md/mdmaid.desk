@@ -33,7 +33,7 @@ For the first `mdmaid-desk` publish only:
 2. add it as `NPM_TOKEN` in the GitHub `prod` environment;
 3. merge the release-readiness pull request and let CI publish `0.1.0`;
 4. on npm, configure the package trusted publisher with:
-   - organization or user: `OleksandrBesan`;
+   - organization or user: `riidii-md`;
    - repository: `mdmaid.desk`;
    - workflow: `ci.yml`;
    - environment: `prod`;
@@ -58,7 +58,7 @@ starts the installed web daemon, and waits for its health endpoint.
 ## Homebrew follow-up
 
 After `mdmaid-desk@0.1.0` exists on npm, create a dedicated
-`OleksandrBesan/homebrew-tap` repository with a `mdmaid-desk` formula. The
+`riidii-md/homebrew-tap` repository with a `mdmaid-desk` formula. The
 formula should install the npm tarball into `libexec`, expose the
 `mdmaid-desk` executable, and define a foreground `web` command for
 `brew services`.
@@ -66,8 +66,8 @@ formula should install the npm tarball into `libexec`, expose the
 Target usage:
 
 ```bash
-brew install OleksandrBesan/tap/mdmaid-desk
-brew services start OleksandrBesan/tap/mdmaid-desk
+brew install riidii-md/tap/mdmaid-desk
+brew services start riidii-md/tap/mdmaid-desk
 mdmaid-desk tui
 ```
 

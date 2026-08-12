@@ -22,7 +22,7 @@ test("publishes a minimal public mdmaid-desk package", async () => {
   assert.equal(packageJson.license, "MIT");
   assert.deepEqual(packageJson.repository, {
     type: "git",
-    url: "https://github.com/OleksandrBesan/mdmaid.desk",
+    url: "https://github.com/riidii-md/mdmaid.desk",
   });
   assert.deepEqual(packageJson.files, ["dist", "!dist/*.test.*"]);
   assert.deepEqual(packageJson.publishConfig, {

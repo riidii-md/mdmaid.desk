@@ -27,6 +27,12 @@ export interface DaemonDescriptor {
   startedAt: string;
 }
 
+export interface DaemonConnection {
+  client: DeskApiClient;
+  descriptor: DaemonDescriptor;
+  url: string;
+}
+
 export function daemonDescriptorPath(statePath: string): string {
   return join(dirname(resolve(statePath)), "daemon.json");
 }
@@ -157,6 +163,12 @@ export async function removeDaemonDescriptor(
 export async function connectToDaemon(
   statePath: string,
 ): Promise<DeskApiClient | undefined> {
+  return (await connectToDaemonInfo(statePath))?.client;
+}
+
+export async function connectToDaemonInfo(
+  statePath: string,
+): Promise<DaemonConnection | undefined> {
   const path = daemonDescriptorPath(statePath);
   const descriptor = await readDaemonDescriptor(path);
   if (!descriptor) {
@@ -174,7 +186,11 @@ export async function connectToDaemon(
     if (health.version !== descriptor.protocolVersion) {
       throw new Error("Daemon protocol version does not match its descriptor");
     }
-    return client;
+    return {
+      client,
+      descriptor,
+      url: `http://${host}:${descriptor.port}`,
+    };
   } catch {
     await removeDaemonDescriptor(path, descriptor);
     return undefined;

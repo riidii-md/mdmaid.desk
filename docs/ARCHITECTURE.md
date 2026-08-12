@@ -109,14 +109,14 @@ existence of the queue. Starting or stopping it never removes catalog entries.
 port, and protocol version through `daemon.json`. `daemon install` explicitly
 configures a user service for people who want an always-available browser URL;
 installation or registration must not silently leave a permanent background
-process running. Homebrew services are the first macOS integration, with
-launchd/systemd adapters following the same lifecycle contract.
+process running. The npm CLI installs a LaunchAgent on macOS or systemd user
+service on Linux; a future Homebrew service uses the same lifecycle contract.
 
-The current vertical slice implements the same discovery contract through the
-foreground `mdmaid-desk web` command. It atomically publishes a mode-`0600`
-descriptor, and `mdmaid-desk tui` health-checks and reuses that service. The
-TUI starts a session-scoped embedded loopback server when no daemon exists.
-Background lifecycle and installation commands are planned next.
+Both foreground `mdmaid-desk web` and the background daemon atomically publish
+a mode-`0600` descriptor. CLI writes, web, and TUI health-check and reuse it.
+The TUI starts a session-scoped embedded loopback server when no daemon exists.
+A user can select a port, while an unpinned daemon falls back from `43127` to an
+available loopback port and reports the actual value through `daemon status`.
 
 `web` should attach to and open an existing healthy daemon when one exists. If
 none exists, it starts the service in the foreground until interrupted. The

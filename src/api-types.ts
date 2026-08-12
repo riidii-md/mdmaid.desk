@@ -33,6 +33,24 @@ export interface PublicWorkspace {
   route: string;
 }
 
+export interface WorkspaceRegistration {
+  id: string;
+  name: string;
+  root: string;
+  artifactRoots: string[];
+}
+
+export interface DocumentRegistration {
+  workspaceId: string;
+  taskId?: string;
+  producer?: string;
+  kind: DocumentKind;
+  title: string;
+  path: string;
+  attention: Attention;
+  tags?: string[];
+}
+
 export interface HealthData {
   service: "mdmaid.desk";
   status: "ok";

@@ -27,13 +27,16 @@ The repository contains the first usable shared-service vertical slice:
 - Server-Sent Event refreshes for both clients;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
 - memorable `http://mdmaid.desk.localhost:43127/` browser origin;
-- `workspace`, `register`, `list`, `web`, and `tui` commands.
+- daemon-first CLI writes with daemonless SQLite fallback;
+- explicit start, status, stop, login-service install, and uninstall lifecycle;
+- selectable ports with automatic available-port fallback;
+- `workspace`, `register`, `list`, `web`, `tui`, and `daemon` commands.
 
-Optional background `daemon start/status/stop/install/uninstall`, directory
-watching, stdin-managed enqueue, comments, and editing remain planned
-milestones. Document registration already works without a daemon. `web`
-currently runs the service in the foreground; `tui` attaches to it when present
-and uses an embedded loopback service otherwise.
+Directory watching, stdin-managed enqueue, comments, and editing remain planned
+milestones. Document registration works without a daemon, but automatically
+uses its authenticated API when one is running. `web` reuses a daemon or runs
+the service in the foreground; `tui` attaches to it when present and uses a
+session-scoped embedded loopback service otherwise.
 
 ## Responsibility
 
@@ -118,8 +121,10 @@ Register a document:
 node dist/cli.js register /path/to/repository/docs/plan.md \
   --workspace example \
   --task PROJECT-123 \
+  --producer codex \
   --kind plan \
-  --attention approval
+  --attention approval \
+  --tag architecture
 ```
 
 List documents:
@@ -155,6 +160,34 @@ same port as the service.
 
 See [Local browser URL](docs/LOCAL_WEB.md) for details.
 
+Run an optional background daemon once:
+
+```bash
+mdmaid-desk daemon start
+mdmaid-desk daemon status
+mdmaid-desk web
+mdmaid-desk daemon stop
+```
+
+The default port is `43127`. If it is occupied, an unpinned daemon selects an
+available loopback port; `daemon start` and `daemon status` print the actual
+port and authenticated web URL. Pin one when desired:
+
+```bash
+mdmaid-desk daemon start --port 43210
+```
+
+To start mdmaid.desk automatically at login, explicitly install its user
+service (LaunchAgent on macOS, systemd user service on Linux):
+
+```bash
+mdmaid-desk daemon install
+# or: mdmaid-desk daemon install --port 43210
+mdmaid-desk daemon uninstall
+```
+
+Registration never installs or permanently starts the daemon.
+
 Run the terminal workspace:
 
 ```bash
@@ -171,7 +204,8 @@ The default state directory is:
 ${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
   auth-token
   catalog.sqlite3
-  daemon.json  # present while the web service is running
+  daemon.json  # present while a foreground or background service is running
+  daemon.log
 ```
 
 ## Target Interaction
