@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { DeskApiClient } from "./api-client.js";
+import { DeskApiClient, type CatalogEvent } from "./api-client.js";
 import { Catalog } from "./catalog.js";
 import { startDeskServer } from "./server.js";
 
@@ -61,11 +61,11 @@ test("uses the versioned daemon API for terminal client operations", async () =>
 
     const controller = new AbortController();
     let ready!: () => void;
-    let received!: (value: { action: string; documentId: string }) => void;
+    let received!: (value: CatalogEvent) => void;
     const readyEvent = new Promise<void>((resolve) => {
       ready = resolve;
     });
-    const catalogEvent = new Promise<{ action: string; documentId: string }>(
+    const catalogEvent = new Promise<CatalogEvent>(
       (resolve) => {
         received = resolve;
       },
@@ -102,6 +102,77 @@ test("rejects malformed or unauthorized daemon responses", async () => {
   try {
     const client = new DeskApiClient(server.url, "wrong-token");
     await assert.rejects(client.listDocuments(), /Authentication required/);
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
+test("routes producer workspace and document mutations through the daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-producer-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "review.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Review\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "producer-token",
+  });
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    const controller = new AbortController();
+    let ready!: () => void;
+    let received!: (value: {
+      action: string;
+      documentId?: string;
+      workspaceId?: string;
+    }) => void;
+    const readyEvent = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const workspaceEvent = new Promise<{
+      action: string;
+      documentId?: string;
+      workspaceId?: string;
+    }>((resolve) => {
+      received = resolve;
+    });
+    const subscription = client.subscribeCatalog(received, {
+      signal: controller.signal,
+      onReady: ready,
+    });
+    await readyEvent;
+    const added = await client.addWorkspace({
+      id: "example",
+      name: "Example",
+      root: workspace,
+      artifactRoots: [workspace],
+    });
+    assert.equal(added.id, "example");
+    assert.deepEqual(await workspaceEvent, {
+      action: "workspace-added",
+      workspaceId: "example",
+    });
+
+    const document = await client.registerDocument({
+      workspaceId: "example",
+      producer: "codex",
+      kind: "review",
+      title: "Review",
+      path: documentPath,
+      attention: "review",
+      tags: ["agent"],
+    });
+    assert.equal(document.workspaceId, "example");
+    assert.equal(document.producer, "codex");
+    assert.deepEqual(document.tags, ["agent"]);
+    controller.abort();
+    await subscription;
   } finally {
     await server.close();
     catalog.close();

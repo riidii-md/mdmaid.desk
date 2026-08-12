@@ -7,17 +7,25 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   type Attention,
+  type AddWorkspaceInput,
   Catalog,
   type DocumentKind,
+  type RegisterDocumentInput,
 } from "./catalog.js";
 import { DeskApiClient } from "./api-client.js";
 import {
   connectToDaemon,
+  connectToDaemonInfo,
   daemonDescriptorPath,
   descriptorForServer,
   removeDaemonDescriptor,
   writeDaemonDescriptor,
+  type DaemonConnection,
 } from "./daemon-state.js";
+import {
+  startDaemon as startBackgroundDaemon,
+  stopDaemon as stopBackgroundDaemon,
+} from "./daemon-lifecycle.js";
 import {
   normalizePublicUrl,
   startDeskServer,
@@ -27,6 +35,10 @@ import {
 import { readOrCreateAuthToken } from "./auth-state.js";
 import { readPackageVersion } from "./package-info.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
+import {
+  installUserService as installLoginService,
+  uninstallUserService as uninstallLoginService,
+} from "./user-service.js";
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
   "definition",
@@ -60,12 +72,17 @@ Usage:
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
   mdmaid-desk register <file.md> --workspace <id>
-      [--task <id>] [--kind <kind>] [--title <title>]
-      [--attention <state>]
+      [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--attention <state>] [--tag <tag> ...]
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]
       [--public-url <http[s]://name.localhost[:port]>]
   mdmaid-desk tui
+  mdmaid-desk daemon start [--port <port>]
+  mdmaid-desk daemon status
+  mdmaid-desk daemon stop
+  mdmaid-desk daemon install [--port <port>]
+  mdmaid-desk daemon uninstall
 `;
 
 interface Writer {
@@ -75,12 +92,25 @@ interface Writer {
 export interface RunOptions {
   statePath?: string;
   connectDaemon?: (statePath: string) => Promise<DeskApiClient | undefined>;
+  connectDaemonInfo?: (
+    statePath: string,
+  ) => Promise<DaemonConnection | undefined>;
+  startDaemon?: (
+    statePath: string,
+    port?: number,
+  ) => Promise<DaemonConnection>;
+  stopDaemon?: (statePath: string) => Promise<boolean>;
+  installUserService?: (statePath: string, port?: number) => Promise<unknown>;
+  uninstallUserService?: (statePath: string) => Promise<unknown>;
   startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
   runTui?: (client: DeskApiClient) => Promise<void>;
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
+  allowPortFallback?: boolean;
 }
 
 class UsageError extends Error {}
+
+const silentWriter: Writer = { write: () => undefined };
 
 export async function run(
   args: string[],
@@ -107,27 +137,65 @@ export async function run(
       return 0;
     }
 
-    const statePath = options.statePath ?? defaultStatePath();
+    let statePath = options.statePath ?? defaultStatePath();
+    if (args[0] === "__daemon-serve") {
+      const internal = parseArguments(args.slice(1));
+      rejectUnknownOptions(internal, new Set(["state-path", "port"]));
+      if (internal.positionals.length > 0) {
+        throw new UsageError("invalid internal daemon arguments");
+      }
+      statePath = firstOption(internal, "state-path") ?? statePath;
+      const port = firstOption(internal, "port");
+      const webArgs = port === undefined ? [] : ["--port", port];
+      const catalog = await Catalog.open(statePath);
+      try {
+        return await runWeb(catalog, statePath, webArgs, silentWriter, {
+          ...options,
+          allowPortFallback: port === undefined,
+        });
+      } finally {
+        catalog.close();
+      }
+    }
     if (args[0] === "tui") {
       return await runTerminal(statePath, args.slice(1), options);
+    }
+    if (args[0] === "daemon") {
+      return await runDaemon(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "web") {
+      if (args.length === 1) {
+        const running = await (
+          options.connectDaemonInfo ?? connectToDaemonInfo
+        )(statePath);
+        if (running) {
+          stdout.write(`mdmaid.desk web: ${daemonWebUrl(running)}\n`);
+          return 0;
+        }
+      }
+      const catalog = await Catalog.open(statePath);
+      try {
+        return await runWeb(catalog, statePath, args.slice(1), stdout, options);
+      } finally {
+        catalog.close();
+      }
+    }
+    if (args[0] === "workspace" && args[1] === "add") {
+      return await runWorkspaceAdd(statePath, args.slice(2), stdout, options);
+    }
+    if (args[0] === "register") {
+      return await runRegister(statePath, args.slice(1), stdout, options);
     }
     const catalog = await Catalog.open(statePath);
     try {
       const command = args[0];
 
       if (command === "workspace") {
-        return await runWorkspace(catalog, args.slice(1), stdout);
-      }
-      if (command === "register") {
-        return await runRegister(catalog, args.slice(1), stdout);
+        return runWorkspaceList(catalog, args.slice(1), stdout);
       }
       if (command === "list") {
         return runList(catalog, args.slice(1), stdout);
       }
-      if (command === "web") {
-        return await runWeb(catalog, statePath, args.slice(1), stdout, options);
-      }
-
       throw new UsageError(`unknown command ${command}`);
     } finally {
       catalog.close();
@@ -163,23 +231,39 @@ async function runWeb(
     configuredPort ?? inferDirectHttpPort(configuredPublicUrl) ?? "43127",
   );
   const publicUrl =
-    configuredPublicUrl ?? `http://mdmaid.desk.localhost:${port}`;
-  validateDirectHttpPort(publicUrl, port);
+    configuredPublicUrl ??
+    (port === 0 ? undefined : `http://mdmaid.desk.localhost:${port}`);
+  if (publicUrl !== undefined) {
+    validateDirectHttpPort(publicUrl, port);
+  }
   const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
-  const server = await startServer({
-    catalog,
-    host: "127.0.0.1",
-    port,
-    token,
-    ...(publicUrl ? { publicUrl } : {}),
-  });
+  let server: RunningDeskServer;
+  try {
+    server = await startServer({
+      catalog,
+      host: "127.0.0.1",
+      port,
+      token,
+      ...(publicUrl ? { publicUrl } : {}),
+    });
+  } catch (error) {
+    if (!options.allowPortFallback || !isAddressInUse(error)) {
+      throw error;
+    }
+    server = await startServer({
+      catalog,
+      host: "127.0.0.1",
+      port: 0,
+      token,
+    });
+  }
   const descriptor = descriptorForServer(server);
   const descriptorPath = daemonDescriptorPath(statePath);
   try {
     await writeDaemonDescriptor(descriptorPath, descriptor);
     stdout.write(`mdmaid.desk web: ${server.webUrl}\n`);
-    if (publicUrl.startsWith("https://")) {
+    if (publicUrl?.startsWith("https://")) {
       stdout.write(`proxy target: ${server.url}\n`);
     }
     stdout.write("Press Ctrl-C to stop the local service.\n");
@@ -221,6 +305,87 @@ async function runTerminal(
     catalog.close();
   }
   return 0;
+}
+
+async function runDaemon(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (!action) {
+    throw new UsageError(
+      "daemon action must be start, status, stop, install, or uninstall",
+    );
+  }
+  const parsed = parseArguments(args.slice(1));
+  if (parsed.positionals.length > 0) {
+    throw new UsageError(`${action} accepts options only`);
+  }
+
+  if (action === "start") {
+    rejectUnknownOptions(parsed, new Set(["port"]));
+    const selected = firstOption(parsed, "port");
+    const port = selected === undefined ? undefined : parsePort(selected);
+    const connection = await (
+      options.startDaemon ?? startBackgroundDaemon
+    )(statePath, port);
+    stdout.write(
+      `daemon started (pid ${connection.descriptor.pid}, port ${connection.descriptor.port})\n`,
+    );
+    stdout.write(`mdmaid.desk web: ${daemonWebUrl(connection)}\n`);
+    return 0;
+  }
+
+  if (action === "status") {
+    rejectUnknownOptions(parsed, new Set());
+    const connection = await (
+      options.connectDaemonInfo ?? connectToDaemonInfo
+    )(statePath);
+    if (!connection) {
+      stdout.write("daemon stopped\n");
+      return 1;
+    }
+    stdout.write(
+      `daemon running (pid ${connection.descriptor.pid}, port ${connection.descriptor.port})\n`,
+    );
+    stdout.write(`mdmaid.desk web: ${daemonWebUrl(connection)}\n`);
+    return 0;
+  }
+
+  if (action === "stop") {
+    rejectUnknownOptions(parsed, new Set());
+    const stopped = await (
+      options.stopDaemon ?? stopBackgroundDaemon
+    )(statePath);
+    stdout.write(stopped ? "daemon stopped\n" : "daemon already stopped\n");
+    return 0;
+  }
+
+  if (action === "install") {
+    rejectUnknownOptions(parsed, new Set(["port"]));
+    const selected = firstOption(parsed, "port");
+    const port = selected === undefined ? undefined : parsePort(selected);
+    await (options.installUserService ?? installLoginService)(statePath, port);
+    stdout.write("user service installed and started\n");
+    return 0;
+  }
+
+  if (action === "uninstall") {
+    rejectUnknownOptions(parsed, new Set());
+    await (options.uninstallUserService ?? uninstallLoginService)(statePath);
+    stdout.write("user service uninstalled\n");
+    return 0;
+  }
+
+  throw new UsageError(
+    "daemon action must be start, status, stop, install, or uninstall",
+  );
+}
+
+function daemonWebUrl(connection: DaemonConnection): string {
+  return `http://mdmaid.desk.localhost:${connection.descriptor.port}/?token=${encodeURIComponent(connection.descriptor.token)}`;
 }
 
 function parsePort(value: string): number {
@@ -276,11 +441,11 @@ function waitForShutdown(_server: RunningDeskServer): Promise<void> {
   });
 }
 
-async function runWorkspace(
+function runWorkspaceList(
   catalog: Catalog,
   args: string[],
   stdout: Writer,
-): Promise<number> {
+): number {
   const action = args[0];
   if (action === "list") {
     for (const workspace of catalog.listWorkspaces()) {
@@ -288,11 +453,16 @@ async function runWorkspace(
     }
     return 0;
   }
-  if (action !== "add") {
-    throw new UsageError("workspace action must be add or list");
-  }
+  throw new UsageError("workspace action must be add or list");
+}
 
-  const parsed = parseArguments(args.slice(1));
+async function runWorkspaceAdd(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(args);
   const root = parsed.positionals[0];
   if (!root) {
     throw new UsageError("workspace root is required");
@@ -305,20 +475,32 @@ async function runWorkspace(
   const artifactRoots = parsed.options.get("artifact-root") ?? [root];
   rejectUnknownOptions(parsed, new Set(["id", "name", "artifact-root"]));
 
-  const workspace = await catalog.addWorkspace({
+  const input: AddWorkspaceInput = {
     id,
     name,
     root,
     artifactRoots,
-  });
-  stdout.write(`workspace ${workspace.id} added: ${workspace.root}\n`);
+  };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.addWorkspace(input);
+  } else {
+    const catalog = await Catalog.open(statePath);
+    try {
+      await catalog.addWorkspace(input);
+    } finally {
+      catalog.close();
+    }
+  }
+  stdout.write(`workspace ${id} added: ${root}\n`);
   return 0;
 }
 
 async function runRegister(
-  catalog: Catalog,
+  statePath: string,
   args: string[],
   stdout: Writer,
+  options: RunOptions,
 ): Promise<number> {
   const parsed = parseArguments(args);
   const path = parsed.positionals[0];
@@ -330,7 +512,15 @@ async function runRegister(
   }
   rejectUnknownOptions(
     parsed,
-    new Set(["workspace", "task", "kind", "title", "attention"]),
+    new Set([
+      "workspace",
+      "task",
+      "producer",
+      "kind",
+      "title",
+      "attention",
+      "tag",
+    ]),
   );
 
   const kind = (firstOption(parsed, "kind") ?? "other") as DocumentKind;
@@ -344,15 +534,31 @@ async function runRegister(
   }
 
   const taskId = firstOption(parsed, "task");
-  const document = await catalog.registerDocument({
+  const producer = firstOption(parsed, "producer");
+  const tags = parsed.options.get("tag");
+  const input: RegisterDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
+    ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
     path,
     attention,
-  });
-  stdout.write(`registered ${document.id}: ${document.path}\n`);
+    ...(tags === undefined ? {} : { tags }),
+  };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  let id: string;
+  if (client) {
+    id = (await client.registerDocument(input)).id;
+  } else {
+    const catalog = await Catalog.open(statePath);
+    try {
+      id = (await catalog.registerDocument(input)).id;
+    } finally {
+      catalog.close();
+    }
+  }
+  stdout.write(`registered ${id}: ${path}\n`);
   return 0;
 }
 
@@ -449,10 +655,18 @@ function rejectUnknownOptions(
     if (!allowed.has(name)) {
       throw new UsageError(`unknown option --${name}`);
     }
-    if (name !== "artifact-root" && values.length > 1) {
+    if (name !== "artifact-root" && name !== "tag" && values.length > 1) {
       throw new UsageError(`option --${name} may be used only once`);
     }
   }
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "EADDRINUSE"
+  );
 }
 
 function defaultStatePath(): string {

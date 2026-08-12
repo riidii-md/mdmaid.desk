@@ -14,7 +14,8 @@ mdmaid
   Markdown and Mermaid renderer
 
 mdmaid.desk
-  Daemon, catalog, watcher, stable URLs, web/TUI workspaces, CLI/API
+  Persistent catalog, optional daemon, watcher, stable URLs,
+  web/TUI workspaces, CLI/API
 
 mdmaid.nvim
   Optional Neovim client
@@ -61,9 +62,13 @@ Metadata-only updates preserve progress. Existing version 1 JSON catalogs are
 imported in one transaction and retained as `catalog.json.migrated`.
 Markdown content remains at its authorized original path.
 
-## Target Daemon
+The catalog is the durable product state. It does not depend on a running
+daemon: harnesses, editors, scripts, and users can register documents through
+short-lived CLI commands and view the same queue later.
 
-Use one user-level daemon with multiple workspaces:
+## Hybrid Runtime and Optional Daemon
+
+Use one user-level catalog with an optional single daemon:
 
 ```text
 ~/.local/state/mdmaid.desk/
@@ -76,9 +81,11 @@ Use one user-level daemon with multiple workspaces:
 Target commands:
 
 ```bash
-mdmaid-desk daemon ensure
+mdmaid-desk daemon start
 mdmaid-desk daemon status
 mdmaid-desk daemon stop
+mdmaid-desk daemon install
+mdmaid-desk daemon uninstall
 
 mdmaid-desk workspace add /path/to/repository
 mdmaid-desk register plan.md
@@ -86,14 +93,35 @@ mdmaid-desk open plan.md
 mdmaid-desk list --task PROJECT-123
 ```
 
-`daemon ensure` is idempotent. The daemon publishes its PID, loopback host,
-port, and protocol version through `daemon.json`.
+Document ingress is daemonless by default. `workspace`, `register`, `enqueue`,
+and other short CLI mutations first health-check `daemon.json`: when a healthy
+daemon exists they use its authenticated API so connected clients receive live
+events; otherwise they perform a bounded catalog transaction and exit. A
+producer must never need to start or install a service just to queue a durable
+Markdown file.
 
-The current vertical slice implements the same discovery contract through the
-foreground `mdmaid-desk web` command. It atomically publishes a mode-`0600`
-descriptor, and `mdmaid-desk tui` health-checks and reuses that service. The
-background `ensure`, `status`, and `stop` process-management commands are the
-next daemon-lifecycle step.
+The daemon is an opt-in live coordination and presentation service. It owns
+continuous behavior while active: HTTP/API access, Server-Sent Events,
+directory watching, and future comment/edit coordination. It does not own the
+existence of the queue. Starting or stopping it never removes catalog entries.
+
+`daemon start` is idempotent. The daemon publishes its PID, loopback host,
+port, and protocol version through `daemon.json`. `daemon install` explicitly
+configures a user service for people who want an always-available browser URL;
+installation or registration must not silently leave a permanent background
+process running. The npm CLI installs a LaunchAgent on macOS or systemd user
+service on Linux; a future Homebrew service uses the same lifecycle contract.
+
+Both foreground `mdmaid-desk web` and the background daemon atomically publish
+a mode-`0600` descriptor. CLI writes, web, and TUI health-check and reuse it.
+The TUI starts a session-scoped embedded loopback server when no daemon exists.
+A user can select a port, while an unpinned daemon falls back from `43127` to an
+available loopback port and reports the actual value through `daemon status`.
+
+`web` should attach to and open an existing healthy daemon when one exists. If
+none exists, it starts the service in the foreground until interrupted. The
+TUI follows the same attach-first policy without leaving its fallback server
+running after the terminal session ends.
 
 The foreground browser service uses the stable direct origin
 `http://mdmaid.desk.localhost:43127/`. The special-use `.localhost` name maps
@@ -173,8 +201,11 @@ Status: complete.
 
 ### 2. Daemon Lifecycle
 
-- ensure, status, and stop commands;
+- attach-first CLI transport with direct-catalog fallback;
+- start, status, and stop commands;
+- explicit install and uninstall of a user service;
 - process discovery;
+- single-instance startup coordination;
 - protocol versioning;
 - stale-state recovery;
 - local mutation authentication.
@@ -211,8 +242,8 @@ Status: complete.
 
 The first coherent release is complete when:
 
-1. one daemon serves multiple workspaces;
-2. newly created Markdown artifacts appear automatically;
+1. harnesses can register documents without starting a daemon;
+2. an optional daemon serves multiple workspaces and live clients;
 3. every document has a stable URL;
 4. multiple tabs display independent documents;
 5. registration never implies approval;

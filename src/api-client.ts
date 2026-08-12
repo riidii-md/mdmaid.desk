@@ -4,6 +4,7 @@ import {
 } from "./domain.js";
 import type {
   DocumentAction,
+  DocumentRegistration,
   HealthData,
   PublicDocument,
   PublicWorkspace,
@@ -11,6 +12,7 @@ import type {
   TerminalRenderPreferences,
   TerminalRender,
   WebRender,
+  WorkspaceRegistration,
 } from "./api-types.js";
 
 interface ErrorEnvelope {
@@ -22,7 +24,8 @@ interface ErrorEnvelope {
 
 export interface CatalogEvent {
   action: string;
-  documentId: string;
+  documentId?: string;
+  workspaceId?: string;
 }
 
 export interface CatalogSubscriptionOptions {
@@ -72,6 +75,28 @@ export class DeskApiClient {
     const value = await this.#request("/api/v1/workspaces");
     if (!Array.isArray(value) || !value.every(isPublicWorkspace)) {
       throw new Error("Daemon returned an invalid workspace list");
+    }
+    return value;
+  }
+
+  async addWorkspace(input: WorkspaceRegistration): Promise<PublicWorkspace> {
+    const value = await this.#request("/api/v1/workspaces", {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicWorkspace(value)) {
+      throw new Error("Daemon returned an invalid workspace response");
+    }
+    return value;
+  }
+
+  async registerDocument(input: DocumentRegistration): Promise<PublicDocument> {
+    const value = await this.#request("/api/v1/documents", {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicDocument(value)) {
+      throw new Error("Daemon returned an invalid document response");
     }
     return value;
   }
@@ -184,16 +209,25 @@ export class DeskApiClient {
     path: string,
     options: {
       authenticated?: boolean;
+      body?: unknown;
       method?: "GET" | "POST";
       signal?: AbortSignal;
     } = {},
   ): Promise<unknown> {
     const authenticated = options.authenticated ?? true;
+    const headers: Record<string, string> = {};
+    if (authenticated) {
+      headers.authorization = `Bearer ${this.#token}`;
+    }
+    if (options.body !== undefined) {
+      headers["content-type"] = "application/json";
+    }
     const response = await fetch(`${this.#baseUrl}${path}`, {
       method: options.method ?? "GET",
-      ...(authenticated
-        ? { headers: { authorization: `Bearer ${this.#token}` } }
-        : {}),
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      ...(options.body === undefined
+        ? {}
+        : { body: JSON.stringify(options.body) }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
     let body: unknown;
@@ -324,12 +358,25 @@ function dispatchEventBlock(
   if (
     !isRecord(value) ||
     typeof value.action !== "string" ||
-    typeof value.documentId !== "string" ||
-    !/^doc-[a-f0-9]{20}$/.test(value.documentId)
+    (value.documentId !== undefined &&
+      (typeof value.documentId !== "string" ||
+        !/^doc-[a-f0-9]{20}$/.test(value.documentId))) ||
+    (value.workspaceId !== undefined &&
+      (typeof value.workspaceId !== "string" ||
+        !/^[a-z0-9][a-z0-9-]{0,63}$/.test(value.workspaceId))) ||
+    (value.documentId === undefined && value.workspaceId === undefined)
   ) {
     throw new Error("Daemon returned an invalid catalog event");
   }
-  listener({ action: value.action, documentId: value.documentId });
+  listener({
+    action: value.action,
+    ...(value.documentId === undefined
+      ? {}
+      : { documentId: value.documentId as string }),
+    ...(value.workspaceId === undefined
+      ? {}
+      : { workspaceId: value.workspaceId as string }),
+  });
 }
 
 function optionalString(value: unknown): boolean {

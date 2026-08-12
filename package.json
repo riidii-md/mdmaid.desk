@@ -15,11 +15,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OleksandrBesan/mdmaid.desk"
+    "url": "https://github.com/riidii-md/mdmaid.desk"
   },
-  "homepage": "https://github.com/OleksandrBesan/mdmaid.desk#readme",
+  "homepage": "https://github.com/riidii-md/mdmaid.desk#readme",
   "bugs": {
-    "url": "https://github.com/OleksandrBesan/mdmaid.desk/issues"
+    "url": "https://github.com/riidii-md/mdmaid.desk/issues"
   },
   "files": [
     "dist",

@@ -16,10 +16,12 @@ import { renderMarkdownToTui } from "mdmaid/tui";
 import sanitizeHtml from "sanitize-html";
 
 import {
+  type AddWorkspaceInput,
   type Catalog,
   type Document,
   type DocumentFilters,
   type RegisterDocumentInput,
+  type Workspace,
 } from "./catalog.js";
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -245,15 +247,44 @@ async function handleRequest(
   if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
     const documents = catalog.listDocuments();
     sendJson(response, 200, {
-      data: catalog.listWorkspaces().map((workspace) => ({
-        id: workspace.id,
-        name: workspace.name,
-        documentCount: documents.filter(
-          ({ workspaceId }) => workspaceId === workspace.id,
-        ).length,
-        route: `/w/${workspace.id}`,
-      })),
+      data: catalog.listWorkspaces().map((workspace) =>
+        publicWorkspace(
+          workspace,
+          documents.filter(({ workspaceId }) => workspaceId === workspace.id)
+            .length,
+        ),
+      ),
     });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/workspaces") {
+    const body = await readJson(request);
+    if (!isWorkspaceRegistration(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid workspace registration",
+      );
+    }
+    try {
+      const workspace = await catalog.addWorkspace(body);
+      response.setHeader("location", `/api/v1/workspaces/${workspace.id}`);
+      sendJson(response, 201, { data: publicWorkspace(workspace, 0) });
+      events.publish("catalog", {
+        action: "workspace-added",
+        workspaceId: workspace.id,
+      });
+    } catch (error) {
+      if (error instanceof Error) {
+        throw new HttpError(
+          422,
+          "validation_error",
+          "Invalid workspace registration",
+        );
+      }
+      throw error;
+    }
     return;
   }
 
@@ -625,6 +656,18 @@ function publicDocument(document: Document): Record<string, unknown> {
   };
 }
 
+function publicWorkspace(
+  workspace: Workspace,
+  documentCount: number,
+): Record<string, unknown> {
+  return {
+    id: workspace.id,
+    name: workspace.name,
+    documentCount,
+    route: `/w/${workspace.id}`,
+  };
+}
+
 function sanitizeRenderedHtml(content: string): string {
   return sanitizeHtml(content, {
     allowedTags: [
@@ -698,6 +741,20 @@ function isDocumentRegistration(value: unknown): value is RegisterDocumentInput 
     (value.tags === undefined ||
       (Array.isArray(value.tags) &&
         value.tags.every((tag) => typeof tag === "string")))
+  );
+}
+
+function isWorkspaceRegistration(value: unknown): value is AddWorkspaceInput {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    hasOnlyKeys(value, ["id", "name", "root", "artifactRoots"]) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.root === "string" &&
+    Array.isArray(value.artifactRoots) &&
+    value.artifactRoots.every((root) => typeof root === "string")
   );
 }
 
