@@ -293,6 +293,20 @@ test("preserves selection and allows only safe document styling", () => {
   assert.doesNotMatch(plainAsciiFrame, /\u001b|[┌┐└┘─│●◐✓]/);
 });
 
+test("removes empty projects and clears their active TUI filter", () => {
+  const filtered = {
+    ...createTuiState(documents, workspaces),
+    workspaceFilter: "alpha",
+  };
+  const refreshed = replaceTuiDocuments(filtered, [documents[1]!]);
+
+  assert.deepEqual(refreshed.workspaces, [
+    { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
+  ]);
+  assert.equal(refreshed.workspaceFilter, undefined);
+  assert.deepEqual(refreshed.visibleDocuments, [documents[1]]);
+});
+
 test("runs the interactive TUI through render, events, actions, and clean exit", async () => {
   const input = new PassThrough();
   const output = new PassThrough();

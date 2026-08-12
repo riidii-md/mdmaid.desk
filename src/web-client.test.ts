@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   filterQueue,
   queueCounts,
+  visibleWorkspaces,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
+import type { PublicWorkspace } from "./api-types.js";
 
 const documents: WebDocument[] = [
   {
@@ -89,4 +91,16 @@ test("counts reading states for the browser navigation", () => {
     reading: 1,
     done: 1,
   });
+});
+
+test("hides projects without visible documents from browser navigation", () => {
+  const workspaces: PublicWorkspace[] = [
+    { id: "alpha", name: "Alpha", documentCount: 99, route: "/w/alpha" },
+    { id: "beta", name: "Beta", documentCount: 0, route: "/w/beta" },
+    { id: "empty", name: "Empty", documentCount: 0, route: "/w/empty" },
+  ];
+
+  assert.deepEqual(visibleWorkspaces([documents[1]!], workspaces), [
+    { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
+  ]);
 });

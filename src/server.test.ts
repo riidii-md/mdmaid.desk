@@ -141,6 +141,46 @@ test("lists public document metadata without leaking filesystem paths", async ()
   }
 });
 
+test("hides empty projects after their last visible document is archived", async () => {
+  const value = await fixture();
+  const emptyRoot = join(value.root, "empty-workspace");
+  await mkdir(emptyRoot);
+  await value.catalog.addWorkspace({
+    id: "empty",
+    name: "Empty",
+    root: emptyRoot,
+    artifactRoots: [emptyRoot],
+  });
+  try {
+    const before = await authorized(value, "/api/v1/workspaces");
+    assert.deepEqual(await before.json(), {
+      data: [
+        {
+          id: "example",
+          name: "Example",
+          documentCount: 1,
+          route: "/w/example",
+        },
+      ],
+    });
+
+    const archived = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/archive`,
+      { method: "POST" },
+    );
+    assert.equal(archived.status, 200);
+    const after = await authorized(value, "/api/v1/workspaces");
+    assert.deepEqual(await after.json(), { data: [] });
+    assert.deepEqual(
+      value.catalog.listWorkspaces().map(({ id }) => id),
+      ["empty", "example"],
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("renders authorized Markdown for web and terminal targets", async () => {
   const value = await fixture();
   try {
