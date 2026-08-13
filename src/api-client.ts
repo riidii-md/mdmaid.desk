@@ -22,6 +22,17 @@ interface ErrorEnvelope {
   };
 }
 
+export class DeskApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "DeskApiError";
+  }
+}
+
 export interface CatalogEvent {
   action: string;
   documentId?: string;
@@ -238,7 +249,11 @@ export class DeskApiClient {
     }
     if (!response.ok) {
       if (isErrorEnvelope(body)) {
-        throw new Error(body.error.message);
+        throw new DeskApiError(
+          response.status,
+          body.error.code,
+          body.error.message,
+        );
       }
       throw new Error(`Daemon request failed (${response.status})`);
     }

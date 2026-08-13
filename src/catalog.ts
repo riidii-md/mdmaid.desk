@@ -97,6 +97,13 @@ interface InspectedDocument {
   content: Buffer;
 }
 
+export class DocumentSourceMissingError extends Error {
+  constructor(readonly document: Document) {
+    super("Document source is missing");
+    this.name = "DocumentSourceMissingError";
+  }
+}
+
 export class Catalog {
   readonly #storage: CatalogStorage;
   readonly #maxDocumentBytes: number;
@@ -169,14 +176,29 @@ export class Catalog {
     if (!workspace) {
       throw new Error(`unknown workspace ${stored.workspaceId}`);
     }
-    const inspected = await inspectMarkdownDocument(
-      stored.path,
-      workspace,
-      this.#maxDocumentBytes,
-    );
+    let inspected: InspectedDocument;
+    try {
+      inspected = await inspectMarkdownDocument(
+        stored.path,
+        workspace,
+        this.#maxDocumentBytes,
+      );
+    } catch (error) {
+      if (
+        isNodeError(error) &&
+        (error.code === "ENOENT" || error.code === "ENOTDIR")
+      ) {
+        const missing = await this.markDocumentMissing(id);
+        throw new DocumentSourceMissingError(missing);
+      }
+      throw error;
+    }
+    const document = stored.missingAt === null
+      ? presentDocument(stored)
+      : await this.markDocumentPresent(id);
     return {
       content: inspected.content.toString("utf8"),
-      document: presentDocument(stored),
+      document,
     };
   }
 

@@ -4,7 +4,7 @@ import { Chalk, type ChalkInstance } from "chalk";
 import sliceAnsi from "slice-ansi";
 import stringWidth from "string-width";
 
-import type { DeskApiClient } from "./api-client.js";
+import { DeskApiError, type DeskApiClient } from "./api-client.js";
 import type {
   DocumentAction,
   PublicDocument,
@@ -101,6 +101,24 @@ export function applyTuiReader(
     searching: false,
     message: undefined,
   };
+}
+
+export function applyTuiMissingReader(
+  state: TuiState,
+  document: PublicDocument,
+): TuiState {
+  return applyTuiReader(
+    state,
+    document,
+    [
+      "Source file is missing.",
+      "",
+      "This catalog record can still be archived from the queue.",
+      "Restore the source file and open it again to resume reading.",
+    ].join("\n"),
+    "unavailable",
+    [],
+  );
 }
 
 export function replaceTuiDocuments(
@@ -228,13 +246,15 @@ export function renderTui(
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
   const footer = state.mode === "reader"
     ? renderShortcutBar(
-        [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+        state.reader?.document.missingAt
+          ? [["a", "archive"], ["b", "queue"], ["q", "quit"]]
+          : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
         theme,
       )
     : state.searching
       ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
       : renderShortcutBar(
-          [["j/k", "move"], ["enter", "open"], ["s", "status"], ["p", "project"], ["/", "search"], ["q", "quit"]],
+          [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["s", "status"], ["p", "project"], ["/", "search"], ["q", "quit"]],
           theme,
         );
   const bodyHeight = safeHeight - 6;
@@ -343,6 +363,24 @@ export async function runTui(
       state = replaceTuiDocuments(state, await client.listDocuments());
       draw();
     } catch (error) {
+      if (
+        effect.type === "open" &&
+        error instanceof DeskApiError &&
+        error.code === "source_missing"
+      ) {
+        try {
+          const documents = await client.listDocuments();
+          state = replaceTuiDocuments(state, documents);
+          const missing = documents.find(({ id }) => id === effect.documentId);
+          if (missing) {
+            state = applyTuiMissingReader(state, missing);
+            draw();
+            return;
+          }
+        } catch {
+          // Fall through to a safe message; queue archive remains available.
+        }
+      }
       state = {
         ...state,
         message: error instanceof Error ? error.message : "TUI request failed",
@@ -514,6 +552,15 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
       effects: document ? [{ type: "open", documentId: document.id }] : [],
     };
   }
+  if (key === "a") {
+    const document = state.visibleDocuments[state.selectedIndex];
+    return {
+      state,
+      effects: document
+        ? [{ type: "action", action: "archive", documentId: document.id }]
+        : [],
+    };
+  }
   if (key === "s") {
     const filters: StatusFilter[] = ["all", "unread", "reading", "done"];
     const index = filters.indexOf(state.statusFilter);
@@ -571,7 +618,11 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     a: "archive",
   };
   const action = actions[key];
-  if (action && state.reader) {
+  if (
+    action &&
+    state.reader &&
+    (action === "archive" || state.reader.document.missingAt === null)
+  ) {
     return {
       state,
       effects: [
@@ -858,17 +909,24 @@ function footerKeyAt(state: TuiState, x: number): string | undefined {
   }
   const shortcuts: Array<readonly [string, string, string | undefined]> =
     state.mode === "reader"
-      ? [
-          ["j/k", "scroll", undefined],
-          ["m", "read", "m"],
-          ["u", "unread", "u"],
-          ["a", "archive", "a"],
-          ["b", "queue", "b"],
-          ["q", "quit", "q"],
-        ]
+      ? state.reader?.document.missingAt
+        ? [
+            ["a", "archive", "a"],
+            ["b", "queue", "b"],
+            ["q", "quit", "q"],
+          ]
+        : [
+            ["j/k", "scroll", undefined],
+            ["m", "read", "m"],
+            ["u", "unread", "u"],
+            ["a", "archive", "a"],
+            ["b", "queue", "b"],
+            ["q", "quit", "q"],
+          ]
       : [
           ["j/k", "move", undefined],
           ["enter", "open", "enter"],
+          ["a", "archive", "a"],
           ["s", "status", "s"],
           ["p", "project", "p"],
           ["/", "search", "/"],
@@ -1062,9 +1120,11 @@ function renderDocumentCard(
 ): string[] {
   const borderStyle = selected ? theme.accent : theme.line;
   const status = statusStyle(theme, document.status);
-  const label = status(
-    `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
-  );
+  const label = document.missingAt
+    ? theme.accent("! SOURCE MISSING")
+    : status(
+        `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
+      );
   const topPrefix = `${borderStyle(`${borders.topLeft}${borders.horizontal}`)} ${label} `;
   const topFill = Math.max(0, width - stringWidth(topPrefix) - 1);
   const top = `${topPrefix}${borderStyle(`${borders.horizontal.repeat(topFill)}${borders.topRight}`)}`;
@@ -1099,9 +1159,11 @@ function readerLines(
   }
   const { document } = state.reader;
   const title = sanitizeTerminalText(document.title).replace(/\s+/g, " ");
-  const pill = statusStyle(theme, document.status)(
-    `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
-  );
+  const pill = document.missingAt
+    ? theme.accent("! SOURCE MISSING")
+    : statusStyle(theme, document.status)(
+        `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
+      );
   const meta = [
     document.workspaceId,
     document.taskId,

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { DeskApiClient, type CatalogEvent } from "./api-client.js";
+import {
+  DeskApiClient,
+  DeskApiError,
+  type CatalogEvent,
+} from "./api-client.js";
 import { Catalog } from "./catalog.js";
 import { startDeskServer } from "./server.js";
 
@@ -82,6 +86,54 @@ test("uses the versioned daemon API for terminal client operations", async () =>
     });
     controller.abort();
     await subscription;
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
+test("preserves typed source-missing errors for client recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-missing-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "temporary.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Temporary\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Temporary",
+    path: documentPath,
+    attention: "none",
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "missing-token",
+  });
+  await rm(documentPath);
+
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    await assert.rejects(
+      client.renderDocument(document.id, "terminal"),
+      (error: unknown) => {
+        assert.ok(error instanceof DeskApiError);
+        assert.equal(error.status, 410);
+        assert.equal(error.code, "source_missing");
+        assert.equal(error.message, "Document source is missing");
+        return true;
+      },
+    );
   } finally {
     await server.close();
     catalog.close();

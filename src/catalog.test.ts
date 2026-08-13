@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import Database from "better-sqlite3";
 
-import { Catalog } from "./catalog.js";
+import { Catalog, DocumentSourceMissingError } from "./catalog.js";
 
 async function fixture(): Promise<{
   catalog: Catalog;
@@ -59,6 +59,37 @@ test("registers documents idempotently and persists the catalog", async () => {
   assert.deepEqual(restored.listDocuments(), catalog.listDocuments());
 
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("marks disappeared sources missing and clears the state when they return", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "temporary.md");
+  await writeFile(documentPath, "# Temporary\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Temporary",
+    path: documentPath,
+    attention: "none",
+  });
+
+  await rm(documentPath);
+  await assert.rejects(
+    catalog.readDocument(document.id),
+    (error: unknown) => {
+      assert.ok(error instanceof DocumentSourceMissingError);
+      assert.equal(error.document.id, document.id);
+      assert.equal(error.message, "Document source is missing");
+      return true;
+    },
+  );
+  assert.notEqual(catalog.getDocument(document.id)?.missingAt, null);
+
+  await writeFile(documentPath, "# Restored\n", "utf8");
+  const restored = await catalog.readDocument(document.id);
+  assert.equal(restored.content, "# Restored\n");
+  assert.equal(restored.document.missingAt, null);
+  catalog.close();
 });
 
 test("rejects documents outside registered artifact roots", async () => {

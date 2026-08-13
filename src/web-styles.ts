@@ -183,10 +183,12 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 }
 .document-card.status-reading::before { background: var(--reading); }
 .document-card.status-done::before { background: var(--done); }
+.document-card.source-missing::before { background: var(--muted); }
 .card-topline { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 9px; text-transform: uppercase; }
 .status-label { color: var(--accent); }
 .status-reading .status-label { color: var(--reading); }
 .status-done .status-label { color: var(--done); }
+.source-missing .status-label { color: var(--muted); }
 .document-card strong { font-size: 17px; line-height: 1.35; }
 .card-detail { color: var(--muted); font-size: 10px; line-height: 1.6; }
 .tag-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: auto; }
@@ -235,6 +237,13 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .reader-content th, .reader-content td { border: 1px solid var(--line); padding: 8px 10px; }
 .reader-content img, .reader-content svg { max-width: 100%; height: auto; }
 .reader-content a { color: var(--reading); text-decoration-thickness: 1px; }
+.reader-content.source-missing {
+  border-style: dashed;
+  border-color: var(--accent);
+  color: var(--muted);
+}
+.reader-content.source-missing strong { color: var(--accent); font-size: 20px; }
+.action:disabled { cursor: not-allowed; opacity: .4; }
 .mermaid { overflow-x: auto; padding: 20px 0; text-align: center; }
 
 @media (max-width: 760px) {
