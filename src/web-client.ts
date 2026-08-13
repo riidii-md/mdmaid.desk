@@ -29,6 +29,13 @@ interface WebState {
   workspaces: WebWorkspace[];
 }
 
+class WebApiError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "WebApiError";
+  }
+}
+
 declare global {
   interface Window {
     mermaid?: {
@@ -111,6 +118,10 @@ export function visibleWorkspaces(
   });
 }
 
+export function isSourceMissing(document: WebDocument): boolean {
+  return document.missingAt !== null;
+}
+
 async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
@@ -136,6 +147,8 @@ async function boot(): Promise<void> {
   const readerContent = element("reader-content");
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
+  const markRead = element("mark-read") as HTMLButtonElement;
+  const markUnread = element("mark-unread") as HTMLButtonElement;
   const empty = element("queue-empty");
   const search = element("search") as HTMLInputElement;
   const live = element("live-status");
@@ -153,9 +166,12 @@ async function boot(): Promise<void> {
     });
     const body = (await response.json()) as
       | { data: T }
-      | { error: { message: string } };
+      | { error: { code: string; message: string } };
     if (!response.ok || !("data" in body)) {
-      throw new Error("error" in body ? body.error.message : "Request failed");
+      if ("error" in body) {
+        throw new WebApiError(body.error.code, body.error.message);
+      }
+      throw new Error("Request failed");
     }
     return body.data;
   }
@@ -232,6 +248,7 @@ async function boot(): Promise<void> {
       const card = document.createElement("button");
       card.type = "button";
       card.className = `document-card status-${item.status}`;
+      card.classList.toggle("source-missing", isSourceMissing(item));
       card.dataset.documentId = item.id;
       card.setAttribute("aria-label", `Open ${item.title}`);
 
@@ -239,7 +256,7 @@ async function boot(): Promise<void> {
       top.className = "card-topline";
       const status = document.createElement("span");
       status.className = "status-label";
-      status.textContent = item.status;
+      status.textContent = isSourceMissing(item) ? "source missing" : item.status;
       const context = document.createElement("span");
       context.className = "card-context";
       context.textContent = [item.workspaceId, item.taskId, item.kind]
@@ -296,6 +313,7 @@ async function boot(): Promise<void> {
     state.selectedId = id;
     queuePanel.setAttribute("hidden", "");
     reader.removeAttribute("hidden");
+    setMissingReader(false);
     readerContent.textContent = "Rendering…";
     const selected = state.documents.find((item) => item.id === id);
     readerTitle.textContent = selected?.title ?? "Document";
@@ -329,9 +347,44 @@ async function boot(): Promise<void> {
         history.pushState({ documentId: id }, "", updated.route);
       }
     } catch (error) {
+      if (error instanceof WebApiError && error.code === "source_missing") {
+        try {
+          state.documents = await api<WebDocument[]>("/api/v1/documents");
+          render();
+        } catch {
+          // The safe missing-source state remains actionable without a refresh.
+        }
+        const missing =
+          state.documents.find((item) => item.id === id) ?? selected;
+        if (missing) {
+          showMissingSource(missing);
+          if (pushHistory) {
+            history.pushState({ documentId: id }, "", missing.route);
+          }
+          return;
+        }
+      }
       readerContent.textContent =
         error instanceof Error ? error.message : "Could not render document";
     }
+  }
+
+  function showMissingSource(item: WebDocument): void {
+    setMissingReader(true);
+    readerTitle.textContent = item.title;
+    readerContent.replaceChildren();
+    const title = document.createElement("strong");
+    title.textContent = "Source file is missing";
+    const guidance = document.createElement("p");
+    guidance.textContent =
+      "This catalog record is still available. Archive it to remove it from the active queue, or restore the source file and open it again.";
+    readerContent.append(title, guidance);
+  }
+
+  function setMissingReader(missing: boolean): void {
+    readerContent.classList.toggle("source-missing", missing);
+    markRead.disabled = missing;
+    markUnread.disabled = missing;
   }
 
   function closeReader(pushHistory = true): void {
@@ -352,6 +405,10 @@ async function boot(): Promise<void> {
 
   async function act(action: "read" | "unread" | "archive"): Promise<void> {
     if (!state.selectedId) {
+      return;
+    }
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (action !== "archive" && selected && isSourceMissing(selected)) {
       return;
     }
     const updated = await api<WebDocument>(
@@ -379,8 +436,8 @@ async function boot(): Promise<void> {
     });
   }
   element("reader-back").addEventListener("click", () => closeReader());
-  element("mark-read").addEventListener("click", () => void act("read"));
-  element("mark-unread").addEventListener("click", () => void act("unread"));
+  markRead.addEventListener("click", () => void act("read"));
+  markUnread.addEventListener("click", () => void act("unread"));
   element("archive").addEventListener("click", () => void act("archive"));
 
   const theme = localStorage.getItem("mdmaid-desk-theme");

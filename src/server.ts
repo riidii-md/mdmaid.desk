@@ -20,6 +20,7 @@ import {
   type Catalog,
   type Document,
   type DocumentFilters,
+  DocumentSourceMissingError,
   type RegisterDocumentInput,
   type Workspace,
 } from "./catalog.js";
@@ -626,6 +627,9 @@ async function readDocument(
 }
 
 function mapCatalogError(error: unknown): HttpError {
+  if (error instanceof DocumentSourceMissingError) {
+    return new HttpError(410, "source_missing", "Document source is missing");
+  }
   if (error instanceof Error && error.message.startsWith("unknown document")) {
     return new HttpError(404, "not_found", "Document not found");
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -220,6 +220,42 @@ test("renders authorized Markdown for web and terminal targets", async () => {
       `/api/v1/documents/${value.document.id}/render?target=terminal&color=rainbow`,
     );
     assert.equal(invalidPreference.status, 400);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("reports missing sources safely while keeping their records archivable", async () => {
+  const value = await fixture();
+  await rm(join(value.workspace, "plan.md"));
+  try {
+    const render = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/render?target=web`,
+    );
+    assert.equal(render.status, 410);
+    assert.deepEqual(await render.json(), {
+      error: {
+        code: "source_missing",
+        message: "Document source is missing",
+      },
+    });
+
+    const missing = value.catalog.getDocument(value.document.id);
+    assert.equal(typeof missing?.missingAt, "string");
+
+    const archived = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/archive`,
+      { method: "POST" },
+    );
+    assert.equal(archived.status, 200);
+    const archivedBody = (await archived.json()) as {
+      data: { archivedAt: string | null; missingAt: string | null };
+    };
+    assert.equal(typeof archivedBody.data.archivedAt, "string");
+    assert.equal(typeof archivedBody.data.missingAt, "string");
+    assert.doesNotMatch(JSON.stringify(archivedBody), new RegExp(value.root));
   } finally {
     await closeFixture(value);
   }

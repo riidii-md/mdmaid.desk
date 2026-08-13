@@ -8,11 +8,12 @@ import stringWidth from "string-width";
 import type {
   CatalogEvent,
   CatalogSubscriptionOptions,
-  DeskApiClient,
 } from "./api-client.js";
+import { DeskApiClient, DeskApiError } from "./api-client.js";
 import type { PublicDocument, PublicWorkspace } from "./api-types.js";
 import {
   applyTuiReader,
+  applyTuiMissingReader,
   createTuiState,
   handleTuiKey,
   handleTuiMouse,
@@ -74,6 +75,27 @@ test("navigates and opens the selected queue document", () => {
   const opened = handleTuiKey(moved.state, "enter");
   assert.deepEqual(opened.effects, [
     { type: "open", documentId: documents[1]?.id },
+  ]);
+});
+
+test("keeps missing documents visible and directly archivable", () => {
+  const missing = {
+    ...documents[0]!,
+    missingAt: "2026-08-13T09:00:00.000Z",
+  };
+  const queue = createTuiState([missing], [workspaces[0]!]);
+  const frame = renderTui(queue, 100, 24);
+  assert.match(frame, /SOURCE MISSING/);
+  assert.match(frame, /a archive/);
+  assert.deepEqual(handleTuiKey(queue, "a").effects, [
+    { type: "action", action: "archive", documentId: missing.id },
+  ]);
+
+  const reader = applyTuiMissingReader(queue, missing);
+  assert.equal(reader.mode, "reader");
+  assert.match(renderTui(reader, 100, 24), /source file is missing/i);
+  assert.deepEqual(handleTuiKey(reader, "a").effects, [
+    { type: "action", action: "archive", documentId: missing.id },
   ]);
 });
 
@@ -255,8 +277,19 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
       .effects,
     [{ type: "open", documentId: documents[0]!.id }],
   );
+  assert.deepEqual(
+    handleTuiMouse(queue, { button: "left", x: 28, y: 27 }, 128, 28)
+      .effects,
+    [
+      {
+        type: "action",
+        action: "archive",
+        documentId: documents[0]!.id,
+      },
+    ],
+  );
   assert.equal(
-    handleTuiMouse(queue, { button: "left", x: 50, y: 27 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: 64, y: 27 }, 128, 28)
       .state.searching,
     true,
   );
@@ -399,6 +432,66 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   assert.match(terminal, /\u001b\[\?1006l\u001b\[\?1000l/);
   assert.equal(terminal.match(/\u001b\[2J/g)?.length, 1);
   assert.deepEqual(renderPreferences, { color: true, unicode: true });
+});
+
+test("opens a safe missing-source reader when a source disappears during render", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  Object.defineProperties(output, {
+    columns: { value: 80 },
+    rows: { value: 20 },
+    isTTY: { value: true },
+  });
+  let terminal = "";
+  output.on("data", (chunk: Buffer) => {
+    terminal += chunk.toString();
+  });
+
+  const present = structuredClone(documents[0]!);
+  const missing = {
+    ...present,
+    missingAt: "2026-08-13T09:00:00.000Z",
+  };
+  let sourceMissing = false;
+  const actions: string[] = [];
+  const client = {
+    listDocuments: async () => [sourceMissing ? missing : present],
+    listWorkspaces: async () => [workspaces[0]!],
+    renderDocument: async () => {
+      sourceMissing = true;
+      throw new DeskApiError(
+        410,
+        "source_missing",
+        "Document source is missing",
+      );
+    },
+    act: async (id: string, action: string) => {
+      actions.push(`${action}:${id}`);
+      return missing;
+    },
+    subscribeCatalog: async (
+      _listener: (event: CatalogEvent) => void,
+      options: CatalogSubscriptionOptions = {},
+    ) => {
+      await new Promise<void>((resolve) => {
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  } as unknown as DeskApiClient;
+
+  const running = runTui(client, {
+    env: { TERM: "xterm-256color" },
+    input: input as unknown as ReadStream,
+    output: output as unknown as WriteStream,
+  });
+  input.write("\r");
+  await eventually(() => /source file is missing/i.test(terminal));
+  input.write("a");
+  await eventually(() => actions.includes(`archive:${present.id}`));
+  input.write("q");
+  await running;
+
+  assert.doesNotMatch(terminal, /ENOENT|\/Users\//);
 });
 
 async function eventually(predicate: () => boolean): Promise<void> {

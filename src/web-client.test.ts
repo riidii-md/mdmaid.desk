@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   filterQueue,
+  isSourceMissing,
   queueCounts,
   visibleWorkspaces,
   type WebDocument,
@@ -103,4 +104,15 @@ test("hides projects without visible documents from browser navigation", () => {
   assert.deepEqual(visibleWorkspaces([documents[1]!], workspaces), [
     { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
   ]);
+});
+
+test("identifies documents whose registered source disappeared", () => {
+  assert.equal(isSourceMissing(documents[0]!), false);
+  assert.equal(
+    isSourceMissing({
+      ...documents[0]!,
+      missingAt: "2026-08-13T09:00:00.000Z",
+    }),
+    true,
+  );
 });
