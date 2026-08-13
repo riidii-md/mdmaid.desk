@@ -131,6 +131,27 @@ test("routes producer writes through a live daemon without opening local storage
         route: "/d/doc-0123456789abcdefabcd",
       };
     },
+    importDocument: async (input: unknown) => {
+      calls.push(["import", input]);
+      return {
+        id: "doc-fedcba9876543210abcd",
+        workspaceId: "example",
+        storage: "managed",
+        kind: "brief",
+        title: "Review",
+        attention: "review",
+        tags: [],
+        revision: 1,
+        openedRevision: null,
+        completedRevision: null,
+        status: "unread",
+        archivedAt: null,
+        missingAt: null,
+        createdAt: "2026-08-12T00:00:00.000Z",
+        updatedAt: "2026-08-12T00:00:00.000Z",
+        route: "/d/doc-fedcba9876543210abcd",
+      };
+    },
   } as unknown as DeskApiClient;
   const stdout = output();
   const stderr = output();
@@ -139,6 +160,24 @@ test("routes producer writes through a live daemon without opening local storage
   assert.equal(
     await run(
       ["workspace", "add", workspace, "--id", "example", "--name", "Example"],
+      stdout,
+      stderr,
+      options,
+    ),
+    0,
+  );
+  assert.equal(
+    await run(
+      [
+        "import",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "brief",
+        "--attention",
+        "review",
+      ],
       stdout,
       stderr,
       options,
@@ -170,6 +209,13 @@ test("routes producer writes through a live daemon without opening local storage
 
   assert.deepEqual(calls, [
     ["workspace", { id: "example", name: "Example", root: workspace, artifactRoots: [workspace] }],
+    ["import", {
+      workspaceId: "example",
+      kind: "brief",
+      title: "review",
+      path: documentPath,
+      attention: "review",
+    }],
     ["document", {
       workspaceId: "example",
       producer: "codex",
@@ -182,6 +228,7 @@ test("routes producer writes through a live daemon without opening local storage
   ]);
   await assert.rejects(readFile(statePath), /ENOENT/);
   assert.equal(stderr.text(), "");
+  assert.match(stdout.text(), /imported doc-fedcba9876543210abcd/);
 });
 
 test("returns a usage error for incomplete commands", async () => {

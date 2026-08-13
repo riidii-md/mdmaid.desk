@@ -184,6 +184,7 @@ GET    /api/v1/workspaces
 POST   /api/v1/workspaces
 GET    /api/v1/documents?workspace=&task=&tag=&status=&attention=
 POST   /api/v1/documents
+POST   /api/v1/imports
 GET    /api/v1/documents/:id
 POST   /api/v1/documents/:id/opened
 POST   /api/v1/documents/:id/read

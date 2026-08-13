@@ -681,6 +681,7 @@ function applyFilters(state: TuiState): TuiState {
       document.taskId ?? "",
       document.producer ?? "",
       document.kind,
+      document.storage,
       document.attention,
       ...document.tags,
     ].join(" ").toLowerCase();
@@ -1132,7 +1133,12 @@ function renderDocumentCard(
   const title = selected
     ? theme.styles.bold(sanitizeTerminalText(document.title))
     : theme.ink(sanitizeTerminalText(document.title));
-  const meta = [document.workspaceId, document.kind, document.taskId]
+  const meta = [
+    document.workspaceId,
+    document.kind,
+    document.storage,
+    document.taskId,
+  ]
     .filter((value): value is string => Boolean(value))
     .map((value) => sanitizeTerminalText(value))
     .join(" · ");
@@ -1168,6 +1174,7 @@ function readerLines(
     document.workspaceId,
     document.taskId,
     document.kind,
+    document.storage,
     state.reader.backend,
   ].filter((value): value is string => Boolean(value)).join(" · ");
   const heading = spread(

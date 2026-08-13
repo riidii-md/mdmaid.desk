@@ -7,13 +7,17 @@ Both the filesystem boundary and browser boundary are security-sensitive.
 
 ## Current Controls
 
-- only `.md` files can be registered;
+- only regular, bounded `.md` files can be registered or imported;
 - workspaces and artifact roots are canonicalized;
 - artifact roots must remain under their workspace;
 - documents must remain under an artifact root after realpath resolution;
+- import is a separate explicit operation and does not broaden registration or
+  watcher artifact-root authorization;
 - final-path symlinks and symlink escapes are rejected;
 - documents are limited to 2 MiB by default;
-- the catalog stores metadata only;
+- imported snapshots are written atomically into non-symlink, mode-`0700`
+  managed directories and use mode `0600`;
+- public API responses expose neither original nor managed filesystem paths;
 - catalog writes are atomic;
 - new catalog files use mode `0600`;
 - new catalog directories use mode `0700`.

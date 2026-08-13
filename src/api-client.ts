@@ -4,6 +4,7 @@ import {
 } from "./domain.js";
 import type {
   DocumentAction,
+  DocumentImport,
   DocumentRegistration,
   HealthData,
   PublicDocument,
@@ -103,6 +104,17 @@ export class DeskApiClient {
 
   async registerDocument(input: DocumentRegistration): Promise<PublicDocument> {
     const value = await this.#request("/api/v1/documents", {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicDocument(value)) {
+      throw new Error("Daemon returned an invalid document response");
+    }
+    return value;
+  }
+
+  async importDocument(input: DocumentImport): Promise<PublicDocument> {
+    const value = await this.#request("/api/v1/imports", {
       method: "POST",
       body: input,
     });
@@ -295,6 +307,7 @@ function isPublicDocument(value: unknown): value is PublicDocument {
     typeof value.kind === "string" &&
     (DOCUMENT_KINDS as readonly string[]).includes(value.kind) &&
     typeof value.title === "string" &&
+    (value.storage === "reference" || value.storage === "managed") &&
     typeof value.attention === "string" &&
     (ATTENTION_STATES as readonly string[]).includes(value.attention) &&
     Array.isArray(value.tags) &&

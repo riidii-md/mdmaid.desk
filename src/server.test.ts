@@ -348,6 +348,57 @@ test("registers documents through validated producer-neutral input", async () =>
   }
 });
 
+test("imports outside documents without leaking source or managed paths", async () => {
+  const value = await fixture();
+  try {
+    const outsidePath = join(value.root, "outside-agent-output.md");
+    await writeFile(outsidePath, "# Imported through API\n", "utf8");
+    const response = await authorized(value, "/api/v1/imports", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "example",
+        producer: "codex",
+        kind: "brief",
+        title: "Imported through API",
+        path: outsidePath,
+        attention: "review",
+      }),
+    });
+
+    assert.equal(response.status, 201);
+    assert.match(response.headers.get("location") ?? "", /^\/api\/v1\/documents\/doc-/);
+    const body = (await response.json()) as { data: Record<string, unknown> };
+    assert.equal(body.data.storage, "managed");
+    assert.equal("path" in body.data, false);
+    assert.equal("sourcePath" in body.data, false);
+    assert.doesNotMatch(JSON.stringify(body), new RegExp(value.root));
+
+    await rm(outsidePath);
+    const rendered = await authorized(
+      value,
+      `/api/v1/documents/${String(body.data.id)}/render?target=web`,
+    );
+    assert.equal(rendered.status, 200);
+    assert.match(await rendered.text(), /Imported through API/);
+
+    const invalid = await authorized(value, "/api/v1/imports", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: "example" }),
+    });
+    assert.equal(invalid.status, 422);
+    assert.deepEqual(await invalid.json(), {
+      error: {
+        code: "validation_error",
+        message: "Invalid document import",
+      },
+    });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("adds workspaces through validated producer-neutral input", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-server-workspace-"));
   const workspace = join(root, "workspace");

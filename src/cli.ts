@@ -10,6 +10,7 @@ import {
   type AddWorkspaceInput,
   Catalog,
   type DocumentKind,
+  type ImportDocumentInput,
   type RegisterDocumentInput,
 } from "./catalog.js";
 import { DeskApiClient } from "./api-client.js";
@@ -72,6 +73,9 @@ Usage:
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
   mdmaid-desk register <file.md> --workspace <id>
+      [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--attention <state>] [--tag <tag> ...]
+  mdmaid-desk import <file.md> --workspace <id>
       [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
   mdmaid-desk list [--workspace <id>] [--task <id>]
@@ -185,6 +189,9 @@ export async function run(
     }
     if (args[0] === "register") {
       return await runRegister(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "import") {
+      return await runImport(statePath, args.slice(1), stdout, options);
     }
     const catalog = await Catalog.open(statePath);
     try {
@@ -560,6 +567,73 @@ async function runRegister(
   }
   stdout.write(`registered ${id}: ${path}\n`);
   return 0;
+}
+
+async function runImport(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const input = parseImport(args);
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  let id: string;
+  if (client) {
+    id = (await client.importDocument(input)).id;
+  } else {
+    const catalog = await Catalog.open(statePath);
+    try {
+      id = (await catalog.importDocument(input)).id;
+    } finally {
+      catalog.close();
+    }
+  }
+  stdout.write(`imported ${id}: ${input.path}\n`);
+  return 0;
+}
+
+function parseImport(args: string[]): ImportDocumentInput {
+  const parsed = parseArguments(args);
+  const path = parsed.positionals[0];
+  if (!path) {
+    throw new UsageError("document path is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("import accepts one document path");
+  }
+  rejectUnknownOptions(
+    parsed,
+    new Set([
+      "workspace",
+      "task",
+      "producer",
+      "kind",
+      "title",
+      "attention",
+      "tag",
+    ]),
+  );
+  const kind = (firstOption(parsed, "kind") ?? "other") as DocumentKind;
+  if (!DOCUMENT_KINDS.has(kind)) {
+    throw new UsageError(`unknown document kind ${kind}`);
+  }
+  const attention = (firstOption(parsed, "attention") ?? "none") as Attention;
+  if (!ATTENTION_STATES.has(attention)) {
+    throw new UsageError(`unknown attention state ${attention}`);
+  }
+  const taskId = firstOption(parsed, "task");
+  const producer = firstOption(parsed, "producer");
+  const tags = parsed.options.get("tag");
+  return {
+    workspaceId: requiredOption(parsed, "workspace"),
+    ...(taskId ? { taskId } : {}),
+    ...(producer ? { producer } : {}),
+    kind,
+    title: firstOption(parsed, "title") ?? basename(path, ".md"),
+    path,
+    attention,
+    ...(tags === undefined ? {} : { tags }),
+  };
 }
 
 function runList(

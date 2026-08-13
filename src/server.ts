@@ -325,6 +325,33 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/v1/imports") {
+    const body = await readJson(request);
+    if (!isDocumentRegistration(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid document import",
+      );
+    }
+    try {
+      const document = await catalog.importDocument(body);
+      response.setHeader("location", `/api/v1/documents/${document.id}`);
+      sendJson(response, 201, { data: publicDocument(document) });
+      events.publish("catalog", { action: "imported", documentId: document.id });
+    } catch (error) {
+      if (error instanceof Error) {
+        throw new HttpError(
+          422,
+          "validation_error",
+          "Invalid document import",
+        );
+      }
+      throw error;
+    }
+    return;
+  }
+
   const documentMatch = url.pathname.match(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})$/,
   );
@@ -647,6 +674,7 @@ function publicDocument(document: Document): Record<string, unknown> {
     ...(document.producer === undefined ? {} : { producer: document.producer }),
     kind: document.kind,
     title: document.title,
+    storage: document.storage,
     attention: document.attention,
     tags: document.tags,
     revision: document.revision,
