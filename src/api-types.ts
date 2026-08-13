@@ -13,6 +13,7 @@ export interface PublicDocument {
   producer?: string;
   kind: DocumentKind;
   title: string;
+  storage: "reference" | "managed";
   attention: Attention;
   tags: string[];
   revision: number;
@@ -50,6 +51,8 @@ export interface DocumentRegistration {
   attention: Attention;
   tags?: string[];
 }
+
+export type DocumentImport = DocumentRegistration;
 
 export interface HealthData {
   service: "mdmaid.desk";

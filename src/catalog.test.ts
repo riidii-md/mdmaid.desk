@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -109,6 +119,116 @@ test("rejects documents outside registered artifact roots", async () => {
   );
 });
 
+test("imports an outside Markdown source into durable private storage", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const outsidePath = join(workspace, "..", "agent-output.md");
+  await writeFile(outsidePath, "# Durable agent output\n", "utf8");
+
+  const imported = await catalog.importDocument({
+    workspaceId: "example",
+    producer: "claude-code",
+    kind: "brief",
+    title: "Durable agent output",
+    path: outsidePath,
+    attention: "review",
+    tags: ["agent"],
+  });
+
+  assert.equal(imported.storage, "managed");
+  assert.notEqual(imported.path, outsidePath);
+  assert.match(imported.path, /[/\\]managed[/\\]example[/\\]doc-[a-f0-9]{20}-[a-f0-9]{64}\.md$/);
+  assert.equal((await stat(imported.path)).mode & 0o777, 0o600);
+  assert.equal((await stat(join(statePath, "..", "managed"))).mode & 0o777, 0o700);
+
+  const repeated = await catalog.importDocument({
+    workspaceId: "example",
+    producer: "claude-code",
+    kind: "brief",
+    title: "Durable agent output",
+    path: outsidePath,
+    attention: "review",
+    tags: ["agent"],
+  });
+  assert.equal(repeated.id, imported.id);
+  assert.equal(repeated.revision, 1);
+
+  await writeFile(outsidePath, "# Durable agent output v2\n", "utf8");
+  const changed = await catalog.importDocument({
+    workspaceId: "example",
+    producer: "claude-code",
+    kind: "brief",
+    title: "Durable agent output",
+    path: outsidePath,
+    attention: "review",
+    tags: ["agent"],
+  });
+  assert.equal(changed.id, imported.id);
+  assert.equal(changed.revision, 2);
+  assert.notEqual(changed.path, imported.path);
+
+  await rm(outsidePath);
+  assert.equal(
+    (await catalog.readDocument(imported.id)).content,
+    "# Durable agent output v2\n",
+  );
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.equal(restored.getDocument(imported.id)?.storage, "managed");
+  assert.equal(
+    (await restored.readDocument(imported.id)).content,
+    "# Durable agent output v2\n",
+  );
+  restored.close();
+  catalog.close();
+});
+
+test("keeps registration root policy separate from managed imports", async () => {
+  const { catalog, workspace } = await fixture();
+  const outsidePath = join(workspace, "..", "outside-managed.md");
+  const symlinkPath = join(workspace, "..", "outside-link.md");
+  await writeFile(outsidePath, "# Managed\n", "utf8");
+  await symlink(outsidePath, symlinkPath);
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "other",
+      title: "Reference",
+      path: outsidePath,
+      attention: "none",
+    }),
+    /outside registered artifact roots/,
+  );
+  await assert.rejects(
+    catalog.importDocument({
+      workspaceId: "example",
+      kind: "other",
+      title: "Symlink",
+      path: symlinkPath,
+      attention: "none",
+    }),
+    /must not be a symlink/,
+  );
+
+  const imported = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "other",
+    title: "Managed",
+    path: outsidePath,
+    attention: "none",
+  });
+  await assert.doesNotReject(
+    catalog.addWorkspace({
+      id: "example",
+      name: "Example renamed",
+      root: workspace,
+      artifactRoots: [workspace],
+    }),
+  );
+  assert.equal(catalog.getDocument(imported.id)?.storage, "managed");
+  catalog.close();
+});
+
 test("rejects symlink escapes from registered artifact roots", async () => {
   const { catalog, workspace } = await fixture();
   const outsideDir = await mkdtemp(join(tmpdir(), "mdmaid-desk-outside-"));
@@ -145,6 +265,16 @@ test("rejects non-Markdown and oversized files", async () => {
     }),
     /Markdown files/,
   );
+  await assert.rejects(
+    catalog.importDocument({
+      workspaceId: "example",
+      kind: "other",
+      title: "Notes",
+      path: textPath,
+      attention: "none",
+    }),
+    /Markdown files/,
+  );
 
   const smallCatalog = await Catalog.open(join(workspace, ".state", "catalog.sqlite3"), {
     maxDocumentBytes: 256,
@@ -165,6 +295,49 @@ test("rejects non-Markdown and oversized files", async () => {
     }),
     /exceeds 256 bytes/,
   );
+  await assert.rejects(
+    smallCatalog.importDocument({
+      workspaceId: "example",
+      kind: "other",
+      title: "Large import",
+      path: largePath,
+      attention: "none",
+    }),
+    /exceeds 256 bytes/,
+  );
+});
+
+test("rejects symlinked managed storage without writing through it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-managed-symlink-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const redirected = join(root, "redirected");
+  const sourcePath = join(root, "outside.md");
+  await mkdir(workspace);
+  await mkdir(redirected);
+  await writeFile(sourcePath, "# Outside\n", "utf8");
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  await symlink(redirected, join(root, "state", "managed"));
+
+  await assert.rejects(
+    catalog.importDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Outside",
+      path: sourcePath,
+      attention: "none",
+    }),
+    /non-symlink directory/,
+  );
+  assert.deepEqual(await readFile(sourcePath, "utf8"), "# Outside\n");
+  assert.deepEqual(await readdir(redirected), []);
+  catalog.close();
 });
 
 test("rejects malformed legacy catalog entries without consuming the source", async () => {
@@ -388,8 +561,24 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const catalog = await Catalog.open(databasePath, { legacyStatePath: false });
   catalog.close();
 
+  const versionOne = new Database(databasePath);
+  versionOne.exec("ALTER TABLE documents DROP COLUMN source_path");
+  versionOne.exec("ALTER TABLE documents DROP COLUMN storage_kind");
+  versionOne.pragma("user_version = 1");
+  versionOne.close();
+  const migrated = await Catalog.open(databasePath, { legacyStatePath: false });
+  migrated.close();
+
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 1);
+  assert.equal(database.pragma("user_version", { simple: true }), 2);
+  assert.deepEqual(
+    database
+      .prepare<[], { name: string }>("PRAGMA table_info(documents)")
+      .all()
+      .map(({ name }) => name)
+      .filter((name) => name === "storage_kind" || name === "source_path"),
+    ["storage_kind", "source_path"],
+  );
   assert.deepEqual(
     database
       .prepare<[], { name: string }>(

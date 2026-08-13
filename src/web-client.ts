@@ -77,6 +77,7 @@ export function filterQueue(
       document.taskId ?? "",
       document.producer ?? "",
       document.kind,
+      document.storage,
       document.attention,
       ...document.tags,
     ]
@@ -259,7 +260,12 @@ async function boot(): Promise<void> {
       status.textContent = isSourceMissing(item) ? "source missing" : item.status;
       const context = document.createElement("span");
       context.className = "card-context";
-      context.textContent = [item.workspaceId, item.taskId, item.kind]
+      context.textContent = [
+        item.workspaceId,
+        item.taskId,
+        item.kind,
+        item.storage,
+      ]
         .filter(Boolean)
         .join(" / ");
       top.append(status, context);
@@ -318,7 +324,12 @@ async function boot(): Promise<void> {
     const selected = state.documents.find((item) => item.id === id);
     readerTitle.textContent = selected?.title ?? "Document";
     readerMeta.textContent = selected
-      ? [selected.workspaceId, selected.taskId, selected.kind]
+      ? [
+          selected.workspaceId,
+          selected.taskId,
+          selected.kind,
+          selected.storage,
+        ]
           .filter(Boolean)
           .join(" / ")
       : "";

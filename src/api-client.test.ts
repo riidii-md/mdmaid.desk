@@ -223,6 +223,16 @@ test("routes producer workspace and document mutations through the daemon", asyn
     assert.equal(document.workspaceId, "example");
     assert.equal(document.producer, "codex");
     assert.deepEqual(document.tags, ["agent"]);
+    const outsidePath = join(root, "outside.md");
+    await writeFile(outsidePath, "# Managed\n", "utf8");
+    const imported = await client.importDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Managed",
+      path: outsidePath,
+      attention: "none",
+    });
+    assert.equal(imported.storage, "managed");
     controller.abort();
     await subscription;
   } finally {

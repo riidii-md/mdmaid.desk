@@ -48,8 +48,9 @@ Approval is not part of mdmaid.desk catalog state.
 
 The catalog uses a versioned SQLite database behind a storage interface.
 Workspaces authorize canonical artifact roots. Documents retain stable IDs,
-content hashes, revisions, reading progress, tags, archive state, and missing
-state. Reading status is derived from progress on the current revision:
+content hashes, revisions, reading progress, tags, archive state, missing
+state, and a storage mode (`reference` or `managed`). Reading status is
+derived from progress on the current revision:
 
 ```text
 completedRevision == revision  -> Done
@@ -60,7 +61,11 @@ otherwise                      -> Unread
 Changing document content increments its revision and makes it Unread.
 Metadata-only updates preserve progress. Existing version 1 JSON catalogs are
 imported in one transaction and retained as `catalog.json.migrated`.
-Markdown content remains at its authorized original path.
+Registered Markdown remains at its authorized original path. Explicit imports
+are copied atomically into mode-`0700` managed storage beside the catalog;
+snapshot files are mode `0600`. The original canonical path is retained only
+as private provenance. Public API responses expose the storage mode but never
+the source or managed filesystem paths.
 
 The catalog is the durable product state. It does not depend on a running
 daemon: harnesses, editors, scripts, and users can register documents through
@@ -75,6 +80,7 @@ Use one user-level catalog with an optional single daemon:
   auth-token
   daemon.json
   catalog.sqlite3
+  managed/
   logs/
 ```
 
@@ -89,16 +95,19 @@ mdmaid-desk daemon uninstall
 
 mdmaid-desk workspace add /path/to/repository
 mdmaid-desk register plan.md
+mdmaid-desk import /path/to/temporary/agent-output.md --workspace project-id
 mdmaid-desk open plan.md
 mdmaid-desk list --task PROJECT-123
 ```
 
-Document ingress is daemonless by default. `workspace`, `register`, `enqueue`,
+Document ingress is daemonless by default. `workspace`, `register`, `import`,
 and other short CLI mutations first health-check `daemon.json`: when a healthy
 daemon exists they use its authenticated API so connected clients receive live
 events; otherwise they perform a bounded catalog transaction and exit. A
-producer must never need to start or install a service just to queue a durable
-Markdown file.
+producer must never need to start or install a service just to queue a
+Markdown file. Registration retains the workspace-root authorization boundary.
+Import is a separate opt-in operation for a durable snapshot when the original
+path may disappear; it does not broaden registration or watcher authorization.
 
 The daemon is an opt-in live coordination and presentation service. It owns
 continuous behavior while active: HTTP/API access, Server-Sent Events,
@@ -171,7 +180,8 @@ Any harness or tool can emit a producer-neutral registration payload:
 ```
 
 The producer name is opaque metadata. Adding another harness does not require a
-mdmaid.desk release. Registration and opening remain separate operations.
+mdmaid.desk release. Registration, import, opening, and workflow approval
+remain separate operations.
 
 Suggested attention values:
 
@@ -191,6 +201,7 @@ Status: complete.
 
 - workspace registration;
 - document registration;
+- explicit managed document import;
 - persistence;
 - path containment;
 - idempotency;

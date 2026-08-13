@@ -26,6 +26,7 @@ export const ATTENTION_STATES = [
 
 export type Attention = (typeof ATTENTION_STATES)[number];
 export type ReadingStatus = "unread" | "reading" | "done";
+export type DocumentStorage = "reference" | "managed";
 
 export interface ReadingProgress {
   revision: number;
@@ -47,7 +48,9 @@ export interface StoredDocument extends ReadingProgress {
   producer?: string;
   kind: DocumentKind;
   title: string;
+  storage: DocumentStorage;
   path: string;
+  sourcePath?: string;
   attention: Attention;
   tags: string[];
   contentHash: string;

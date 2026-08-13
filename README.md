@@ -12,6 +12,7 @@ The repository contains the first usable shared-service vertical slice:
 
 - persistent workspace metadata;
 - Markdown document registration;
+- opt-in durable imports for sources outside workspace artifact roots;
 - idempotent updates by canonical path;
 - workspace and artifact-root containment;
 - symlink-escape protection;
@@ -30,9 +31,10 @@ The repository contains the first usable shared-service vertical slice:
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
 - selectable ports with automatic available-port fallback;
-- `workspace`, `register`, `list`, `web`, `tui`, and `daemon` commands.
+- `workspace`, `register`, `import`, `list`, `web`, `tui`, and `daemon`
+  commands.
 
-Directory watching, stdin-managed enqueue, comments, and editing remain planned
+Directory watching, stdin import, comments, and editing remain planned
 milestones. Document registration works without a daemon, but automatically
 uses its authenticated API when one is running. `web` reuses a daemon or runs
 the service in the foreground; `tui` attaches to it when present and uses a
@@ -127,6 +129,23 @@ node dist/cli.js register /path/to/repository/docs/plan.md \
   --tag architecture
 ```
 
+Import a durable copy when the original file may disappear (for example, an
+agent-run file in a temporary worktree):
+
+```bash
+mdmaid-desk import /path/to/worktree/.agent-runs/readability/adapted.md \
+  --workspace example \
+  --producer claude-code \
+  --kind brief \
+  --attention review
+```
+
+`register` keeps the document at its authorized workspace path and continues
+to reflect later file changes. `import` is explicit: it accepts a regular,
+non-symlink Markdown file from any local path, makes a private durable snapshot,
+and queues that snapshot under the selected workspace. Removing the original
+file does not remove the imported copy.
+
 List documents:
 
 ```bash
@@ -204,6 +223,7 @@ The default state directory is:
 ${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
   auth-token
   catalog.sqlite3
+  managed/     # private imported Markdown snapshots
   daemon.json  # present while a foreground or background service is running
   daemon.log
 ```
@@ -212,7 +232,7 @@ ${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
 
 ```mermaid
 flowchart LR
-    A[Harnesses and tools] -->|register document| S[mdmaid.desk]
+    A[Harnesses and tools] -->|register reference or import copy| S[mdmaid.desk]
     CFG[agentctl] -.->|optional configuration| A
     N[mdmaid.nvim] -->|register or open| S
     X[Scripts] -->|register| S

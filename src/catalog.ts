@@ -1,19 +1,22 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   access,
   chmod,
   lstat,
+  mkdir,
   open,
   readFile,
   realpath,
   rename,
+  rm,
   stat,
 } from "node:fs/promises";
 import {
   dirname,
   extname,
   isAbsolute,
+  join,
   relative,
   resolve,
   sep,
@@ -27,17 +30,20 @@ import {
   type Document,
   type DocumentFilters,
   type DocumentKind,
+  type DocumentStorage,
   type StoredDocument,
   type Workspace,
 } from "./domain.js";
 import { SqliteCatalogStorage } from "./sqlite-storage.js";
 import type { CatalogStorage } from "./storage.js";
+import { syncDirectory } from "./fs-durability.js";
 
 export type {
   Attention,
   Document,
   DocumentFilters,
   DocumentKind,
+  DocumentStorage,
   ReadingStatus,
   Workspace,
 } from "./domain.js";
@@ -91,6 +97,8 @@ export interface RegisterDocumentInput {
   tags?: string[];
 }
 
+export type ImportDocumentInput = RegisterDocumentInput;
+
 interface InspectedDocument {
   path: string;
   contentHash: string;
@@ -107,11 +115,17 @@ export class DocumentSourceMissingError extends Error {
 export class Catalog {
   readonly #storage: CatalogStorage;
   readonly #maxDocumentBytes: number;
+  readonly #managedRoot: string;
 
-  private constructor(storage: CatalogStorage, options: CatalogOptions) {
+  private constructor(
+    storage: CatalogStorage,
+    options: CatalogOptions,
+    managedRoot: string,
+  ) {
     this.#storage = storage;
     this.#maxDocumentBytes =
       options.maxDocumentBytes ?? DEFAULT_MAX_DOCUMENT_BYTES;
+    this.#managedRoot = managedRoot;
   }
 
   static async open(
@@ -123,8 +137,13 @@ export class Catalog {
       throw new Error("database path is required");
     }
 
-    const storage = SqliteCatalogStorage.open(resolve(databasePath));
-    const catalog = new Catalog(storage, options);
+    const canonicalDatabasePath = resolve(databasePath);
+    const storage = SqliteCatalogStorage.open(canonicalDatabasePath);
+    const catalog = new Catalog(
+      storage,
+      options,
+      join(dirname(canonicalDatabasePath), "managed"),
+    );
     try {
       const legacyStatePath =
         options.legacyStatePath === false
@@ -178,11 +197,18 @@ export class Catalog {
     }
     let inspected: InspectedDocument;
     try {
-      inspected = await inspectMarkdownDocument(
-        stored.path,
-        workspace,
-        this.#maxDocumentBytes,
-      );
+      inspected =
+        stored.storage === "managed"
+          ? await inspectManagedMarkdownDocument(
+              stored.path,
+              this.#managedRoot,
+              this.#maxDocumentBytes,
+            )
+          : await inspectMarkdownDocument(
+              stored.path,
+              workspace,
+              this.#maxDocumentBytes,
+            );
     } catch (error) {
       if (
         isNodeError(error) &&
@@ -234,6 +260,7 @@ export class Catalog {
     const excludedDocument = documents.find(
       (document) =>
         document.workspaceId === workspace.id &&
+        document.storage === "reference" &&
         !workspace.artifactRoots.some((artifactRoot) =>
           isWithin(artifactRoot, document.path),
         ),
@@ -284,7 +311,74 @@ export class Catalog {
         : { producer: validated.producer }),
       kind: validated.kind,
       title: validated.title,
+      storage: "reference",
       path: inspected.path,
+      attention: validated.attention,
+      tags,
+      contentHash: inspected.contentHash,
+      revision: existing ? existing.revision + (contentChanged ? 1 : 0) : 1,
+      openedRevision: existing?.openedRevision ?? null,
+      completedRevision: existing?.completedRevision ?? null,
+      archivedAt: existing?.archivedAt ?? null,
+      missingAt: null,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+
+    this.#storage.saveDocument(document);
+    return presentDocument(document);
+  }
+
+  async importDocument(input: ImportDocumentInput): Promise<Document> {
+    const validated = validateRegisterDocumentInput(input, "import");
+    const workspace = this.#storage.getWorkspace(validated.workspaceId);
+    if (!workspace) {
+      throw new Error(`unknown workspace ${validated.workspaceId}`);
+    }
+
+    const inspected = await inspectImportSource(
+      validated.path,
+      this.#maxDocumentBytes,
+    );
+    const id = documentId(
+      validated.workspaceId,
+      `managed\0${inspected.path}`,
+    );
+    const existing = this.#storage.getDocument(id);
+    if (existing && existing.storage !== "managed") {
+      throw new Error("document id conflicts with a referenced document");
+    }
+    const managedPath = await writeManagedCopy(
+      this.#managedRoot,
+      validated.workspaceId,
+      id,
+      inspected,
+    );
+    const now = new Date().toISOString();
+    const contentChanged =
+      existing !== undefined && existing.contentHash !== inspected.contentHash;
+    const tags =
+      validated.tags === undefined
+        ? (existing?.tags ?? [])
+        : normalizeTags(validated.tags);
+    const document: StoredDocument = {
+      id,
+      workspaceId: validated.workspaceId,
+      ...(validated.taskId === undefined
+        ? existing?.taskId === undefined
+          ? {}
+          : { taskId: existing.taskId }
+        : { taskId: validated.taskId }),
+      ...(validated.producer === undefined
+        ? existing?.producer === undefined
+          ? {}
+          : { producer: existing.producer }
+        : { producer: validated.producer }),
+      kind: validated.kind,
+      title: validated.title,
+      storage: "managed",
+      path: managedPath,
+      sourcePath: inspected.path,
       attention: validated.attention,
       tags,
       contentHash: inspected.contentHash,
@@ -439,6 +533,7 @@ export class Catalog {
           : { taskId: legacyDocument.taskId }),
         kind: legacyDocument.kind,
         title: legacyDocument.title,
+        storage: "reference",
         path: inspected.path,
         attention: legacyDocument.attention,
         tags: [],
@@ -512,6 +607,7 @@ function validateAddWorkspaceInput(input: AddWorkspaceInput): void {
 
 function validateRegisterDocumentInput(
   input: RegisterDocumentInput,
+  operation: "registration" | "import" = "registration",
 ): RegisterDocumentInput {
   if (
     !isRecord(input) ||
@@ -546,7 +642,7 @@ function validateRegisterDocumentInput(
     !isAttention(input.attention) ||
     (input.tags !== undefined && !isStringArray(input.tags))
   ) {
-    throw new Error("invalid document registration input");
+    throw new Error(`invalid document ${operation} input`);
   }
   if (input.tags !== undefined) {
     normalizeTags(input.tags);
@@ -684,6 +780,111 @@ async function inspectMarkdownDocument(
     contentHash: createHash("sha256").update(content).digest("hex"),
     content,
   };
+}
+
+async function inspectImportSource(
+  inputPath: string,
+  maxDocumentBytes: number,
+): Promise<InspectedDocument> {
+  const requestedPath = resolve(inputPath);
+  if (extname(requestedPath).toLowerCase() !== ".md") {
+    throw new Error("only Markdown files can be imported");
+  }
+  const requestedInfo = await lstat(requestedPath);
+  if (requestedInfo.isSymbolicLink()) {
+    throw new Error("document path must not be a symlink");
+  }
+  const documentPath = await realpath(requestedPath);
+  const content = await readBoundedRegularFile(documentPath, maxDocumentBytes);
+  return {
+    path: documentPath,
+    contentHash: createHash("sha256").update(content).digest("hex"),
+    content,
+  };
+}
+
+async function inspectManagedMarkdownDocument(
+  inputPath: string,
+  managedRoot: string,
+  maxDocumentBytes: number,
+): Promise<InspectedDocument> {
+  const requestedPath = resolve(inputPath);
+  if (!isWithin(managedRoot, requestedPath)) {
+    throw new Error("managed document is outside private storage");
+  }
+  const rootInfo = await lstat(managedRoot);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new Error("managed document storage must be a non-symlink directory");
+  }
+  const requestedInfo = await lstat(requestedPath);
+  if (requestedInfo.isSymbolicLink()) {
+    throw new Error("managed document path must not be a symlink");
+  }
+  const canonicalRoot = await realpath(managedRoot);
+  const documentPath = await realpath(requestedPath);
+  if (!isWithin(canonicalRoot, documentPath)) {
+    throw new Error("managed document is outside private storage");
+  }
+  const content = await readBoundedRegularFile(documentPath, maxDocumentBytes);
+  return {
+    path: documentPath,
+    contentHash: createHash("sha256").update(content).digest("hex"),
+    content,
+  };
+}
+
+async function writeManagedCopy(
+  managedRoot: string,
+  workspaceId: string,
+  id: string,
+  inspected: InspectedDocument,
+): Promise<string> {
+  await ensurePrivateDirectory(managedRoot);
+  const workspaceRoot = join(managedRoot, workspaceId);
+  await ensurePrivateDirectory(workspaceRoot);
+  const destination = join(
+    workspaceRoot,
+    `${id}-${inspected.contentHash}.md`,
+  );
+  const temporary = join(workspaceRoot, `.${id}-${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await open(
+      temporary,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        (fsConstants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    await handle.writeFile(inspected.content);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, destination);
+    await chmod(destination, 0o600);
+    await syncDirectory(workspaceRoot);
+    return destination;
+  } catch (error) {
+    await handle?.close();
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") {
+      throw error;
+    }
+  }
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("managed document storage must be a non-symlink directory");
+  }
+  await chmod(path, 0o700);
 }
 
 async function readBoundedRegularFile(

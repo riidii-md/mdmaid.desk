@@ -9,12 +9,13 @@ import {
   type Attention,
   type DocumentFilters,
   type DocumentKind,
+  type DocumentStorage,
   type StoredDocument,
   type Workspace,
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 1;
+export const SQLITE_SCHEMA_VERSION = 2;
 
 interface WorkspaceRow {
   id: string;
@@ -33,7 +34,9 @@ interface DocumentRow {
   producer: string | null;
   kind: string;
   title: string;
+  storage_kind: string;
   path: string;
+  source_path: string | null;
   attention: string;
   content_hash: string;
   revision: number;
@@ -69,7 +72,9 @@ const INITIAL_SCHEMA = `
     producer TEXT,
     kind TEXT NOT NULL,
     title TEXT NOT NULL,
+    storage_kind TEXT NOT NULL CHECK (storage_kind IN ('reference', 'managed')),
     path TEXT NOT NULL,
+    source_path TEXT,
     attention TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0),
@@ -275,11 +280,13 @@ export class SqliteCatalogStorage implements CatalogStorage {
       this.#database
         .prepare(
           `INSERT INTO documents (
-             id, workspace_id, task_id, producer, kind, title, path, attention,
+             id, workspace_id, task_id, producer, kind, title, storage_kind,
+             path, source_path, attention,
              content_hash, revision, opened_revision, completed_revision,
              archived_at, missing_at, created_at, updated_at
            ) VALUES (
-             @id, @workspaceId, @taskId, @producer, @kind, @title, @path, @attention,
+             @id, @workspaceId, @taskId, @producer, @kind, @title, @storage,
+             @path, @sourcePath, @attention,
              @contentHash, @revision, @openedRevision, @completedRevision,
              @archivedAt, @missingAt, @createdAt, @updatedAt
            )
@@ -289,7 +296,9 @@ export class SqliteCatalogStorage implements CatalogStorage {
              producer = excluded.producer,
              kind = excluded.kind,
              title = excluded.title,
+             storage_kind = excluded.storage_kind,
              path = excluded.path,
+             source_path = excluded.source_path,
              attention = excluded.attention,
              content_hash = excluded.content_hash,
              revision = excluded.revision,
@@ -306,7 +315,9 @@ export class SqliteCatalogStorage implements CatalogStorage {
           producer: document.producer ?? null,
           kind: document.kind,
           title: document.title,
+          storage: document.storage,
           path: document.path,
+          sourcePath: document.sourcePath ?? null,
           attention: document.attention,
           contentHash: document.contentHash,
           revision: document.revision,
@@ -356,7 +367,9 @@ export class SqliteCatalogStorage implements CatalogStorage {
       ...(row.producer === null ? {} : { producer: row.producer }),
       kind: row.kind as DocumentKind,
       title: row.title,
+      storage: row.storage_kind as DocumentStorage,
       path: row.path,
+      ...(row.source_path === null ? {} : { sourcePath: row.source_path }),
       attention: row.attention as Attention,
       tags,
       contentHash: row.content_hash,
@@ -382,7 +395,17 @@ function migrate(database: Database.Database): void {
   if (rawVersion < 1) {
     database.transaction(() => {
       database.exec(INITIAL_SCHEMA);
-      database.pragma("user_version = 1");
+      database.pragma(`user_version = ${SQLITE_SCHEMA_VERSION}`);
+    })();
+    return;
+  }
+  if (rawVersion < 2) {
+    database.transaction(() => {
+      database.exec(
+        "ALTER TABLE documents ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'reference' CHECK (storage_kind IN ('reference', 'managed'))",
+      );
+      database.exec("ALTER TABLE documents ADD COLUMN source_path TEXT");
+      database.pragma("user_version = 2");
     })();
   }
 }
@@ -414,9 +437,15 @@ function validateDocumentRow(row: DocumentRow, tags: string[]): void {
     (row.producer !== null && row.producer.trim() === "") ||
     !isDocumentKind(row.kind) ||
     row.title.trim() === "" ||
+    (row.storage_kind !== "reference" && row.storage_kind !== "managed") ||
     !isAbsolute(row.path) ||
     extname(row.path).toLowerCase() !== ".md" ||
     !isAttention(row.attention) ||
+    (row.storage_kind === "reference" && row.source_path !== null) ||
+    (row.storage_kind === "managed" &&
+      (row.source_path === null ||
+        !isAbsolute(row.source_path) ||
+        extname(row.source_path).toLowerCase() !== ".md")) ||
     !/^[a-f0-9]{64}$/.test(row.content_hash) ||
     !isPositiveInteger(row.revision) ||
     !isProgressRevision(row.opened_revision, row.revision) ||
