@@ -201,7 +201,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   color: var(--muted);
 }
 
-.reader { max-width: 1060px; margin: 0 auto; }
+.reader { width: 100%; max-width: 1600px; margin: 0 auto; }
 .reader-toolbar {
   position: sticky;
   top: 74px;
