@@ -657,7 +657,13 @@ test("serves the browser workspace and local visual assets", async () => {
     });
     assert.equal(css.status, 200);
     assert.match(css.headers.get("content-type") ?? "", /text\/css/);
-    assert.match(await css.text(), /Departure Mono/);
+    const cssText = await css.text();
+    assert.match(cssText, /Departure Mono/);
+    assert.match(
+      cssText,
+      /\.reader\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1600px;/,
+    );
+    assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
 
     const app = await fetch(new URL("/assets/app.js", value.server.url), {
       headers,
