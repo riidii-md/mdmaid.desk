@@ -9,13 +9,14 @@ import {
   type Attention,
   type DocumentFilters,
   type DocumentKind,
+  type DocumentSourceLink,
   type DocumentStorage,
   type StoredDocument,
   type Workspace,
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 2;
+export const SQLITE_SCHEMA_VERSION = 3;
 
 interface WorkspaceRow {
   id: string;
@@ -52,6 +53,12 @@ interface TagRow {
   name: string;
 }
 
+interface SourceLinkRow {
+  id: string;
+  href: string;
+  workspace_path: string;
+}
+
 const INITIAL_SCHEMA = `
   CREATE TABLE workspaces (
     id TEXT PRIMARY KEY,
@@ -85,6 +92,15 @@ const INITIAL_SCHEMA = `
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (workspace_id, path)
+  ) STRICT;
+
+  CREATE TABLE document_source_links (
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    href TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    PRIMARY KEY (document_id, id),
+    UNIQUE (document_id, href)
   ) STRICT;
 
   CREATE TABLE tags (
@@ -342,6 +358,22 @@ export class SqliteCatalogStorage implements CatalogStorage {
         saveTag.run(tag);
         assignTag.run(document.id, tag);
       }
+      this.#database
+        .prepare("DELETE FROM document_source_links WHERE document_id = ?")
+        .run(document.id);
+      const assignSourceLink = this.#database.prepare(
+        `INSERT INTO document_source_links (
+           document_id, id, href, workspace_path
+         ) VALUES (?, ?, ?, ?)`,
+      );
+      for (const sourceLink of document.sourceLinks) {
+        assignSourceLink.run(
+          document.id,
+          sourceLink.id,
+          sourceLink.href,
+          sourceLink.workspacePath,
+        );
+      }
       this.#database.exec(
         "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM document_tags WHERE document_tags.tag_name = tags.name)",
       );
@@ -359,7 +391,20 @@ export class SqliteCatalogStorage implements CatalogStorage {
       )
       .all(row.id)
       .map(({ name }) => name);
-    validateDocumentRow(row, tags);
+    const sourceLinks = this.#database
+      .prepare<[string], SourceLinkRow>(
+        `SELECT id, href, workspace_path
+         FROM document_source_links
+         WHERE document_id = ?
+         ORDER BY href`,
+      )
+      .all(row.id)
+      .map(({ id, href, workspace_path: workspacePath }) => ({
+        id,
+        href,
+        workspacePath,
+      }));
+    validateDocumentRow(row, tags, sourceLinks);
     return {
       id: row.id,
       workspaceId: row.workspace_id,
@@ -372,6 +417,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
       ...(row.source_path === null ? {} : { sourcePath: row.source_path }),
       attention: row.attention as Attention,
       tags,
+      sourceLinks,
       contentHash: row.content_hash,
       revision: row.revision,
       openedRevision: row.opened_revision,
@@ -408,6 +454,21 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 2");
     })();
   }
+  if (rawVersion < 3) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE IF NOT EXISTS document_source_links (
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+           id TEXT NOT NULL,
+           href TEXT NOT NULL,
+           workspace_path TEXT NOT NULL,
+           PRIMARY KEY (document_id, id),
+           UNIQUE (document_id, href)
+         ) STRICT`,
+      );
+      database.pragma("user_version = 3");
+    })();
+  }
 }
 
 function validateWorkspaceRow(
@@ -429,7 +490,11 @@ function validateWorkspaceRow(
   return { ...row, artifactRoots };
 }
 
-function validateDocumentRow(row: DocumentRow, tags: string[]): void {
+function validateDocumentRow(
+  row: DocumentRow,
+  tags: string[],
+  sourceLinks: DocumentSourceLink[],
+): void {
   if (
     !/^doc-[a-f0-9]{20}$/.test(row.id) ||
     !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.workspace_id) ||
@@ -454,10 +519,28 @@ function validateDocumentRow(row: DocumentRow, tags: string[]): void {
     !isNullableDate(row.missing_at) ||
     !isDate(row.created_at) ||
     !isDate(row.updated_at) ||
-    tags.some((tag) => !/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(tag))
+    tags.some((tag) => !/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(tag)) ||
+    sourceLinks.some(
+      ({ id, href, workspacePath }) =>
+        !/^source-[a-f0-9]{20}$/.test(id) ||
+        href === "" ||
+        href.length > 4096 ||
+        !isSafeRelativePath(workspacePath),
+    )
   ) {
     throw new Error(`invalid document row ${row.id}`);
   }
+}
+
+function isSafeRelativePath(path: string): boolean {
+  const normalized = relative(".", path);
+  return (
+    path !== "" &&
+    !isAbsolute(path) &&
+    normalized !== ".." &&
+    !normalized.startsWith(`..${sep}`) &&
+    !isAbsolute(normalized)
+  );
 }
 
 function isPositiveInteger(value: number): boolean {

@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import {
   dirname,
+  basename,
   extname,
   isAbsolute,
   join,
@@ -30,6 +31,7 @@ import {
   type Document,
   type DocumentFilters,
   type DocumentKind,
+  type DocumentSourceLink,
   type DocumentStorage,
   type StoredDocument,
   type Workspace,
@@ -37,12 +39,18 @@ import {
 import { SqliteCatalogStorage } from "./sqlite-storage.js";
 import type { CatalogStorage } from "./storage.js";
 import { syncDirectory } from "./fs-durability.js";
+import {
+  discoverDocumentSourceLinks,
+  isSafeWorkspacePath,
+  validateSourceLinkId,
+} from "./source-links.js";
 
 export type {
   Attention,
   Document,
   DocumentFilters,
   DocumentKind,
+  DocumentSourceLink,
   DocumentStorage,
   ReadingStatus,
   Workspace,
@@ -53,6 +61,7 @@ const DEFAULT_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_LEGACY_CATALOG_BYTES = 4 * 1024 * 1024;
 const MAX_TITLE_LENGTH = 512;
 const MAX_CONTEXT_LENGTH = 256;
+const MAX_LINKED_SOURCE_LINES = 50_000;
 const TAG_PATTERN = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
 const WORKSPACE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -99,6 +108,12 @@ export interface RegisterDocumentInput {
 
 export type ImportDocumentInput = RegisterDocumentInput;
 
+export interface DocumentSource {
+  content: string;
+  document: Document;
+  name: string;
+}
+
 interface InspectedDocument {
   path: string;
   contentHash: string;
@@ -109,6 +124,27 @@ export class DocumentSourceMissingError extends Error {
   constructor(readonly document: Document) {
     super("Document source is missing");
     this.name = "DocumentSourceMissingError";
+  }
+}
+
+export class DocumentSourceLinkNotFoundError extends Error {
+  constructor() {
+    super("unknown document source link");
+    this.name = "DocumentSourceLinkNotFoundError";
+  }
+}
+
+export class LinkedSourceMissingError extends Error {
+  constructor() {
+    super("linked source is missing");
+    this.name = "LinkedSourceMissingError";
+  }
+}
+
+export class LinkedSourceUnavailableError extends Error {
+  constructor(message = "linked source is unavailable") {
+    super(message);
+    this.name = "LinkedSourceUnavailableError";
   }
 }
 
@@ -228,6 +264,51 @@ export class Catalog {
     };
   }
 
+  async readDocumentSource(
+    documentId: string,
+    sourceLinkId: string,
+  ): Promise<DocumentSource> {
+    validateDocumentId(documentId);
+    validateSourceLinkId(sourceLinkId);
+    const stored = this.#storage.getDocument(documentId);
+    const sourceLink = stored?.sourceLinks.find(({ id }) => id === sourceLinkId);
+    if (!stored || !sourceLink) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
+    const workspace = this.#storage.getWorkspace(stored.workspaceId);
+    if (!workspace) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
+    const source = await inspectLinkedSource(
+      sourceLink,
+      workspace,
+      this.#maxDocumentBytes,
+    );
+    if (source.content.includes(0)) {
+      throw new LinkedSourceUnavailableError(
+        "linked source must contain UTF-8 text",
+      );
+    }
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(source.content);
+    } catch {
+      throw new LinkedSourceUnavailableError(
+        "linked source must contain UTF-8 text",
+      );
+    }
+    if (content.split("\n").length > MAX_LINKED_SOURCE_LINES) {
+      throw new LinkedSourceUnavailableError(
+        `linked source exceeds ${MAX_LINKED_SOURCE_LINES} lines`,
+      );
+    }
+    return {
+      content,
+      document: presentDocument(stored),
+      name: basename(source.path),
+    };
+  }
+
   async addWorkspace(input: AddWorkspaceInput): Promise<Workspace> {
     validateAddWorkspaceInput(input);
     const root = await canonicalDirectory(input.root, "workspace root");
@@ -288,6 +369,12 @@ export class Catalog {
       this.#maxDocumentBytes,
     );
     const id = documentId(validated.workspaceId, inspected.path);
+    const sourceLinks = await discoverDocumentSourceLinks({
+      content: inspected.content,
+      documentId: id,
+      documentPath: inspected.path,
+      workspaceRoot: workspace.root,
+    });
     const existing = this.#storage.getDocument(id);
     const now = new Date().toISOString();
     const contentChanged =
@@ -315,6 +402,7 @@ export class Catalog {
       path: inspected.path,
       attention: validated.attention,
       tags,
+      sourceLinks,
       contentHash: inspected.contentHash,
       revision: existing ? existing.revision + (contentChanged ? 1 : 0) : 1,
       openedRevision: existing?.openedRevision ?? null,
@@ -348,6 +436,12 @@ export class Catalog {
     if (existing && existing.storage !== "managed") {
       throw new Error("document id conflicts with a referenced document");
     }
+    const sourceLinks = await discoverDocumentSourceLinks({
+      content: inspected.content,
+      documentId: id,
+      documentPath: inspected.path,
+      workspaceRoot: workspace.root,
+    });
     const managedPath = await writeManagedCopy(
       this.#managedRoot,
       validated.workspaceId,
@@ -381,6 +475,7 @@ export class Catalog {
       sourcePath: inspected.path,
       attention: validated.attention,
       tags,
+      sourceLinks,
       contentHash: inspected.contentHash,
       revision: existing ? existing.revision + (contentChanged ? 1 : 0) : 1,
       openedRevision: existing?.openedRevision ?? null,
@@ -537,6 +632,12 @@ export class Catalog {
         path: inspected.path,
         attention: legacyDocument.attention,
         tags: [],
+        sourceLinks: await discoverDocumentSourceLinks({
+          content: inspected.content,
+          documentId: legacyDocument.id,
+          documentPath: inspected.path,
+          workspaceRoot: workspace.root,
+        }),
         contentHash: inspected.contentHash,
         revision: 1,
         openedRevision: null,
@@ -833,6 +934,82 @@ async function inspectManagedMarkdownDocument(
   };
 }
 
+async function inspectLinkedSource(
+  link: DocumentSourceLink,
+  workspace: Workspace,
+  maxBytes: number,
+): Promise<{ content: Buffer; path: string }> {
+  if (!isSafeWorkspacePath(link.workspacePath)) {
+    throw new LinkedSourceUnavailableError();
+  }
+  const requestedPath = resolve(workspace.root, link.workspacePath);
+  if (!isWithin(workspace.root, requestedPath)) {
+    throw new LinkedSourceUnavailableError();
+  }
+
+  let requestedInfo;
+  try {
+    requestedInfo = await lstat(requestedPath);
+  } catch (error) {
+    if (
+      isNodeError(error) &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      throw new LinkedSourceMissingError();
+    }
+    throw new LinkedSourceUnavailableError();
+  }
+  if (requestedInfo.isSymbolicLink()) {
+    throw new LinkedSourceUnavailableError(
+      "linked source must not be a symlink",
+    );
+  }
+  if (!requestedInfo.isFile()) {
+    throw new LinkedSourceUnavailableError(
+      "linked source must be a regular file",
+    );
+  }
+
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(requestedPath);
+  } catch (error) {
+    if (
+      isNodeError(error) &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      throw new LinkedSourceMissingError();
+    }
+    throw new LinkedSourceUnavailableError();
+  }
+  if (!isWithin(workspace.root, canonicalPath)) {
+    throw new LinkedSourceUnavailableError(
+      "linked source is outside workspace root",
+    );
+  }
+
+  try {
+    return {
+      content: await readBoundedRegularFile(
+        canonicalPath,
+        maxBytes,
+        "linked source",
+      ),
+      path: canonicalPath,
+    };
+  } catch (error) {
+    if (
+      isNodeError(error) &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      throw new LinkedSourceMissingError();
+    }
+    throw new LinkedSourceUnavailableError(
+      error instanceof Error ? error.message : undefined,
+    );
+  }
+}
+
 async function writeManagedCopy(
   managedRoot: string,
   workspaceId: string,
@@ -890,6 +1067,7 @@ async function ensurePrivateDirectory(path: string): Promise<void> {
 async function readBoundedRegularFile(
   path: string,
   maxBytes: number,
+  label = "document",
 ): Promise<Buffer> {
   const handle = await open(
     path,
@@ -898,10 +1076,10 @@ async function readBoundedRegularFile(
   try {
     const info = await handle.stat();
     if (!info.isFile()) {
-      throw new Error("document must be a regular file");
+      throw new Error(`${label} must be a regular file`);
     }
     if (info.size > maxBytes) {
-      throw new Error(`document exceeds ${maxBytes} bytes`);
+      throw new Error(`${label} exceeds ${maxBytes} bytes`);
     }
 
     const buffer = Buffer.alloc(maxBytes + 1);
@@ -919,7 +1097,7 @@ async function readBoundedRegularFile(
       offset += bytesRead;
     }
     if (offset > maxBytes) {
-      throw new Error(`document exceeds ${maxBytes} bytes`);
+      throw new Error(`${label} exceeds ${maxBytes} bytes`);
     }
     return buffer.subarray(0, offset);
   } finally {

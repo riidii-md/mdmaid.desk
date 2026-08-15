@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import test from "node:test";
 
 import Database from "better-sqlite3";
@@ -69,6 +69,215 @@ test("registers documents idempotently and persists the catalog", async () => {
   assert.deepEqual(restored.listDocuments(), catalog.listDocuments());
 
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("registers workspace-local source links and persists their safe mappings", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const sourceDirectory = join(workspace, "Backend", "Features");
+  const sourcePath = join(sourceDirectory, "AgentTurnV2.cs");
+  const documentPath = join(workspace, "reports", "evidence.md");
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(
+    sourcePath,
+    "public sealed class AgentTurnV2\n{\n    // evidence\n}\n",
+    "utf8",
+  );
+  await writeFile(
+    documentPath,
+    [
+      "# Evidence",
+      "",
+      "[local source][agent-turn]",
+      "[external](https://example.com/reference)",
+      "[mail](mailto:reader@example.com)",
+      "[section](#evidence)",
+      "",
+      "[agent-turn]: ../Backend/Features/AgentTurnV2.cs#L2",
+      "[unused]: ../../outside-secret.cs",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Evidence",
+    path: documentPath,
+    attention: "review",
+  });
+
+  assert.equal(document.sourceLinks.length, 1);
+  const sourceLink = document.sourceLinks[0]!;
+  assert.match(sourceLink.id, /^source-[a-f0-9]{20}$/);
+  assert.deepEqual(sourceLink, {
+    id: sourceLink.id,
+    href: "../Backend/Features/AgentTurnV2.cs#L2",
+    workspacePath: join("Backend", "Features", "AgentTurnV2.cs"),
+  });
+  assert.equal(sourceLink.workspacePath, relative(workspace, sourcePath));
+
+  const source = await catalog.readDocumentSource(document.id, sourceLink.id);
+  assert.equal(source.name, "AgentTurnV2.cs");
+  assert.equal(
+    source.content,
+    "public sealed class AgentTurnV2\n{\n    // evidence\n}\n",
+  );
+
+  await catalog.markDocumentOpened(document.id);
+  assert.deepEqual(catalog.getDocument(document.id)?.sourceLinks, [sourceLink]);
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getDocument(document.id)?.sourceLinks, [sourceLink]);
+  assert.equal(
+    (await restored.readDocumentSource(document.id, sourceLink.id)).content,
+    source.content,
+  );
+  restored.close();
+});
+
+test("replaces source-link mappings when a document is registered again", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "changing-links.md");
+  const firstSource = join(workspace, "first.ts");
+  const secondSource = join(workspace, "second.ts");
+  await writeFile(firstSource, "export const first = true;\n", "utf8");
+  await writeFile(secondSource, "export const second = true;\n", "utf8");
+  await writeFile(documentPath, "[first](../first.ts)\n", "utf8");
+
+  const first = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Changing links",
+    path: documentPath,
+    attention: "none",
+  });
+  await writeFile(documentPath, "[second](../second.ts)\n", "utf8");
+  const second = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Changing links",
+    path: documentPath,
+    attention: "none",
+  });
+
+  assert.equal(first.sourceLinks.length, 1);
+  assert.deepEqual(
+    second.sourceLinks.map(({ href }) => href),
+    ["../second.ts"],
+  );
+  await assert.rejects(
+    catalog.readDocumentSource(first.id, first.sourceLinks[0]!.id),
+    /unknown document source link/,
+  );
+  catalog.close();
+});
+
+test("rejects local source links that escape the workspace or use symlinks", async () => {
+  const { catalog, workspace } = await fixture();
+  const outside = join(workspace, "..", "outside-secret.cs");
+  const traversalDocument = join(workspace, "reports", "traversal.md");
+  await writeFile(outside, "secret\n", "utf8");
+  await writeFile(traversalDocument, "[secret](../../outside-secret.cs)\n", "utf8");
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Traversal",
+      path: traversalDocument,
+      attention: "none",
+    }),
+    /local source link is outside workspace root/,
+  );
+
+  const linkedSource = join(workspace, "linked-source.cs");
+  const symlinkDocument = join(workspace, "reports", "symlink.md");
+  await symlink(outside, linkedSource);
+  await writeFile(symlinkDocument, "[secret](../linked-source.cs)\n", "utf8");
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Symlink",
+      path: symlinkDocument,
+      attention: "none",
+    }),
+    /local source link must not be a symlink/,
+  );
+  catalog.close();
+});
+
+test("re-authorizes linked sources when they are read", async () => {
+  const { catalog, workspace } = await fixture();
+  const sourcePath = join(workspace, "source.ts");
+  const outside = join(workspace, "..", "replacement-secret.ts");
+  const documentPath = join(workspace, "reports", "source-link.md");
+  await writeFile(sourcePath, "export const safe = true;\n", "utf8");
+  await writeFile(outside, "export const secret = true;\n", "utf8");
+  await writeFile(documentPath, "[source](../source.ts)\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Source link",
+    path: documentPath,
+    attention: "none",
+  });
+  const sourceLink = document.sourceLinks[0]!;
+
+  await rm(sourcePath);
+  await symlink(outside, sourcePath);
+  await assert.rejects(
+    catalog.readDocumentSource(document.id, sourceLink.id),
+    /linked source must not be a symlink/,
+  );
+
+  await rm(sourcePath);
+  await assert.rejects(
+    catalog.readDocumentSource(document.id, sourceLink.id),
+    /linked source is missing/,
+  );
+  catalog.close();
+});
+
+test("bounds source-link expansion and rejects binary linked sources", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "bounded-links.md");
+  const sourcePath = join(workspace, "binary.dat");
+  await writeFile(sourcePath, Buffer.from([0]));
+  await writeFile(documentPath, "[binary](../binary.dat)\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Bounded links",
+    path: documentPath,
+    attention: "none",
+  });
+  await assert.rejects(
+    catalog.readDocumentSource(document.id, document.sourceLinks[0]!.id),
+    /linked source must contain UTF-8 text/,
+  );
+
+  await writeFile(
+    documentPath,
+    Array.from(
+      { length: 513 },
+      (_, index) => `[source ${index}](../binary.dat#L${index + 1})`,
+    ).join("\n"),
+    "utf8",
+  );
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Too many links",
+      path: documentPath,
+      attention: "none",
+    }),
+    /more than 512 links/,
+  );
+  catalog.close();
 });
 
 test("marks disappeared sources missing and clears the state when they return", async () => {
@@ -569,8 +778,17 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const migrated = await Catalog.open(databasePath, { legacyStatePath: false });
   migrated.close();
 
+  const versionTwo = new Database(databasePath);
+  versionTwo.exec("DROP TABLE document_source_links");
+  versionTwo.pragma("user_version = 2");
+  versionTwo.close();
+  const migratedAgain = await Catalog.open(databasePath, {
+    legacyStatePath: false,
+  });
+  migratedAgain.close();
+
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 2);
+  assert.equal(database.pragma("user_version", { simple: true }), 3);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -587,6 +805,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       .all()
       .map(({ name }) => name),
     [
+      "document_source_links",
       "document_tags",
       "documents",
       "tags",
@@ -802,5 +1021,33 @@ test("rejects malformed rows read from the SQLite catalog", async () => {
 
   const reopened = await Catalog.open(statePath, { legacyStatePath: false });
   assert.throws(() => reopened.listDocuments(), /invalid document row/);
+  reopened.close();
+});
+
+test("rejects malformed private source-link mappings read from SQLite", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "linked.md");
+  const sourcePath = join(workspace, "source.ts");
+  await writeFile(sourcePath, "export const value = true;\n", "utf8");
+  await writeFile(documentPath, "[source](../source.ts)\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "other",
+    title: "Linked",
+    path: documentPath,
+    attention: "none",
+  });
+  catalog.close();
+
+  const database = new Database(statePath);
+  database
+    .prepare(
+      "UPDATE document_source_links SET workspace_path = ? WHERE document_id = ?",
+    )
+    .run("../outside.ts", document.id);
+  database.close();
+
+  const reopened = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.throws(() => reopened.getDocument(document.id), /invalid document row/);
   reopened.close();
 });

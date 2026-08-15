@@ -22,6 +22,8 @@ The repository contains the first usable shared-service vertical slice:
 - transactional SQLite migrations and one-time JSON catalog import;
 - user-only catalog permissions;
 - authenticated loopback HTTP API and stable document/workspace routes;
+- registered workspace-local Markdown links rewritten to authenticated source
+  viewers with line anchors;
 - sanitized `mdmaid` HTML and terminal rendering;
 - responsive browser queue, project/status filters, search, reader, and actions;
 - terminal-native queue, filters, search, reader, and lifecycle actions;
@@ -145,6 +147,16 @@ to reflect later file changes. `import` is explicit: it accepts a regular,
 non-symlink Markdown file from any local path, makes a private durable snapshot,
 and queues that snapshot under the selected workspace. Removing the original
 file does not remove the imported copy.
+
+During either operation, Markdown links such as
+`../../Backend/Feature.cs#L124` are resolved relative to the original Markdown
+file. Targets under the registered workspace are stored as private,
+workspace-relative mappings and rendered as authenticated mdmaid.desk source
+viewer links. External `http`, `https`, and `mailto` links are unchanged.
+Linked source files remain live references rather than snapshots: each read
+rechecks the workspace boundary, file type, size, and symlink policy. Re-run
+`register` or `import` after upgrading an existing catalog to populate mappings
+for documents that were already queued.
 
 List documents:
 

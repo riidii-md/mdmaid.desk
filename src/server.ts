@@ -20,7 +20,10 @@ import {
   type Catalog,
   type Document,
   type DocumentFilters,
+  DocumentSourceLinkNotFoundError,
   DocumentSourceMissingError,
+  LinkedSourceMissingError,
+  LinkedSourceUnavailableError,
   type RegisterDocumentInput,
   type Workspace,
 } from "./catalog.js";
@@ -225,6 +228,26 @@ async function handleRequest(
   }
   authorizeOrigin(request, auth, baseUrl);
 
+  const sourceMatch = url.pathname.match(
+    /^\/d\/(doc-[a-f0-9]{20})\/source\/(source-[a-f0-9]{20})$/,
+  );
+  if (request.method === "GET" && sourceMatch) {
+    try {
+      const source = await catalog.readDocumentSource(
+        sourceMatch[1] ?? "",
+        sourceMatch[2] ?? "",
+      );
+      sendHtml(
+        response,
+        200,
+        sourceViewerHtml(source.document.id, source.name, source.content),
+      );
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
   if (
     request.method === "GET" &&
     (url.pathname === "/" ||
@@ -377,6 +400,7 @@ async function handleRequest(
     if (target === "web") {
       const rendered = sanitizeRenderedHtml(
         await renderMarkdown(content, { sanitize: false }),
+        document,
       );
       sendJson(response, 200, {
         data: {
@@ -657,6 +681,23 @@ function mapCatalogError(error: unknown): HttpError {
   if (error instanceof DocumentSourceMissingError) {
     return new HttpError(410, "source_missing", "Document source is missing");
   }
+  if (error instanceof DocumentSourceLinkNotFoundError) {
+    return new HttpError(404, "not_found", "Document source link not found");
+  }
+  if (error instanceof LinkedSourceMissingError) {
+    return new HttpError(
+      410,
+      "linked_source_missing",
+      "Linked source is missing",
+    );
+  }
+  if (error instanceof LinkedSourceUnavailableError) {
+    return new HttpError(
+      410,
+      "linked_source_unavailable",
+      "Linked source is unavailable",
+    );
+  }
   if (error instanceof Error && error.message.startsWith("unknown document")) {
     return new HttpError(404, "not_found", "Document not found");
   }
@@ -701,7 +742,10 @@ function publicWorkspace(
   };
 }
 
-function sanitizeRenderedHtml(content: string): string {
+function sanitizeRenderedHtml(content: string, document: Document): string {
+  const sourceLinks = new Map(
+    document.sourceLinks.map((link) => [link.href, link]),
+  );
   return sanitizeHtml(content, {
     allowedTags: [
       ...sanitizeHtml.defaults.allowedTags,
@@ -731,7 +775,82 @@ function sanitizeRenderedHtml(content: string): string {
       img: ["http", "https", "data"],
     },
     allowProtocolRelative: false,
+    transformTags: {
+      a: (tagName, attribs) => {
+        const link = attribs.href
+          ? sourceLinks.get(attribs.href)
+          : undefined;
+        return {
+          tagName,
+          attribs: link
+            ? {
+                ...attribs,
+                href: documentSourceRoute(document.id, link),
+              }
+            : attribs,
+        };
+      },
+    },
   });
+}
+
+function documentSourceRoute(
+  documentId: string,
+  link: Document["sourceLinks"][number],
+): string {
+  const line = link.href.match(/#(L[1-9][0-9]*)$/)?.[1];
+  return `/d/${documentId}/source/${link.id}${line ? `#${line}` : ""}`;
+}
+
+function sourceViewerHtml(
+  documentId: string,
+  name: string,
+  content: string,
+): string {
+  const lines = content.endsWith("\n")
+    ? content.slice(0, -1).split("\n")
+    : content.split("\n");
+  const source = lines
+    .map((line, index) => {
+      const lineNumber = index + 1;
+      return `<span id="L${lineNumber}" class="source-line"><a class="source-line-number" href="#L${lineNumber}" aria-label="Line ${lineNumber}">${lineNumber}</a><code>${escapeHtml(line) || "&#8203;"}</code></span>`;
+    })
+    .join("");
+  const escapedName = escapeHtml(name);
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapedName} · mdmaid.desk</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="preload" href="/assets/departure-mono.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body class="source-page">
+    <header class="topbar">
+      <div class="brand">
+        <strong>mdmaid.desk</strong>
+        <span>workspace source</span>
+      </div>
+      <a class="action" href="/d/${documentId}">← document</a>
+    </header>
+    <main class="source-viewer">
+      <span class="eyebrow">linked source</span>
+      <h1>${escapedName}</h1>
+      <pre class="source-code">${source}</pre>
+    </main>
+  </body>
+</html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {
