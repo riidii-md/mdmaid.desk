@@ -49,7 +49,8 @@ Approval is not part of mdmaid.desk catalog state.
 The catalog uses a versioned SQLite database behind a storage interface.
 Workspaces authorize canonical artifact roots. Documents retain stable IDs,
 content hashes, revisions, reading progress, tags, archive state, missing
-state, and a storage mode (`reference` or `managed`). Reading status is
+state, a storage mode (`reference` or `managed`), and private local-source link
+mappings. Reading status is
 derived from progress on the current revision:
 
 ```text
@@ -66,6 +67,16 @@ are copied atomically into mode-`0700` managed storage beside the catalog;
 snapshot files are mode `0600`. The original canonical path is retained only
 as private provenance. Public API responses expose the storage mode but never
 the source or managed filesystem paths.
+
+Registration and import parse Markdown links on every ingress. Relative local
+links are resolved from the original Markdown path, authorized against the
+canonical workspace root, and persisted only as workspace-relative paths.
+Rendered web links use opaque, document-scoped identifiers under
+`/d/:document/source/:source`. The authenticated source viewer repeats
+realpath, regular-file, symlink, size, and UTF-8 checks on every read. It does
+not expose absolute paths. External HTTP(S) and mail links bypass this mapping
+unchanged. Linked sources are live references; managed import snapshots only
+the Markdown document, not its linked repository files.
 
 The catalog is the durable product state. It does not depend on a running
 daemon: harnesses, editors, scripts, and users can register documents through
@@ -258,6 +269,7 @@ The first coherent release is complete when:
 3. every document has a stable URL;
 4. multiple tabs display independent documents;
 5. registration never implies approval;
-6. the daemon cannot read outside registered artifact roots;
+6. the daemon reads documents only from registered artifact roots and linked
+   sources only from their registered workspace roots;
 7. generic harnesses and mdmaid.nvim can act as clients;
 8. the same reading workflow is available in web and TUI clients.

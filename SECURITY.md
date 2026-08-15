@@ -18,6 +18,10 @@ Both the filesystem boundary and browser boundary are security-sensitive.
 - imported snapshots are written atomically into non-symlink, mode-`0700`
   managed directories and use mode `0600`;
 - public API responses expose neither original nor managed filesystem paths;
+- local Markdown links are stored as workspace-relative mappings and served
+  only through authenticated, document-scoped routes;
+- linked sources are re-authorized on every read, limited to regular UTF-8 text
+  under the canonical workspace root, and never followed through symlinks;
 - catalog writes are atomic;
 - new catalog files use mode `0600`;
 - new catalog directories use mode `0700`.

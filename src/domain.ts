@@ -41,6 +41,12 @@ export interface Workspace {
   artifactRoots: string[];
 }
 
+export interface DocumentSourceLink {
+  id: string;
+  href: string;
+  workspacePath: string;
+}
+
 export interface StoredDocument extends ReadingProgress {
   id: string;
   workspaceId: string;
@@ -53,6 +59,7 @@ export interface StoredDocument extends ReadingProgress {
   sourcePath?: string;
   attention: Attention;
   tags: string[];
+  sourceLinks: DocumentSourceLink[];
   contentHash: string;
   archivedAt: string | null;
   missingAt: string | null;

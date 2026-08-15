@@ -25,7 +25,19 @@ async function fixture(
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-server-"));
   const workspace = join(root, "workspace");
   const documentPath = join(workspace, "plan.md");
-  await mkdir(workspace);
+  const sourceDirectory = join(workspace, "Backend", "Features");
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(
+    join(sourceDirectory, "AgentTurnV2.cs"),
+    [
+      "public sealed class AgentTurnV2",
+      "{",
+      "    private const string Markup = \"<script>alert('no')</script>\";",
+      "}",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
   await writeFile(
     documentPath,
     [
@@ -34,6 +46,8 @@ async function fixture(
       "<script>globalThis.pwned = true</script>",
       "",
       "[unsafe](javascript:alert(1))",
+      "[local source](Backend/Features/AgentTurnV2.cs#L2)",
+      "[external](https://example.com/reference)",
       "\u001b]52;c;terminal-injection\u0007",
       "",
       "```mermaid",
@@ -130,6 +144,7 @@ test("lists public document metadata without leaking filesystem paths", async ()
     assert.equal(body.data[0]?.status, "unread");
     assert.equal(body.data[0]?.route, `/d/${value.document.id}`);
     assert.equal("path" in (body.data[0] ?? {}), false);
+    assert.equal("sourceLinks" in (body.data[0] ?? {}), false);
     assert.equal("contentHash" in (body.data[0] ?? {}), false);
     assert.doesNotMatch(JSON.stringify(body), new RegExp(value.root));
 
@@ -195,6 +210,12 @@ test("renders authorized Markdown for web and terminal targets", async () => {
     assert.equal(webBody.data.target, "web");
     assert.match(webBody.data.content, /Visible plan/);
     assert.match(webBody.data.content, /class="mermaid"/);
+    assert.match(
+      webBody.data.content,
+      new RegExp(`/d/${value.document.id}/source/source-[a-f0-9]{20}#L2`),
+    );
+    assert.match(webBody.data.content, /href="https:\/\/example\.com\/reference"/);
+    assert.doesNotMatch(webBody.data.content, /href="Backend\/Features/);
     assert.doesNotMatch(webBody.data.content, /<script/i);
     assert.doesNotMatch(webBody.data.content, /javascript:/i);
 
@@ -220,6 +241,50 @@ test("renders authorized Markdown for web and terminal targets", async () => {
       `/api/v1/documents/${value.document.id}/render?target=terminal&color=rainbow`,
     );
     assert.equal(invalidPreference.status, 400);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("serves authenticated local source links without exposing filesystem paths", async () => {
+  const value = await fixture();
+  const sourceLink = value.document.sourceLinks[0]!;
+  const route = `/d/${value.document.id}/source/${sourceLink.id}`;
+  try {
+    const unauthorized = await fetch(new URL(route, value.server.url));
+    assert.equal(unauthorized.status, 401);
+
+    const response = await authorized(value, `${route}#L2`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/html/);
+    const html = await response.text();
+    assert.match(html, /AgentTurnV2\.cs/);
+    assert.match(html, /id="L2"/);
+    assert.match(html, /&lt;script&gt;alert\(&#39;no&#39;\)&lt;\/script&gt;/);
+    assert.match(html, new RegExp(`/d/${value.document.id}`));
+    assert.doesNotMatch(html, new RegExp(value.root));
+
+    const unknown = await authorized(
+      value,
+      `/d/${value.document.id}/source/source-00000000000000000000`,
+    );
+    assert.equal(unknown.status, 404);
+    assert.deepEqual(await unknown.json(), {
+      error: {
+        code: "not_found",
+        message: "Document source link not found",
+      },
+    });
+
+    await rm(join(value.workspace, "Backend", "Features", "AgentTurnV2.cs"));
+    const missing = await authorized(value, route);
+    assert.equal(missing.status, 410);
+    assert.deepEqual(await missing.json(), {
+      error: {
+        code: "linked_source_missing",
+        message: "Linked source is missing",
+      },
+    });
   } finally {
     await closeFixture(value);
   }
