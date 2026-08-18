@@ -16,6 +16,28 @@ export interface WebFilters {
   search?: string | undefined;
 }
 
+export interface DocumentOutlineItem {
+  id: string;
+  level: number;
+  text: string;
+}
+
+export interface WebLoadFailure {
+  guidance: string;
+  liveStatus: string;
+  title: string;
+}
+
+interface DocumentHeading {
+  id: string;
+  tagName: string;
+  textContent: string | null;
+}
+
+interface PrintTarget {
+  print(): void;
+}
+
 interface RenderedDocument {
   document: WebDocument;
   target: "web";
@@ -123,6 +145,38 @@ export function isSourceMissing(document: WebDocument): boolean {
   return document.missingAt !== null;
 }
 
+export function documentOutline(
+  headings: readonly DocumentHeading[],
+): DocumentOutlineItem[] {
+  return headings.flatMap((heading) => {
+    const level = /^H([1-6])$/.exec(heading.tagName.toUpperCase())?.[1];
+    const text = heading.textContent?.trim() ?? "";
+    return heading.id === "" || level === undefined || text === ""
+      ? []
+      : [{ id: heading.id, level: Number(level), text }];
+  });
+}
+
+export function requestDocumentPrint(target: PrintTarget): void {
+  target.print();
+}
+
+export function webLoadFailure(code?: string): WebLoadFailure {
+  return code === "unauthorized"
+    ? {
+        guidance:
+          "Run mdmaid-desk web and open the authenticated URL it prints in this browser.",
+        liveStatus: "○ session expired",
+        title: "Browser session expired",
+      }
+    : {
+        guidance:
+          "Check that the local mdmaid.desk service is running, then reload.",
+        liveStatus: "○ unavailable",
+        title: "Could not load documents",
+      };
+}
+
 async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
@@ -146,10 +200,13 @@ async function boot(): Promise<void> {
   const queuePanel = element("queue-panel");
   const reader = element("document-reader");
   const readerContent = element("reader-content");
+  const readerToc = element("reader-toc");
+  const readerTocList = element("reader-toc-list");
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
+  const print = element("print") as HTMLButtonElement;
   const empty = element("queue-empty");
   const search = element("search") as HTMLInputElement;
   const live = element("live-status");
@@ -302,6 +359,34 @@ async function boot(): Promise<void> {
     renderQueue();
   }
 
+  function renderDocumentOutline(): void {
+    readerTocList.replaceChildren();
+    const outline = documentOutline(
+      Array.from(
+        readerContent.querySelectorAll<HTMLElement>(
+          "h1, h2, h3, h4, h5, h6",
+        ),
+      ),
+    );
+    readerToc.toggleAttribute("hidden", outline.length === 0);
+    for (const item of outline) {
+      const entry = document.createElement("li");
+      entry.className = `toc-item toc-level-${item.level}`;
+      const link = document.createElement("a");
+      link.href = `#${item.id}`;
+      link.textContent = item.text;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        document.getElementById(item.id)?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      });
+      entry.append(link);
+      readerTocList.append(entry);
+    }
+  }
+
   async function load(openSelected = true): Promise<void> {
     const [documents, workspaces] = await Promise.all([
       api<WebDocument[]>("/api/v1/documents"),
@@ -319,6 +404,8 @@ async function boot(): Promise<void> {
     state.selectedId = id;
     queuePanel.setAttribute("hidden", "");
     reader.removeAttribute("hidden");
+    readerToc.setAttribute("hidden", "");
+    readerTocList.replaceChildren();
     setMissingReader(false);
     readerContent.textContent = "Rendering…";
     const selected = state.documents.find((item) => item.id === id);
@@ -338,6 +425,7 @@ async function boot(): Promise<void> {
         `/api/v1/documents/${id}/render?target=web`,
       );
       readerContent.innerHTML = rendered.content;
+      renderDocumentOutline();
       if (window.mermaid) {
         window.mermaid.initialize({
           startOnLoad: false,
@@ -396,11 +484,18 @@ async function boot(): Promise<void> {
     readerContent.classList.toggle("source-missing", missing);
     markRead.disabled = missing;
     markUnread.disabled = missing;
+    print.disabled = missing;
+    if (missing) {
+      readerToc.setAttribute("hidden", "");
+      readerTocList.replaceChildren();
+    }
   }
 
   function closeReader(pushHistory = true): void {
     state.selectedId = undefined;
     reader.setAttribute("hidden", "");
+    readerToc.setAttribute("hidden", "");
+    readerTocList.replaceChildren();
     queuePanel.removeAttribute("hidden");
     if (pushHistory) {
       history.pushState({}, "", "/");
@@ -449,6 +544,7 @@ async function boot(): Promise<void> {
   element("reader-back").addEventListener("click", () => closeReader());
   markRead.addEventListener("click", () => void act("read"));
   markUnread.addEventListener("click", () => void act("unread"));
+  print.addEventListener("click", () => requestDocumentPrint(window));
   element("archive").addEventListener("click", () => void act("archive"));
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
@@ -524,8 +620,20 @@ function element(id: string): HTMLElement {
   return value;
 }
 
+function showBootFailure(error: unknown): void {
+  const failure = webLoadFailure(
+    error instanceof WebApiError ? error.code : undefined,
+  );
+  element("queue-error-title").textContent = failure.title;
+  element("queue-error-guidance").textContent = failure.guidance;
+  element("queue-error").removeAttribute("hidden");
+  const live = element("live-status");
+  live.textContent = failure.liveStatus;
+  live.classList.add("offline");
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
   window.addEventListener("DOMContentLoaded", () => {
-    void boot();
+    void boot().catch(showBootFailure);
   });
 }

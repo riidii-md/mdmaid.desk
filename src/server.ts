@@ -33,6 +33,7 @@ import { sanitizeTerminalText } from "./terminal-text.js";
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
 const SESSION_COOKIE = "mdmaid_desk_session";
+const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const WEB_CLIENT_PATH = fileURLToPath(new URL("./web-client.js", import.meta.url));
 const MDMAID_ENTRY = fileURLToPath(import.meta.resolve("mdmaid"));
@@ -51,6 +52,10 @@ export interface DeskServerOptions {
   port?: number;
   publicUrl?: string;
   token?: string;
+}
+
+export interface DeskServerDependencies {
+  readWebClient?: (() => Promise<Buffer>) | undefined;
 }
 
 export interface RunningDeskServer {
@@ -114,6 +119,7 @@ class EventHub {
 
 export async function startDeskServer(
   options: DeskServerOptions,
+  dependencies: DeskServerDependencies = {},
 ): Promise<RunningDeskServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 0;
@@ -132,6 +138,7 @@ export async function startDeskServer(
   if (typeof token !== "string" || token.length < 8) {
     throw new Error("server token must contain at least 8 characters");
   }
+  const webClient = await (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))();
 
   const events = new EventHub();
   const server = createServer((request, response) => {
@@ -143,6 +150,7 @@ export async function startDeskServer(
       events,
       publicOrigin,
       securePublicOrigin,
+      webClient,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
@@ -185,6 +193,7 @@ async function handleRequest(
   events: EventHub,
   publicOrigin: string | undefined,
   securePublicOrigin: boolean,
+  webClient: Buffer,
 ): Promise<void> {
   applySecurityHeaders(response, securePublicOrigin);
   const baseUrl =
@@ -216,7 +225,7 @@ async function handleRequest(
     response.setHeader("location", url.pathname);
     response.setHeader(
       "set-cookie",
-      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=86400`,
+      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`,
     );
     response.end();
     return;
@@ -264,7 +273,7 @@ async function handleRequest(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/assets/")) {
-    await serveAsset(response, url.pathname);
+    await serveAsset(response, url.pathname, webClient);
     return;
   }
 
@@ -958,17 +967,14 @@ function sendHtml(response: ServerResponse, status: number, body: string): void 
 async function serveAsset(
   response: ServerResponse,
   pathname: string,
+  webClient: Buffer,
 ): Promise<void> {
   if (pathname === "/assets/app.css") {
     sendAsset(response, "text/css; charset=utf-8", WEB_STYLES);
     return;
   }
   if (pathname === "/assets/app.js") {
-    sendAsset(
-      response,
-      "text/javascript; charset=utf-8",
-      await readFile(WEB_CLIENT_PATH),
-    );
+    sendAsset(response, "text/javascript; charset=utf-8", webClient);
     return;
   }
   if (pathname === "/assets/mermaid.min.js") {
@@ -1031,6 +1037,10 @@ function workspaceHtml(pathname: string): string {
       <aside class="sidebar">
         <h2>projects</h2>
         <nav id="project-nav" class="project-nav" data-testid="project-nav"></nav>
+        <nav id="reader-toc" class="reader-toc" aria-labelledby="reader-toc-title" data-testid="reader-toc" hidden>
+          <h2 id="reader-toc-title">contents</h2>
+          <ol id="reader-toc-list" class="toc-list"></ol>
+        </nav>
         <div class="shortcut-card">
           <div><kbd>/</kbd> search</div>
           <div><kbd>j</kbd> <kbd>k</kbd> scroll</div>
@@ -1061,6 +1071,10 @@ function workspaceHtml(pathname: string): string {
           </div>
           <div id="document-queue" class="document-queue" data-testid="document-queue"></div>
           <div id="queue-empty" class="empty" hidden>No documents match this view.</div>
+          <div id="queue-error" class="empty error-state" data-testid="queue-error" hidden>
+            <strong id="queue-error-title">Could not load documents</strong>
+            <p id="queue-error-guidance"></p>
+          </div>
         </section>
         <article id="document-reader" class="reader" data-testid="document-reader" hidden>
           <div class="reader-toolbar">
@@ -1068,6 +1082,7 @@ function workspaceHtml(pathname: string): string {
             <div class="reader-actions">
               <button id="mark-read" class="action" type="button">✓ mark read</button>
               <button id="mark-unread" class="action" type="button">○ unread</button>
+              <button id="print" class="action" type="button">print</button>
               <button id="archive" class="action" type="button">archive</button>
             </div>
           </div>

@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  documentOutline,
   filterQueue,
   isSourceMissing,
   queueCounts,
+  requestDocumentPrint,
+  webLoadFailure,
   visibleWorkspaces,
   type WebDocument,
   type WebFilters,
@@ -118,4 +121,46 @@ test("identifies documents whose registered source disappeared", () => {
     }),
     true,
   );
+});
+
+test("builds document contents from rendered heading anchors", () => {
+  assert.deepEqual(
+    documentOutline([
+      { id: "visible-plan", tagName: "H1", textContent: " Visible plan " },
+      { id: "scope", tagName: "H2", textContent: "Scope" },
+      { id: "details", tagName: "H4", textContent: "  Details  " },
+      { id: "", tagName: "H2", textContent: "No anchor" },
+      { id: "empty", tagName: "H3", textContent: "   " },
+      { id: "paragraph", tagName: "P", textContent: "Not a heading" },
+    ]),
+    [
+      { id: "visible-plan", level: 1, text: "Visible plan" },
+      { id: "scope", level: 2, text: "Scope" },
+      { id: "details", level: 4, text: "Details" },
+    ],
+  );
+});
+
+test("requests the browser print dialog for PDF export", () => {
+  let calls = 0;
+  requestDocumentPrint({
+    print(): void {
+      calls += 1;
+    },
+  });
+  assert.equal(calls, 1);
+});
+
+test("explains how to recover when the browser session expires", () => {
+  assert.deepEqual(webLoadFailure("unauthorized"), {
+    guidance:
+      "Run mdmaid-desk web and open the authenticated URL it prints in this browser.",
+    liveStatus: "○ session expired",
+    title: "Browser session expired",
+  });
+  assert.deepEqual(webLoadFailure(), {
+    guidance: "Check that the local mdmaid.desk service is running, then reload.",
+    liveStatus: "○ unavailable",
+    title: "Could not load documents",
+  });
 });

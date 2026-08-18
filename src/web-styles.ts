@@ -95,6 +95,11 @@ button { color: inherit; }
 }
 
 .sidebar {
+  position: sticky;
+  top: 62px;
+  align-self: start;
+  height: calc(100vh - 62px);
+  overflow-y: auto;
   border-right: 2px solid var(--ink);
   background: color-mix(in srgb, var(--surface) 92%, transparent);
   padding: 24px 14px;
@@ -120,6 +125,34 @@ button { color: inherit; }
 .project-button:hover { border-color: var(--line); background: var(--surface-2); }
 .project-button.active { border-color: var(--ink); background: var(--ink); color: var(--surface); }
 .count { opacity: .68; font-variant-numeric: tabular-nums; }
+
+.reader-toc {
+  margin-top: 30px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+}
+.reader-toc h2 { margin-bottom: 10px; }
+.toc-list { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.toc-item a {
+  display: block;
+  padding: 5px 6px;
+  color: var(--ink);
+  font-size: 10px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+  border-bottom: 1px dashed transparent;
+}
+.toc-item a:hover, .toc-item a:focus-visible {
+  border-bottom-color: var(--ink);
+  outline: none;
+}
+.toc-level-1 { font-weight: 700; }
+.toc-level-2 { padding-left: 8px; }
+.toc-level-3 { padding-left: 16px; opacity: .88; }
+.toc-level-4 { padding-left: 24px; opacity: .8; }
+.toc-level-5, .toc-level-6 { padding-left: 32px; opacity: .72; }
 
 .shortcut-card {
   margin-top: 30px;
@@ -200,6 +233,9 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   text-align: center;
   color: var(--muted);
 }
+.error-state { border-color: var(--accent); }
+.error-state strong { display: block; color: var(--accent); font-size: 18px; }
+.error-state p { max-width: 700px; margin: 14px auto 0; line-height: 1.7; }
 
 .reader { width: 100%; max-width: 1600px; margin: 0 auto; }
 .reader-toolbar {
@@ -230,6 +266,8 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   line-height: 1.7;
 }
 .reader-content h1, .reader-content h2, .reader-content h3 { font-family: "Departure Mono", monospace; line-height: 1.25; }
+.reader-content h1, .reader-content h2, .reader-content h3,
+.reader-content h4, .reader-content h5, .reader-content h6 { scroll-margin-top: 145px; }
 .reader-content h2 { margin-top: 2.3em; border-bottom: 1px dashed var(--line); padding-bottom: .35em; }
 .reader-content pre { overflow: auto; padding: 16px; background: var(--surface-2); border-left: 4px solid var(--accent); }
 .reader-content code { font-family: "Departure Mono", monospace; font-size: .88em; }
@@ -289,10 +327,53 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 }
 .source-line code { padding-left: 1.5ch; white-space: pre; }
 
+@media print {
+  @page { margin: 16mm; }
+  :root, :root[data-theme="dark"] {
+    color-scheme: light;
+    --bg: #fff;
+    --surface: #fff;
+    --surface-2: #f2f2f2;
+    --ink: #000;
+    --muted: #444;
+    --line: #aaa;
+    --reading: #000;
+    --shadow: none;
+  }
+  body { min-height: auto; background: #fff; color: #000; }
+  .topbar, .sidebar, .reader-toolbar, #queue-panel { display: none !important; }
+  .workspace { display: block; min-height: auto; }
+  .main { padding: 0; }
+  .reader { width: 100%; max-width: none; margin: 0; }
+  .reader-heading { margin: 0 0 18px; }
+  .reader-heading h1 { font-size: 28px; letter-spacing: -.04em; }
+  .reader-content {
+    padding: 0;
+    border: 0;
+    background: #fff;
+    box-shadow: none;
+    color: #000;
+    overflow-wrap: normal;
+  }
+  .reader-content a { color: #000; }
+  .reader-content .mermaid, .reader-content pre, .reader-content table,
+  .reader-content img, .reader-content svg {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}
+
 @media (max-width: 760px) {
   .workspace { grid-template-columns: 1fr; }
-  .sidebar { border-right: 0; border-bottom: 2px solid var(--ink); }
+  .sidebar {
+    position: static;
+    height: auto;
+    overflow-y: visible;
+    border-right: 0;
+    border-bottom: 2px solid var(--ink);
+  }
   .project-nav { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .reader-toc { max-height: 240px; overflow-y: auto; }
   .shortcut-card { display: none; }
   .queue-title-row { align-items: start; flex-direction: column; }
   .reader-toolbar { top: 68px; flex-direction: column; }
