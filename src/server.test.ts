@@ -7,6 +7,7 @@ import test from "node:test";
 import { Catalog, type Document } from "./catalog.js";
 import {
   startDeskServer,
+  type DeskServerDependencies,
   type DeskServerOptions,
   type RunningDeskServer,
 } from "./server.js";
@@ -21,6 +22,7 @@ interface ServerFixture {
 
 async function fixture(
   serverOptions: Omit<DeskServerOptions, "catalog"> = {},
+  dependencies: DeskServerDependencies = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-server-"));
   const workspace = join(root, "workspace");
@@ -84,7 +86,7 @@ async function fixture(
     port: 0,
     token: "test-token",
     ...serverOptions,
-  });
+  }, dependencies);
   return { catalog, document, root, server, workspace };
 }
 
@@ -531,6 +533,7 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(cookie, /mdmaid_desk_session=/);
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
+    assert.match(cookie, /Max-Age=31536000/);
     assert.doesNotMatch(cookie, /Secure/);
 
     const anotherBrowser = await fetch(
@@ -707,6 +710,9 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(html, /data-testid="project-nav"/);
     assert.match(html, /data-testid="document-queue"/);
     assert.match(html, /data-testid="document-reader"/);
+    assert.match(html, /data-testid="reader-toc"/);
+    assert.match(html, /data-testid="queue-error"/);
+    assert.match(html, /id="print"[^>]*>print<\/button>/);
     assert.match(html, /\/assets\/app\.css/);
     assert.match(html, /\/assets\/app\.js/);
     assert.match(html, /\/assets\/mermaid\.min\.js/);
@@ -729,13 +735,17 @@ test("serves the browser workspace and local visual assets", async () => {
       /\.reader\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1600px;/,
     );
     assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
+    assert.match(cssText, /\.reader-toc/);
+    assert.match(cssText, /@media print/);
 
     const app = await fetch(new URL("/assets/app.js", value.server.url), {
       headers,
     });
     assert.equal(app.status, 200);
     assert.match(app.headers.get("content-type") ?? "", /javascript/);
-    assert.match(await app.text(), /mdmaid\.desk web client/);
+    const appText = await app.text();
+    assert.match(appText, /mdmaid\.desk web client/);
+    assert.match(appText, /requestDocumentPrint\(window\)/);
 
     const mermaid = await fetch(
       new URL("/assets/mermaid.min.js", value.server.url),
@@ -751,6 +761,21 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.equal(font.status, 200);
     assert.equal(font.headers.get("content-type"), "font/woff2");
     assert.ok((await font.arrayBuffer()).byteLength > 1_000);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("pins the web client asset for the lifetime of a running server", async () => {
+  let clientScript = "/* client build one */";
+  const value = await fixture({}, {
+    readWebClient: async () => Buffer.from(clientScript),
+  });
+  try {
+    clientScript = "/* client build two */";
+    const response = await authorized(value, "/assets/app.js");
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "/* client build one */");
   } finally {
     await closeFixture(value);
   }
