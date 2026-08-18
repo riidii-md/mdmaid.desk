@@ -411,9 +411,11 @@ async function handleRequest(
     }
     const { content, document } = await readDocument(catalog, id);
     if (target === "web") {
+      const documentTargets = catalog.resolveDocumentSourceTargets(document.id);
       const rendered = sanitizeRenderedHtml(
         await renderMarkdown(content, { sanitize: false }),
         document,
+        documentTargets,
       );
       sendJson(response, 200, {
         data: {
@@ -767,7 +769,11 @@ function publicWorkspace(
   };
 }
 
-function sanitizeRenderedHtml(content: string, document: Document): string {
+function sanitizeRenderedHtml(
+  content: string,
+  document: Document,
+  documentTargets: ReadonlyMap<string, string>,
+): string {
   const sourceLinks = new Map(
     document.sourceLinks.map((link) => [link.href, link]),
   );
@@ -805,18 +811,29 @@ function sanitizeRenderedHtml(content: string, document: Document): string {
         const link = attribs.href
           ? sourceLinks.get(attribs.href)
           : undefined;
+        const targetDocumentId = link
+          ? documentTargets.get(link.id)
+          : undefined;
         return {
           tagName,
           attribs: link
             ? {
                 ...attribs,
-                href: documentSourceRoute(document.id, link),
+                href: targetDocumentId
+                  ? registeredDocumentRoute(targetDocumentId, link.href)
+                  : documentSourceRoute(document.id, link),
               }
             : attribs,
         };
       },
     },
   });
+}
+
+function registeredDocumentRoute(documentId: string, href: string): string {
+  const fragmentIndex = href.indexOf("#");
+  const fragment = fragmentIndex === -1 ? "" : href.slice(fragmentIndex);
+  return `/d/${documentId}${fragment}`;
 }
 
 function documentSourceRoute(

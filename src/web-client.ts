@@ -157,6 +157,17 @@ export function documentOutline(
   });
 }
 
+export function documentFragmentId(hash: string): string | undefined {
+  if (!hash.startsWith("#") || hash.length === 1) {
+    return undefined;
+  }
+  try {
+    return decodeURIComponent(hash.slice(1));
+  } catch {
+    return undefined;
+  }
+}
+
 export function requestDocumentPrint(target: PrintTarget): void {
   target.print();
 }
@@ -436,6 +447,12 @@ async function boot(): Promise<void> {
         await window.mermaid.run({
           nodes: Array.from(readerContent.querySelectorAll(".mermaid")),
         });
+      }
+      const fragmentId = documentFragmentId(location.hash);
+      if (fragmentId !== undefined) {
+        Array.from(readerContent.querySelectorAll<HTMLElement>("[id]"))
+          .find(({ id: candidate }) => candidate === fragmentId)
+          ?.scrollIntoView({ block: "start" });
       }
       const updated = await api<WebDocument>(
         `/api/v1/documents/${id}/opened`,

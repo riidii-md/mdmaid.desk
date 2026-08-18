@@ -59,6 +59,10 @@ interface SourceLinkRow {
   workspace_path: string;
 }
 
+interface DocumentIdRow {
+  id: string;
+}
+
 const INITIAL_SCHEMA = `
   CREATE TABLE workspaces (
     id TEXT PRIMARY KEY,
@@ -289,6 +293,19 @@ export class SqliteCatalogStorage implements CatalogStorage {
       .prepare<[string], DocumentRow>("SELECT * FROM documents WHERE id = ?")
       .get(id);
     return row ? this.#mapDocument(row) : undefined;
+  }
+
+  getReferenceDocumentIdByPath(
+    workspaceId: string,
+    path: string,
+  ): string | undefined {
+    return this.#database
+      .prepare<[string, string], DocumentIdRow>(
+        `SELECT id
+         FROM documents
+         WHERE workspace_id = ? AND path = ? AND storage_kind = 'reference'`,
+      )
+      .get(workspaceId, path)?.id;
   }
 
   saveDocument(document: StoredDocument): void {
