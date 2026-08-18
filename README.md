@@ -266,6 +266,7 @@ Document registration and presentation never imply workflow approval.
 ## Documentation
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
+- [Live human-agent collaboration rooms](docs/plans/live-human-agent-collaboration.md)
 - [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
