@@ -148,7 +148,11 @@ The foreground browser service uses the stable direct origin
 back to loopback, so it needs no DNS, hosts-file, proxy, or certificate setup.
 Browser origin checks use that explicit origin rather than forwarding headers.
 The daemon keeps a stable random mode-`0600` authentication token so browser
-sessions and local API authentication survive service restarts.
+sessions and local API authentication survive service restarts. Its browser
+cookie name includes a one-way token fingerprint, preventing another daemon on
+the same hostname but a different port from overwriting the session. The
+legacy unscoped cookie remains accepted during upgrades but is no longer
+issued.
 
 ## Stable Routes
 

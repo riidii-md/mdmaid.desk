@@ -20,6 +20,10 @@ node dist/cli.js web
 The command prints an authenticated URL containing a bootstrap token. Open
 that complete URL once. Mdmaid.desk exchanges it for an HTTP-only,
 same-site cookie and redirects to the clean root URL, which can be bookmarked.
+The cookie name is scoped to the daemon's persistent token. This matters because
+browsers share cookies across ports: token-scoped names let multiple local
+mdmaid.desk daemons coexist on the same `.localhost` hostname without signing
+each other out.
 
 The default backend port is stable at `43127`. To choose a different one:
 
@@ -38,7 +42,7 @@ The public origin then becomes
 - a direct HTTP public URL must use the same port as the server;
 - browser mutations authenticated by cookie must send the exact public origin;
 - forwarding headers are not trusted or used for authentication;
-- the browser cookie is marked `HttpOnly` and `SameSite=Strict`;
+- browser cookies are token-scoped and marked `HttpOnly` and `SameSite=Strict`;
 - the persistent random `auth-token` and transient `daemon.json` descriptor use
   mode `0600` in the mode-`0700` state directory;
 - bearer-authenticated local clients connect directly to the loopback address

@@ -530,7 +530,7 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.equal(bootstrap.status, 303);
     assert.equal(bootstrap.headers.get("location"), "/");
     const cookie = bootstrap.headers.get("set-cookie") ?? "";
-    assert.match(cookie, /mdmaid_desk_session=/);
+    assert.match(cookie, /mdmaid_desk_session_[a-f0-9]{24}=/);
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
     assert.match(cookie, /Max-Age=31536000/);
@@ -556,6 +556,100 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     );
     assert.equal(route.status, 200);
     assert.match(await route.text(), new RegExp(value.document.id));
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("isolates browser cookies for daemons sharing one localhost hostname", async () => {
+  const first = await fixture({ token: "first-daemon-token" });
+  const second = await fixture({ token: "second-daemon-token" });
+  try {
+    const firstBootstrap = await fetch(
+      new URL("/?token=first-daemon-token", first.server.url),
+      { redirect: "manual" },
+    );
+    const secondBootstrap = await fetch(
+      new URL("/?token=second-daemon-token", second.server.url),
+      { redirect: "manual" },
+    );
+    const firstCookie =
+      (firstBootstrap.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    const secondCookie =
+      (secondBootstrap.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    const firstCookieName = firstCookie.split("=", 1)[0];
+    const secondCookieName = secondCookie.split("=", 1)[0];
+
+    assert.equal(firstBootstrap.status, 303);
+    assert.equal(secondBootstrap.status, 303);
+    assert.match(firstCookieName ?? "", /^mdmaid_desk_session_[a-f0-9]{24}$/);
+    assert.match(secondCookieName ?? "", /^mdmaid_desk_session_[a-f0-9]{24}$/);
+    assert.notEqual(firstCookieName, secondCookieName);
+    assert.doesNotMatch(firstCookieName ?? "", /first-daemon-token/);
+
+    const crossedCookie = await fetch(
+      new URL("/api/v1/documents", first.server.url),
+      { headers: { cookie: secondCookie } },
+    );
+    assert.equal(crossedCookie.status, 401);
+
+    const browserCookies = `${firstCookie}; ${secondCookie}`;
+    const firstDocuments = await fetch(
+      new URL("/api/v1/documents", first.server.url),
+      { headers: { cookie: browserCookies } },
+    );
+    const secondDocuments = await fetch(
+      new URL("/api/v1/documents", second.server.url),
+      { headers: { cookie: browserCookies } },
+    );
+    assert.equal(firstDocuments.status, 200);
+    assert.equal(secondDocuments.status, 200);
+  } finally {
+    await closeFixture(first);
+    await closeFixture(second);
+  }
+});
+
+test("keeps a browser cookie valid when a daemon restarts with its token", async () => {
+  const value = await fixture({ token: "stable-restart-token" });
+  let server: RunningDeskServer | undefined = value.server;
+  try {
+    const bootstrap = await fetch(
+      new URL("/?token=stable-restart-token", server.url),
+      { redirect: "manual" },
+    );
+    const cookie =
+      (bootstrap.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    assert.equal(bootstrap.status, 303);
+    assert.match(cookie, /^mdmaid_desk_session_[a-f0-9]{24}=/);
+
+    await server.close();
+    server = undefined;
+    server = await startDeskServer({
+      catalog: value.catalog,
+      host: "127.0.0.1",
+      port: 0,
+      token: "stable-restart-token",
+    });
+
+    const documents = await fetch(new URL("/api/v1/documents", server.url), {
+      headers: { cookie },
+    });
+    assert.equal(documents.status, 200);
+  } finally {
+    await server?.close();
+    value.catalog.close();
+  }
+});
+
+test("accepts the legacy browser cookie during upgrade", async () => {
+  const value = await fixture();
+  try {
+    const documents = await fetch(
+      new URL("/api/v1/documents", value.server.url),
+      { headers: { cookie: "mdmaid_desk_session=test-token" } },
+    );
+    assert.equal(documents.status, 200);
   } finally {
     await closeFixture(value);
   }

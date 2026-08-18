@@ -182,8 +182,10 @@ No proxy, certificate, DNS, or `/etc/hosts` setup is required. After the first
 authenticated open, the browser redirects to the clean URL, which can be
 bookmarked. The service publishes a user-only `daemon.json` for local clients
 and keeps its persistent random authentication token in a user-only
-`auth-token` file, so browser sessions survive service restarts. Stop the
-foreground service with `Ctrl-C`.
+`auth-token` file, so browser sessions survive service restarts. Browser cookie
+names are scoped to that token, allowing independent mdmaid.desk daemons on
+different ports to remain signed in at the same time. Stop the foreground
+service with `Ctrl-C`.
 
 Use `--port` to select another loopback port. An advanced `--public-url` option
 accepts HTTP or HTTPS `.localhost` origins; a direct HTTP origin must use the

@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   createServer,
@@ -32,7 +32,8 @@ import { sanitizeTerminalText } from "./terminal-text.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
-const SESSION_COOKIE = "mdmaid_desk_session";
+const SESSION_COOKIE_PREFIX = "mdmaid_desk_session";
+const LEGACY_SESSION_COOKIE = SESSION_COOKIE_PREFIX;
 const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const WEB_CLIENT_PATH = fileURLToPath(new URL("./web-client.js", import.meta.url));
@@ -138,6 +139,7 @@ export async function startDeskServer(
   if (typeof token !== "string" || token.length < 8) {
     throw new Error("server token must contain at least 8 characters");
   }
+  const sessionCookie = browserSessionCookieName(token);
   const webClient = await (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))();
 
   const events = new EventHub();
@@ -147,6 +149,7 @@ export async function startDeskServer(
       response,
       options.catalog,
       token,
+      sessionCookie,
       events,
       publicOrigin,
       securePublicOrigin,
@@ -190,6 +193,7 @@ async function handleRequest(
   response: ServerResponse,
   catalog: Catalog,
   token: string,
+  sessionCookie: string,
   events: EventHub,
   publicOrigin: string | undefined,
   securePublicOrigin: boolean,
@@ -225,13 +229,13 @@ async function handleRequest(
     response.setHeader("location", url.pathname);
     response.setHeader(
       "set-cookie",
-      `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`,
+      `${sessionCookie}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`,
     );
     response.end();
     return;
   }
 
-  const auth = authenticate(request, token);
+  const auth = authenticate(request, token, sessionCookie);
   if (!auth) {
     throw new HttpError(401, "unauthorized", "Authentication required");
   }
@@ -537,6 +541,7 @@ export function normalizePublicUrl(value: string): string {
 function authenticate(
   request: IncomingMessage,
   expectedToken: string,
+  sessionCookie: string,
 ): AuthResult | undefined {
   const authorization = request.headers.authorization;
   if (
@@ -546,10 +551,21 @@ function authenticate(
     return { method: "bearer" };
   }
   const cookies = parseCookies(request.headers.cookie ?? "");
-  if (safeEqual(cookies.get(SESSION_COOKIE) ?? "", expectedToken)) {
+  if (
+    safeEqual(cookies.get(sessionCookie) ?? "", expectedToken) ||
+    safeEqual(cookies.get(LEGACY_SESSION_COOKIE) ?? "", expectedToken)
+  ) {
     return { method: "cookie" };
   }
   return undefined;
+}
+
+function browserSessionCookieName(token: string): string {
+  const fingerprint = createHash("sha256")
+    .update(token)
+    .digest("hex")
+    .slice(0, 24);
+  return `${SESSION_COOKIE_PREFIX}_${fingerprint}`;
 }
 
 function authorizeOrigin(
