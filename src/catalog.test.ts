@@ -137,6 +137,66 @@ test("registers workspace-local source links and persists their safe mappings", 
   restored.close();
 });
 
+test("resolves registered Markdown source links to catalog documents", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "index.md");
+  const targetPath = join(workspace, "reports", "guide.md");
+  const draftPath = join(workspace, "reports", "draft.md");
+  const snapshotPath = join(workspace, "reports", "snapshot.md");
+  await writeFile(targetPath, "# Guide\n\n## Details\n", "utf8");
+  await writeFile(draftPath, "# Draft\n", "utf8");
+  await writeFile(snapshotPath, "# Snapshot\n", "utf8");
+  await writeFile(
+    documentPath,
+    [
+      "[guide](guide.md#details)",
+      "[draft](draft.md)",
+      "[snapshot](snapshot.md)",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const target = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Guide",
+    path: targetPath,
+    attention: "none",
+  });
+  await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Snapshot",
+    path: snapshotPath,
+    attention: "none",
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Index",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const guideLink = document.sourceLinks.find(
+    ({ href }) => href === "guide.md#details",
+  );
+  const draftLink = document.sourceLinks.find(({ href }) => href === "draft.md");
+  const snapshotLink = document.sourceLinks.find(
+    ({ href }) => href === "snapshot.md",
+  );
+  assert.ok(guideLink);
+  assert.ok(draftLink);
+  assert.ok(snapshotLink);
+
+  const targets = catalog.resolveDocumentSourceTargets(document.id);
+  assert.equal(targets.get(guideLink.id), target.id);
+  assert.equal(targets.has(draftLink.id), false);
+  assert.equal(targets.has(snapshotLink.id), false);
+  catalog.close();
+});
+
 test("replaces source-link mappings when a document is registered again", async () => {
   const { catalog, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "changing-links.md");

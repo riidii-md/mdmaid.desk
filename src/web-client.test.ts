@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  documentFragmentId,
   documentOutline,
   filterQueue,
   isSourceMissing,
@@ -139,6 +140,14 @@ test("builds document contents from rendered heading anchors", () => {
       { id: "details", level: 4, text: "Details" },
     ],
   );
+});
+
+test("decodes document fragments after asynchronous rendering", () => {
+  assert.equal(documentFragmentId("#details"), "details");
+  assert.equal(documentFragmentId("#space%20heading"), "space heading");
+  assert.equal(documentFragmentId(""), undefined);
+  assert.equal(documentFragmentId("#"), undefined);
+  assert.equal(documentFragmentId("#invalid%2"), undefined);
 });
 
 test("requests the browser print dialog for PDF export", () => {

@@ -248,6 +248,82 @@ test("renders authorized Markdown for web and terminal targets", async () => {
   }
 });
 
+test("routes registered Markdown links to the document reader with source fallbacks", async () => {
+  const value = await fixture();
+  const documentPath = join(value.workspace, "plan.md");
+  const targetPath = join(value.workspace, "guide.md");
+  const draftPath = join(value.workspace, "draft.md");
+  await writeFile(targetPath, "# Guide\n\n## Details\n\nRendered target.\n", "utf8");
+  await writeFile(draftPath, "# Draft\n", "utf8");
+  const target = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Guide",
+    path: targetPath,
+    attention: "none",
+  });
+  await writeFile(
+    documentPath,
+    [
+      "# Visible plan",
+      "",
+      "[guide](guide.md#details)",
+      "[draft](draft.md)",
+      "[local source](Backend/Features/AgentTurnV2.cs#L2)",
+      "[external](https://example.com/reference)",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const document = await value.catalog.registerDocument({
+    workspaceId: "example",
+    taskId: "DESK-4",
+    producer: "codex",
+    kind: "plan",
+    title: "Visible plan",
+    path: documentPath,
+    attention: "review",
+    tags: ["architecture"],
+  });
+  const draftLink = document.sourceLinks.find(({ href }) => href === "draft.md");
+  const sourceLink = document.sourceLinks.find(
+    ({ href }) => href === "Backend/Features/AgentTurnV2.cs#L2",
+  );
+  assert.ok(draftLink);
+  assert.ok(sourceLink);
+
+  try {
+    const response = await authorized(
+      value,
+      `/api/v1/documents/${document.id}/render?target=web`,
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      data: { content: string };
+    };
+    assert.match(body.data.content, new RegExp(`href="/d/${target.id}#details"`));
+    assert.match(
+      body.data.content,
+      new RegExp(`href="/d/${document.id}/source/${draftLink.id}"`),
+    );
+    assert.match(
+      body.data.content,
+      new RegExp(`href="/d/${document.id}/source/${sourceLink.id}#L2"`),
+    );
+    assert.match(body.data.content, /href="https:\/\/example\.com\/reference"/);
+    assert.doesNotMatch(body.data.content, new RegExp(value.root));
+
+    const renderedTarget = await authorized(
+      value,
+      `/api/v1/documents/${target.id}/render?target=web`,
+    );
+    assert.equal(renderedTarget.status, 200);
+    assert.match(await renderedTarget.text(), /Rendered target/);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("serves authenticated local source links without exposing filesystem paths", async () => {
   const value = await fixture();
   const sourceLink = value.document.sourceLinks[0]!;

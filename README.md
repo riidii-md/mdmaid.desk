@@ -151,8 +151,10 @@ file does not remove the imported copy.
 During either operation, Markdown links such as
 `../../Backend/Feature.cs#L124` are resolved relative to the original Markdown
 file. Targets under the registered workspace are stored as private,
-workspace-relative mappings and rendered as authenticated mdmaid.desk source
-viewer links. External `http`, `https`, and `mailto` links are unchanged.
+workspace-relative mappings. A link to another registered reference Markdown
+document opens that document's stable mdmaid.desk reader route; other local
+targets use the authenticated source viewer. External `http`, `https`, and
+`mailto` links are unchanged.
 Linked source files remain live references rather than snapshots: each read
 rechecks the workspace boundary, file type, size, and symlink policy. Re-run
 `register` or `import` after upgrading an existing catalog to populate mappings

@@ -13,5 +13,9 @@ export interface CatalogStorage {
   saveWorkspace(workspace: Workspace): void;
   listDocuments(filters?: DocumentFilters): StoredDocument[];
   getDocument(id: string): StoredDocument | undefined;
+  getReferenceDocumentIdByPath(
+    workspaceId: string,
+    path: string,
+  ): string | undefined;
   saveDocument(document: StoredDocument): void;
 }

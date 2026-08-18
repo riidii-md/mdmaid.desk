@@ -309,6 +309,34 @@ export class Catalog {
     };
   }
 
+  resolveDocumentSourceTargets(documentId: string): Map<string, string> {
+    validateDocumentId(documentId);
+    const stored = this.#storage.getDocument(documentId);
+    if (!stored) {
+      throw new Error(`unknown document ${documentId}`);
+    }
+    const workspace = this.#storage.getWorkspace(stored.workspaceId);
+    if (!workspace) {
+      throw new Error(`unknown workspace ${stored.workspaceId}`);
+    }
+
+    const targets = new Map<string, string>();
+    for (const sourceLink of stored.sourceLinks) {
+      const targetPath = resolve(workspace.root, sourceLink.workspacePath);
+      if (!isWithin(workspace.root, targetPath)) {
+        continue;
+      }
+      const targetId = this.#storage.getReferenceDocumentIdByPath(
+        stored.workspaceId,
+        targetPath,
+      );
+      if (targetId !== undefined) {
+        targets.set(sourceLink.id, targetId);
+      }
+    }
+    return targets;
+  }
+
   async addWorkspace(input: AddWorkspaceInput): Promise<Workspace> {
     validateAddWorkspaceInput(input);
     const root = await canonicalDirectory(input.root, "workspace root");

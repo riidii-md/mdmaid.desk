@@ -115,10 +115,18 @@ export async function readDaemonDescriptor(
   if (info.size > MAX_DESCRIPTOR_BYTES) {
     throw new Error("Invalid daemon descriptor");
   }
-  const handle = await open(
-    destination,
-    constants.O_RDONLY | constants.O_NOFOLLOW,
-  );
+  let handle;
+  try {
+    handle = await open(
+      destination,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
   let raw: string;
   try {
     const opened = await handle.stat();
