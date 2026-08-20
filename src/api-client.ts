@@ -1,6 +1,9 @@
 import {
   ATTENTION_STATES,
   DOCUMENT_KINDS,
+  REVIEW_KINDS,
+  REVIEW_OUTCOMES,
+  REVIEW_STATUSES,
 } from "./domain.js";
 import type {
   DocumentAction,
@@ -8,11 +11,15 @@ import type {
   DocumentRegistration,
   HealthData,
   PublicDocument,
+  PublicReviewRequest,
   PublicWorkspace,
   RenderTarget,
   TerminalRenderPreferences,
   TerminalRender,
   WebRender,
+  ReviewRequestRegistration,
+  ReviewRequestResponse,
+  ReviewStatus,
   WorkspaceRegistration,
 } from "./api-types.js";
 
@@ -37,6 +44,7 @@ export class DeskApiError extends Error {
 export interface CatalogEvent {
   action: string;
   documentId?: string;
+  reviewRequestId?: string;
   workspaceId?: string;
 }
 
@@ -120,6 +128,67 @@ export class DeskApiClient {
     });
     if (!isPublicDocument(value)) {
       throw new Error("Daemon returned an invalid document response");
+    }
+    return value;
+  }
+
+  async listReviewRequests(
+    filters: { documentId?: string; status?: ReviewStatus } = {},
+  ): Promise<PublicReviewRequest[]> {
+    const query = new URLSearchParams();
+    if (filters.documentId !== undefined) {
+      assertDocumentId(filters.documentId);
+      query.set("document", filters.documentId);
+    }
+    if (filters.status !== undefined) {
+      if (!(REVIEW_STATUSES as readonly string[]).includes(filters.status)) {
+        throw new Error("unknown review status");
+      }
+      query.set("status", filters.status);
+    }
+    const suffix = query.size === 0 ? "" : `?${query.toString()}`;
+    const value = await this.#request(`/api/v1/review-requests${suffix}`);
+    if (!Array.isArray(value) || !value.every(isPublicReviewRequest)) {
+      throw new Error("Daemon returned an invalid review request list");
+    }
+    return value;
+  }
+
+  async getReviewRequest(id: string): Promise<PublicReviewRequest> {
+    assertReviewRequestId(id);
+    const value = await this.#request(
+      `/api/v1/review-requests/${encodeURIComponent(id)}`,
+    );
+    if (!isPublicReviewRequest(value)) {
+      throw new Error("Daemon returned an invalid review request");
+    }
+    return value;
+  }
+
+  async createReviewRequest(
+    input: ReviewRequestRegistration,
+  ): Promise<PublicReviewRequest> {
+    const value = await this.#request("/api/v1/review-requests", {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicReviewRequest(value)) {
+      throw new Error("Daemon returned an invalid review request");
+    }
+    return value;
+  }
+
+  async respondToReviewRequest(
+    id: string,
+    input: ReviewRequestResponse,
+  ): Promise<PublicReviewRequest> {
+    assertReviewRequestId(id);
+    const value = await this.#request(
+      `/api/v1/review-requests/${encodeURIComponent(id)}/respond`,
+      { method: "POST", body: input },
+    );
+    if (!isPublicReviewRequest(value)) {
+      throw new Error("Daemon returned an invalid review request");
     }
     return value;
   }
@@ -326,6 +395,34 @@ function isPublicDocument(value: unknown): value is PublicDocument {
   );
 }
 
+function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const validResponse =
+    value.response === null ||
+    (isRecord(value.response) &&
+      typeof value.response.outcome === "string" &&
+      (REVIEW_OUTCOMES as readonly string[]).includes(value.response.outcome) &&
+      typeof value.response.message === "string" &&
+      typeof value.response.createdAt === "string");
+  return (
+    typeof value.id === "string" &&
+    /^review-[a-f0-9]{20}$/.test(value.id) &&
+    typeof value.documentId === "string" &&
+    /^doc-[a-f0-9]{20}$/.test(value.documentId) &&
+    isInteger(value.documentRevision) &&
+    typeof value.kind === "string" &&
+    (REVIEW_KINDS as readonly string[]).includes(value.kind) &&
+    typeof value.requestMessage === "string" &&
+    typeof value.status === "string" &&
+    (REVIEW_STATUSES as readonly string[]).includes(value.status) &&
+    validResponse &&
+    nullableString(value.staleAt) &&
+    typeof value.createdAt === "string"
+  );
+}
+
 function isWebRender(value: unknown): value is WebRender {
   return (
     isRecord(value) &&
@@ -392,7 +489,12 @@ function dispatchEventBlock(
     (value.workspaceId !== undefined &&
       (typeof value.workspaceId !== "string" ||
         !/^[a-z0-9][a-z0-9-]{0,63}$/.test(value.workspaceId))) ||
-    (value.documentId === undefined && value.workspaceId === undefined)
+    (value.reviewRequestId !== undefined &&
+      (typeof value.reviewRequestId !== "string" ||
+        !/^review-[a-f0-9]{20}$/.test(value.reviewRequestId))) ||
+    (value.documentId === undefined &&
+      value.workspaceId === undefined &&
+      value.reviewRequestId === undefined)
   ) {
     throw new Error("Daemon returned an invalid catalog event");
   }
@@ -404,6 +506,9 @@ function dispatchEventBlock(
     ...(value.workspaceId === undefined
       ? {}
       : { workspaceId: value.workspaceId as string }),
+    ...(value.reviewRequestId === undefined
+      ? {}
+      : { reviewRequestId: value.reviewRequestId as string }),
   });
 }
 
@@ -430,5 +535,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function assertDocumentId(id: string): void {
   if (!/^doc-[a-f0-9]{20}$/.test(id)) {
     throw new Error("invalid document id");
+  }
+}
+
+function assertReviewRequestId(id: string): void {
+  if (!/^review-[a-f0-9]{20}$/.test(id)) {
+    throw new Error("invalid review request id");
   }
 }

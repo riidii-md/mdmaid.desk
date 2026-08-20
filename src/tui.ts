@@ -8,8 +8,10 @@ import { DeskApiError, type DeskApiClient } from "./api-client.js";
 import type {
   DocumentAction,
   PublicDocument,
+  PublicReviewRequest,
   PublicWorkspace,
   ReadingStatus,
+  ReviewOutcome,
 } from "./api-types.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -23,8 +25,17 @@ interface TuiReader {
   warnings: string[];
 }
 
+interface TuiReviewComposer {
+  requestId: string;
+  outcome: ReviewOutcome;
+  message: string;
+}
+
 export interface TuiState {
   documents: PublicDocument[];
+  reviewRequests: PublicReviewRequest[];
+  reviewComposer?: TuiReviewComposer | undefined;
+  actionsOnly: boolean;
   mode: TuiMode;
   reader?: TuiReader | undefined;
   search: string;
@@ -41,6 +52,12 @@ export interface TuiState {
 export type TuiEffect =
   | { type: "open"; documentId: string }
   | { type: "action"; documentId: string; action: DocumentAction }
+  | {
+      type: "review-response";
+      requestId: string;
+      outcome: ReviewOutcome;
+      message: string;
+    }
   | { type: "quit" };
 
 export interface TuiTransition {
@@ -70,10 +87,13 @@ export interface TuiMouseEvent {
 export function createTuiState(
   documents: PublicDocument[],
   workspaces: PublicWorkspace[],
+  reviewRequests: PublicReviewRequest[] = [],
 ): TuiState {
   const visibleWorkspaces = workspacesForDocuments(documents, workspaces);
   const state: TuiState = {
     documents,
+    reviewRequests,
+    actionsOnly: false,
     mode: "queue",
     search: "",
     searching: false,
@@ -97,6 +117,7 @@ export function applyTuiReader(
     ...state,
     mode: "reader",
     reader: { backend, content, document, warnings },
+    reviewComposer: undefined,
     scroll: 0,
     searching: false,
     message: undefined,
@@ -125,6 +146,7 @@ export function replaceTuiDocuments(
   state: TuiState,
   documents: PublicDocument[],
   workspaces: PublicWorkspace[] = state.workspaces,
+  reviewRequests: PublicReviewRequest[] = state.reviewRequests,
 ): TuiState {
   const selectedId = state.visibleDocuments[state.selectedIndex]?.id;
   const visibleWorkspaces = workspacesForDocuments(documents, workspaces);
@@ -136,6 +158,7 @@ export function replaceTuiDocuments(
   let next = applyFilters({
     ...state,
     documents,
+    reviewRequests,
     workspaces: visibleWorkspaces,
     workspaceFilter,
   });
@@ -150,9 +173,16 @@ export function replaceTuiDocuments(
         : clamp(next.selectedIndex, 0, Math.max(0, next.visibleDocuments.length - 1)),
   };
   if (next.reader) {
-    const updated = documents.find(({ id }) => id === next.reader?.document.id);
+    const readerDocumentId = next.reader.document.id;
+    const updated = documents.find(({ id }) => id === readerDocumentId);
     if (updated) {
       next = { ...next, reader: { ...next.reader, document: updated } };
+    }
+    if (
+      pendingReviewForDocument(reviewRequests, readerDocumentId) ===
+      undefined
+    ) {
+      next = { ...next, reviewComposer: undefined };
     }
   }
   return next;
@@ -164,6 +194,9 @@ export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   }
   if (state.searching) {
     return handleSearchKey(state, key);
+  }
+  if (state.reviewComposer) {
+    return handleReviewComposerKey(state, key);
   }
   if (key === "q") {
     return { state, effects: [{ type: "quit" }] };
@@ -244,17 +277,27 @@ export function renderTui(
     `${borders.middleLeft}${borders.horizontal.repeat(innerWidth)}${borders.middleRight}`,
   );
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
-  const footer = state.mode === "reader"
+  const footer = state.reviewComposer
     ? renderShortcutBar(
-        state.reader?.document.missingAt
-          ? [["a", "archive"], ["b", "queue"], ["q", "quit"]]
-          : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+        [["enter", "newline"], ["ctrl-d", "submit"], ["esc", "cancel"]],
         theme,
       )
+    : state.mode === "reader"
+      ? renderShortcutBar(
+          state.reader?.document.missingAt
+            ? [["a", "archive"], ["b", "queue"], ["q", "quit"]]
+            : pendingReviewForDocument(
+                  state.reviewRequests,
+                  state.reader?.document.id ?? "",
+                )
+              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["j/k", "scroll"], ["b", "queue"]]
+              : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+          theme,
+        )
     : state.searching
       ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
       : renderShortcutBar(
-          [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["s", "status"], ["p", "project"], ["/", "search"], ["q", "quit"]],
+          [["j/k", "move"], ["enter", "open"], ["r", "actions"], ["a", "archive"], ["s", "status"], ["p", "project"], ["/", "search"], ["q", "quit"]],
           theme,
         );
   const bodyHeight = safeHeight - 6;
@@ -279,9 +322,16 @@ export async function runTui(
   const color = !("NO_COLOR" in env) &&
     (io.color ?? Boolean(output.isTTY && env.TERM !== "dumb"));
   const unicode = io.unicode ?? env.TERM !== "dumb";
+  const [initialDocuments, initialWorkspaces, initialReviewRequests] =
+    await Promise.all([
+      client.listDocuments(),
+      client.listWorkspaces(),
+      client.listReviewRequests(),
+    ]);
   let state = createTuiState(
-    await client.listDocuments(),
-    await client.listWorkspaces(),
+    initialDocuments,
+    initialWorkspaces,
+    initialReviewRequests,
   );
   const wasRaw = input.isRaw;
   const eventController = new AbortController();
@@ -354,13 +404,29 @@ export async function runTui(
         );
         draw();
         await client.act(effect.documentId, "opened");
-      } else {
+      } else if (effect.type === "action") {
         await client.act(effect.documentId, effect.action);
         if (effect.action === "archive") {
           state = { ...state, mode: "queue", reader: undefined, scroll: 0 };
         }
+      } else {
+        await client.respondToReviewRequest(effect.requestId, {
+          outcome: effect.outcome,
+          message: effect.message,
+        });
+        state = { ...state, reviewComposer: undefined };
       }
-      state = replaceTuiDocuments(state, await client.listDocuments());
+      const [documents, workspaces, reviewRequests] = await Promise.all([
+        client.listDocuments(),
+        client.listWorkspaces(),
+        client.listReviewRequests(),
+      ]);
+      state = replaceTuiDocuments(
+        state,
+        documents,
+        workspaces,
+        reviewRequests,
+      );
       draw();
     } catch (error) {
       if (
@@ -369,8 +435,16 @@ export async function runTui(
         error.code === "source_missing"
       ) {
         try {
-          const documents = await client.listDocuments();
-          state = replaceTuiDocuments(state, documents);
+          const [documents, reviewRequests] = await Promise.all([
+            client.listDocuments(),
+            client.listReviewRequests(),
+          ]);
+          state = replaceTuiDocuments(
+            state,
+            documents,
+            state.workspaces,
+            reviewRequests,
+          );
           const missing = documents.find(({ id }) => id === effect.documentId);
           if (missing) {
             state = applyTuiMissingReader(state, missing);
@@ -476,11 +550,17 @@ export async function runTui(
     .subscribeCatalog(() => {
       refreshing = refreshing
         .then(async () => {
-          const [documents, workspaces] = await Promise.all([
+          const [documents, workspaces, reviewRequests] = await Promise.all([
             client.listDocuments(),
             client.listWorkspaces(),
+            client.listReviewRequests(),
           ]);
-          state = replaceTuiDocuments(state, documents, workspaces);
+          state = replaceTuiDocuments(
+            state,
+            documents,
+            workspaces,
+            reviewRequests,
+          );
           draw();
         })
         .catch((error: unknown) => {
@@ -561,6 +641,16 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
         : [],
     };
   }
+  if (key === "r") {
+    return {
+      state: applyFilters({
+        ...state,
+        actionsOnly: !state.actionsOnly,
+        selectedIndex: 0,
+      }),
+      effects: [],
+    };
+  }
   if (key === "s") {
     const filters: StatusFilter[] = ["all", "unread", "reading", "done"];
     const index = filters.indexOf(state.statusFilter);
@@ -612,6 +702,32 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       effects: [],
     };
   }
+  const pending = state.reader
+    ? pendingReviewForDocument(
+        state.reviewRequests,
+        state.reader.document.id,
+      )
+    : undefined;
+  const reviewOutcomes: Partial<Record<string, ReviewOutcome>> = {
+    y: "approved",
+    c: "changes_requested",
+    x: "rejected",
+  };
+  const reviewOutcome = reviewOutcomes[key];
+  if (pending && reviewOutcome) {
+    return {
+      state: {
+        ...state,
+        reviewComposer: {
+          requestId: pending.id,
+          outcome: reviewOutcome,
+          message: "",
+        },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
   const actions: Partial<Record<string, DocumentAction>> = {
     m: "read",
     u: "unread",
@@ -628,6 +744,78 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       effects: [
         { type: "action", action, documentId: state.reader.document.id },
       ],
+    };
+  }
+  return { state, effects: [] };
+}
+
+function handleReviewComposerKey(
+  state: TuiState,
+  key: string,
+): TuiTransition {
+  const composer = state.reviewComposer;
+  if (!composer) {
+    return { state, effects: [] };
+  }
+  if (key === "escape") {
+    return {
+      state: { ...state, reviewComposer: undefined, message: undefined },
+      effects: [],
+    };
+  }
+  if (key === "backspace") {
+    return {
+      state: {
+        ...state,
+        reviewComposer: {
+          ...composer,
+          message: Array.from(composer.message).slice(0, -1).join(""),
+        },
+      },
+      effects: [],
+    };
+  }
+  if (key === "enter") {
+    if (composer.message.length >= 16 * 1024) {
+      return { state, effects: [] };
+    }
+    return {
+      state: {
+        ...state,
+        reviewComposer: { ...composer, message: `${composer.message}\n` },
+      },
+      effects: [],
+    };
+  }
+  if (key === "ctrl-d") {
+    if (
+      composer.outcome === "changes_requested" &&
+      composer.message.trim() === ""
+    ) {
+      return {
+        state: { ...state, message: "Explain what needs to change." },
+        effects: [],
+      };
+    }
+    return {
+      state: { ...state, message: undefined },
+      effects: [
+        {
+          type: "review-response",
+          requestId: composer.requestId,
+          outcome: composer.outcome,
+          message: composer.message,
+        },
+      ],
+    };
+  }
+  if (key.length === 1 && key >= " " && composer.message.length < 16 * 1024) {
+    return {
+      state: {
+        ...state,
+        reviewComposer: { ...composer, message: composer.message + key },
+      },
+      effects: [],
     };
   }
   return { state, effects: [] };
@@ -666,6 +854,12 @@ function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
 function applyFilters(state: TuiState): TuiState {
   const terms = state.search.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const visibleDocuments = state.documents.filter((document) => {
+    if (
+      state.actionsOnly &&
+      pendingReviewForDocument(state.reviewRequests, document.id) === undefined
+    ) {
+      return false;
+    }
     if (state.statusFilter !== "all" && document.status !== state.statusFilter) {
       return false;
     }
@@ -696,6 +890,16 @@ function applyFilters(state: TuiState): TuiState {
     ),
     visibleDocuments,
   };
+}
+
+function pendingReviewForDocument(
+  reviewRequests: PublicReviewRequest[],
+  documentId: string,
+): PublicReviewRequest | undefined {
+  return reviewRequests.find(
+    (request) =>
+      request.documentId === documentId && request.status === "pending",
+  );
 }
 
 function workspacesForDocuments(
@@ -974,6 +1178,17 @@ function sidebarLines(
       ),
     );
   }
+  lines.push("", theme.accent(theme.styles.bold(" ACTIONS")), "");
+  lines.push(
+    navigationLine(
+      "Waiting for you",
+      state.reviewRequests.filter(({ status }) => status === "pending").length,
+      state.actionsOnly,
+      width,
+      theme,
+      unicode,
+    ),
+  );
   lines.push("", theme.accent(theme.styles.bold(" STATUS")), "");
   const counts: Record<StatusFilter, number> = {
     all: state.documents.length,
@@ -1083,6 +1298,10 @@ function queueMainLines(
       state.visibleDocuments[firstIndex]!,
       firstWidth,
       firstIndex === state.selectedIndex,
+      pendingReviewForDocument(
+        state.reviewRequests,
+        state.visibleDocuments[firstIndex]!.id,
+      ) !== undefined,
       theme,
       borders,
     );
@@ -1094,6 +1313,8 @@ function queueMainLines(
           secondDocument,
           secondWidth,
           firstIndex + 1 === state.selectedIndex,
+          pendingReviewForDocument(state.reviewRequests, secondDocument.id) !==
+            undefined,
           theme,
           borders,
         )
@@ -1116,6 +1337,7 @@ function renderDocumentCard(
   document: PublicDocument,
   width: number,
   selected: boolean,
+  actionRequired: boolean,
   theme: TuiTheme,
   borders: TuiBorders,
 ): string[] {
@@ -1138,6 +1360,7 @@ function renderDocumentCard(
     document.kind,
     document.storage,
     document.taskId,
+    actionRequired ? "ACTION REQUIRED" : undefined,
   ]
     .filter((value): value is string => Boolean(value))
     .map((value) => sanitizeTerminalText(value))
@@ -1188,9 +1411,43 @@ function readerLines(
   const content = sanitizeTerminalText(state.reader.content, {
     preserveSgr: theme.color,
   }).split("\n");
-  const all = warningLines.length > 0
-    ? [...warningLines, "", ...content]
-    : content;
+  const requests = state.reviewRequests.filter(
+    (request) => request.documentId === document.id,
+  );
+  const review =
+    pendingReviewForDocument(requests, document.id) ?? requests[0];
+  const reviewLines = review
+    ? [
+        theme.accent(
+          theme.styles.bold(
+            review.status === "pending" ? "ACTION REQUIRED" : "REVIEW HISTORY",
+          ),
+        ),
+        ...sanitizeTerminalText(review.requestMessage).split("\n"),
+        theme.muted(
+          review.response
+            ? `${review.status.replaceAll("_", " ")} — ${sanitizeTerminalText(review.response.message)}`
+            : "waiting for your decision",
+        ),
+        "",
+      ]
+    : [];
+  const composerLines = state.reviewComposer
+    ? [
+        theme.accent(
+          `RESPONSE · ${state.reviewComposer.outcome.replaceAll("_", " ")}`,
+        ),
+        ...sanitizeTerminalText(state.reviewComposer.message || "_").split("\n"),
+        theme.muted("enter newline · ctrl-d submit · esc cancel"),
+        "",
+      ]
+    : [];
+  const all = [
+    ...(warningLines.length > 0 ? [...warningLines, ""] : []),
+    ...content,
+    ...(reviewLines.length > 0 ? ["", ...reviewLines] : []),
+    ...composerLines,
+  ];
   const headerLength = state.message ? 4 : 3;
   const available = Math.max(1, height - headerLength);
   const maxScroll = Math.max(0, all.length - available);
@@ -1348,6 +1605,8 @@ function decodeInput(value: string): DecodedInput {
         events.push({ type: "key", key: "escape" });
       } else if (character === "\u0003") {
         events.push({ type: "key", key: "ctrl-c" });
+      } else if (character === "\u0004") {
+        events.push({ type: "key", key: "ctrl-d" });
       } else if (character === "\u007f" || character === "\b") {
         events.push({ type: "key", key: "backspace" });
       } else {

@@ -25,8 +25,14 @@ import {
   LinkedSourceMissingError,
   LinkedSourceUnavailableError,
   type RegisterDocumentInput,
+  ReviewConflictError,
+  type ReviewRequest,
   type Workspace,
 } from "./catalog.js";
+import type {
+  ReviewRequestRegistration,
+  ReviewRequestResponse,
+} from "./api-types.js";
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -388,6 +394,94 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/v1/review-requests") {
+    const documentId = url.searchParams.get("document") ?? undefined;
+    const status = url.searchParams.get("status") ?? undefined;
+    try {
+      sendJson(response, 200, {
+        data: catalog
+          .listReviewRequests({
+            ...(documentId === undefined ? {} : { documentId }),
+            ...(status === undefined
+              ? {}
+              : { status: status as ReviewRequest["status"] }),
+          })
+          .map(publicReviewRequest),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/review-requests") {
+    const body = await readJson(request);
+    if (!isReviewRequestRegistration(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid review request",
+      );
+    }
+    try {
+      const reviewRequest = await catalog.createReviewRequest(body);
+      response.setHeader(
+        "location",
+        `/api/v1/review-requests/${reviewRequest.id}`,
+      );
+      sendJson(response, 201, { data: publicReviewRequest(reviewRequest) });
+      events.publish("catalog", {
+        action: "review-created",
+        documentId: reviewRequest.documentId,
+        reviewRequestId: reviewRequest.id,
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  const reviewRequestMatch = url.pathname.match(
+    /^\/api\/v1\/review-requests\/(review-[a-f0-9]{20})$/,
+  );
+  if (request.method === "GET" && reviewRequestMatch) {
+    const reviewRequest = catalog.getReviewRequest(reviewRequestMatch[1] ?? "");
+    if (!reviewRequest) {
+      throw new HttpError(404, "not_found", "Review request not found");
+    }
+    sendJson(response, 200, { data: publicReviewRequest(reviewRequest) });
+    return;
+  }
+
+  const reviewResponseMatch = url.pathname.match(
+    /^\/api\/v1\/review-requests\/(review-[a-f0-9]{20})\/respond$/,
+  );
+  if (request.method === "POST" && reviewResponseMatch) {
+    const body = await readJson(request);
+    if (!isReviewRequestResponse(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid review response",
+      );
+    }
+    try {
+      const reviewRequest = await catalog.respondToReviewRequest(
+        reviewResponseMatch[1] ?? "",
+        body,
+      );
+      sendJson(response, 200, { data: publicReviewRequest(reviewRequest) });
+      events.publish("catalog", {
+        action: "review-responded",
+        documentId: reviewRequest.documentId,
+        reviewRequestId: reviewRequest.id,
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
   const documentMatch = url.pathname.match(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})$/,
   );
@@ -705,6 +799,9 @@ async function readDocument(
 }
 
 function mapCatalogError(error: unknown): HttpError {
+  if (error instanceof ReviewConflictError) {
+    return new HttpError(409, "review_conflict", error.message);
+  }
   if (error instanceof DocumentSourceMissingError) {
     return new HttpError(410, "source_missing", "Document source is missing");
   }
@@ -727,6 +824,12 @@ function mapCatalogError(error: unknown): HttpError {
   }
   if (error instanceof Error && error.message.startsWith("unknown document")) {
     return new HttpError(404, "not_found", "Document not found");
+  }
+  if (
+    error instanceof Error &&
+    error.message.startsWith("unknown review request")
+  ) {
+    return new HttpError(404, "not_found", "Review request not found");
   }
   if (error instanceof Error) {
     return new HttpError(422, "validation_error", error.message);
@@ -755,6 +858,10 @@ function publicDocument(document: Document): Record<string, unknown> {
     updatedAt: document.updatedAt,
     route: `/d/${document.id}`,
   };
+}
+
+function publicReviewRequest(request: ReviewRequest): Record<string, unknown> {
+  return structuredClone(request) as unknown as Record<string, unknown>;
 }
 
 function publicWorkspace(
@@ -952,6 +1059,37 @@ function isWorkspaceRegistration(value: unknown): value is AddWorkspaceInput {
   );
 }
 
+function isReviewRequestRegistration(
+  value: unknown,
+): value is ReviewRequestRegistration {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "documentId",
+      "documentRevision",
+      "kind",
+      "requestMessage",
+    ]) &&
+    typeof value.documentId === "string" &&
+    (value.documentRevision === undefined ||
+      (typeof value.documentRevision === "number" &&
+        Number.isSafeInteger(value.documentRevision))) &&
+    typeof value.kind === "string" &&
+    typeof value.requestMessage === "string"
+  );
+}
+
+function isReviewRequestResponse(
+  value: unknown,
+): value is ReviewRequestResponse {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, ["outcome", "message"]) &&
+    typeof value.outcome === "string" &&
+    typeof value.message === "string"
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -1070,6 +1208,12 @@ function workspaceHtml(pathname: string): string {
       <aside class="sidebar">
         <h2>projects</h2>
         <nav id="project-nav" class="project-nav" data-testid="project-nav"></nav>
+        <section class="actions-nav" aria-labelledby="actions-title">
+          <h2 id="actions-title">actions</h2>
+          <button id="actions-filter" class="project-button" type="button">
+            <span>waiting for you</span><span id="actions-count" class="count">0</span>
+          </button>
+        </section>
         <nav id="reader-toc" class="reader-toc" aria-labelledby="reader-toc-title" data-testid="reader-toc" hidden>
           <h2 id="reader-toc-title">contents</h2>
           <ol id="reader-toc-list" class="toc-list"></ol>
@@ -1125,6 +1269,20 @@ function workspaceHtml(pathname: string): string {
             <p id="reader-meta"></p>
           </header>
           <div id="reader-content" class="reader-content"></div>
+          <section id="review-panel" class="review-panel" aria-labelledby="review-title" hidden>
+            <span class="eyebrow">action required</span>
+            <h2 id="review-title">Human decision</h2>
+            <p id="review-request-message" class="review-message"></p>
+            <p id="review-status" class="review-status"></p>
+            <label for="review-response">Your response</label>
+            <textarea id="review-response" rows="5" maxlength="16384" placeholder="Add context for the agent…"></textarea>
+            <p id="review-error" class="review-error" role="alert"></p>
+            <div id="review-actions" class="review-actions">
+              <button id="review-approve" class="action" type="button">approve</button>
+              <button id="review-changes" class="action" type="button">request changes</button>
+              <button id="review-reject" class="action" type="button">reject</button>
+            </div>
+          </section>
         </article>
       </main>
     </div>

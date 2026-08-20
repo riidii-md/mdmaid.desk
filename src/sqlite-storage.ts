@@ -6,17 +6,23 @@ import Database from "better-sqlite3";
 import {
   isAttention,
   isDocumentKind,
+  isReviewKind,
+  isReviewOutcome,
+  isReviewStatus,
   type Attention,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type ReviewRequestFilters,
+  type ReviewResponse,
   type StoredDocument,
+  type StoredReviewRequest,
   type Workspace,
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 3;
+export const SQLITE_SCHEMA_VERSION = 4;
 
 interface WorkspaceRow {
   id: string;
@@ -63,6 +69,24 @@ interface DocumentIdRow {
   id: string;
 }
 
+interface ReviewRequestRow {
+  id: string;
+  document_id: string;
+  document_revision: number;
+  document_content_hash: string;
+  kind: string;
+  request_message: string;
+  status: string;
+  stale_at: string | null;
+  created_at: string;
+}
+
+interface ReviewResponseRow {
+  outcome: string;
+  message: string;
+  created_at: string;
+}
+
 const INITIAL_SCHEMA = `
   CREATE TABLE workspaces (
     id TEXT PRIMARY KEY,
@@ -107,6 +131,25 @@ const INITIAL_SCHEMA = `
     UNIQUE (document_id, href)
   ) STRICT;
 
+  CREATE TABLE review_requests (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+    document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+    document_content_hash TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('plan-decision')),
+    request_message TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
+    stale_at TEXT,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE review_responses (
+    review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
   CREATE TABLE tags (
     name TEXT PRIMARY KEY
   ) STRICT;
@@ -123,6 +166,12 @@ const INITIAL_SCHEMA = `
   CREATE INDEX documents_attention_idx ON documents(attention);
   CREATE INDEX documents_updated_idx ON documents(updated_at DESC);
   CREATE INDEX document_tags_tag_idx ON document_tags(tag_name);
+  CREATE UNIQUE INDEX review_requests_pending_document_idx
+    ON review_requests(document_id) WHERE status = 'pending';
+  CREATE INDEX review_requests_document_idx
+    ON review_requests(document_id, created_at DESC);
+  CREATE INDEX review_requests_status_idx
+    ON review_requests(status, created_at DESC);
 `;
 
 export class SqliteCatalogStorage implements CatalogStorage {
@@ -394,7 +443,124 @@ export class SqliteCatalogStorage implements CatalogStorage {
       this.#database.exec(
         "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM document_tags WHERE document_tags.tag_name = tags.name)",
       );
+      this.#database
+        .prepare(
+          `UPDATE review_requests
+           SET status = 'stale', stale_at = @staleAt
+           WHERE document_id = @documentId
+             AND status = 'pending'
+             AND (
+               document_revision <> @documentRevision
+               OR document_content_hash <> @documentContentHash
+               OR @missingAt IS NOT NULL
+             )`,
+        )
+        .run({
+          documentId: document.id,
+          documentRevision: document.revision,
+          documentContentHash: document.contentHash,
+          missingAt: document.missingAt,
+          staleAt: document.updatedAt,
+        });
     });
+  }
+
+  listReviewRequests(
+    filters: ReviewRequestFilters = {},
+  ): StoredReviewRequest[] {
+    const clauses: string[] = [];
+    const parameters: string[] = [];
+    if (filters.documentId !== undefined) {
+      clauses.push("document_id = ?");
+      parameters.push(filters.documentId);
+    }
+    if (filters.status !== undefined) {
+      clauses.push("status = ?");
+      parameters.push(filters.status);
+    }
+    const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
+    return this.#database
+      .prepare<string[], ReviewRequestRow>(
+        `SELECT * FROM review_requests${where} ORDER BY created_at DESC, id`,
+      )
+      .all(...parameters)
+      .map((row) => this.#mapReviewRequest(row));
+  }
+
+  getReviewRequest(id: string): StoredReviewRequest | undefined {
+    const row = this.#database
+      .prepare<[string], ReviewRequestRow>(
+        "SELECT * FROM review_requests WHERE id = ?",
+      )
+      .get(id);
+    return row ? this.#mapReviewRequest(row) : undefined;
+  }
+
+  saveReviewRequest(request: StoredReviewRequest): void {
+    if (
+      request.status !== "pending" ||
+      request.response !== null ||
+      request.staleAt !== null
+    ) {
+      throw new Error("new review request must be pending");
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO review_requests (
+           id, document_id, document_revision, document_content_hash,
+           kind, request_message, status, stale_at, created_at
+         ) VALUES (
+           @id, @documentId, @documentRevision, @documentContentHash,
+           @kind, @requestMessage, @status, @staleAt, @createdAt
+         )`,
+      )
+      .run(request);
+  }
+
+  completeReviewRequest(request: StoredReviewRequest): boolean {
+    if (request.response === null) {
+      throw new Error("completed review request requires a response");
+    }
+    const response = request.response;
+    return this.transaction(() => {
+      const result = this.#database
+        .prepare(
+          `UPDATE review_requests
+           SET status = @status
+           WHERE id = @id
+             AND status = 'pending'
+             AND document_revision = @documentRevision
+             AND document_content_hash = @documentContentHash`,
+        )
+        .run(request);
+      if (result.changes !== 1) {
+        return false;
+      }
+      this.#database
+        .prepare(
+          `INSERT INTO review_responses (
+             review_request_id, outcome, message, created_at
+           ) VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          request.id,
+          response.outcome,
+          response.message,
+          response.createdAt,
+        );
+      return true;
+    });
+  }
+
+  staleReviewRequest(id: string, staleAt: string): boolean {
+    const result = this.#database
+      .prepare(
+        `UPDATE review_requests
+         SET status = 'stale', stale_at = ?
+         WHERE id = ? AND status = 'pending'`,
+      )
+      .run(staleAt, id);
+    return result.changes === 1;
   }
 
   #mapDocument(row: DocumentRow): StoredDocument {
@@ -445,6 +611,35 @@ export class SqliteCatalogStorage implements CatalogStorage {
       updatedAt: row.updated_at,
     };
   }
+
+  #mapReviewRequest(row: ReviewRequestRow): StoredReviewRequest {
+    const responseRow = this.#database
+      .prepare<[string], ReviewResponseRow>(
+        `SELECT outcome, message, created_at
+         FROM review_responses WHERE review_request_id = ?`,
+      )
+      .get(row.id);
+    const response: ReviewResponse | null = responseRow
+      ? {
+          outcome: responseRow.outcome as ReviewResponse["outcome"],
+          message: responseRow.message,
+          createdAt: responseRow.created_at,
+        }
+      : null;
+    validateReviewRequestRow(row, response);
+    return {
+      id: row.id,
+      documentId: row.document_id,
+      documentRevision: row.document_revision,
+      documentContentHash: row.document_content_hash,
+      kind: row.kind as StoredReviewRequest["kind"],
+      requestMessage: row.request_message,
+      status: row.status as StoredReviewRequest["status"],
+      response,
+      staleAt: row.stale_at,
+      createdAt: row.created_at,
+    };
+  }
 }
 
 function migrate(database: Database.Database): void {
@@ -484,6 +679,36 @@ function migrate(database: Database.Database): void {
          ) STRICT`,
       );
       database.pragma("user_version = 3");
+    })();
+  }
+  if (rawVersion < 4) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE IF NOT EXISTS review_requests (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK (kind IN ('plan-decision')),
+           request_message TEXT NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
+           stale_at TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS review_responses (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+           message TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE UNIQUE INDEX IF NOT EXISTS review_requests_pending_document_idx
+           ON review_requests(document_id) WHERE status = 'pending';
+         CREATE INDEX IF NOT EXISTS review_requests_document_idx
+           ON review_requests(document_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS review_requests_status_idx
+           ON review_requests(status, created_at DESC);`,
+      );
+      database.pragma("user_version = 4");
     })();
   }
 }
@@ -547,6 +772,40 @@ function validateDocumentRow(
   ) {
     throw new Error(`invalid document row ${row.id}`);
   }
+}
+
+function validateReviewRequestRow(
+  row: ReviewRequestRow,
+  response: ReviewResponse | null,
+): void {
+  const terminal = row.status !== "pending" && row.status !== "stale";
+  if (
+    !/^review-[a-f0-9]{20}$/.test(row.id) ||
+    !/^doc-[a-f0-9]{20}$/.test(row.document_id) ||
+    !isPositiveInteger(row.document_revision) ||
+    !/^[a-f0-9]{64}$/.test(row.document_content_hash) ||
+    !isReviewKind(row.kind) ||
+    !isValidReviewMessage(row.request_message) ||
+    !isReviewStatus(row.status) ||
+    !isNullableDate(row.stale_at) ||
+    !isDate(row.created_at) ||
+    (row.status === "stale") !== (row.stale_at !== null) ||
+    terminal !== (response !== null) ||
+    (response !== null &&
+      (!isReviewOutcome(response.outcome) ||
+        !isValidReviewMessage(response.message) ||
+        !isDate(response.createdAt) ||
+        response.outcome !== row.status))
+  ) {
+    throw new Error(`invalid review request row ${row.id}`);
+  }
+}
+
+function isValidReviewMessage(value: string): boolean {
+  return (
+    value.length <= 16 * 1024 &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)
+  );
 }
 
 function isSafeRelativePath(path: string): boolean {

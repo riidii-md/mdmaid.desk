@@ -140,6 +140,84 @@ test("preserves typed source-missing errors for client recovery", async () => {
   }
 });
 
+test("validates review requests and receives their live events", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-reviews-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "plan.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Review plan\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Review plan",
+    path: documentPath,
+    attention: "none",
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "review-token",
+  });
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    const controller = new AbortController();
+    let ready!: () => void;
+    let received!: (value: CatalogEvent) => void;
+    const readyEvent = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const reviewEvent = new Promise<CatalogEvent>((resolve) => {
+      received = resolve;
+    });
+    const subscription = client.subscribeCatalog(received, {
+      signal: controller.signal,
+      onReady: ready,
+    });
+    await readyEvent;
+
+    const request = await client.createReviewRequest({
+      documentId: document.id,
+      documentRevision: document.revision,
+      kind: "plan-decision",
+      requestMessage: "Please decide and explain.",
+    });
+    assert.equal(request.status, "pending");
+    assert.equal(request.requestMessage, "Please decide and explain.");
+    assert.deepEqual(await reviewEvent, {
+      action: "review-created",
+      documentId: document.id,
+      reviewRequestId: request.id,
+    });
+    assert.deepEqual(await client.getReviewRequest(request.id), request);
+    assert.deepEqual(
+      (await client.listReviewRequests({ status: "pending" })).map(({ id }) => id),
+      [request.id],
+    );
+
+    const responded = await client.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "Proceed after the backup check.",
+    });
+    assert.equal(responded.status, "approved");
+    assert.equal(responded.response?.message, "Proceed after the backup check.");
+    controller.abort();
+    await subscription;
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
 test("rejects malformed or unauthorized daemon responses", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-client-auth-"));
   const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {

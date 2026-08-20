@@ -2,18 +2,22 @@
 
 import type {
   PublicDocument,
+  PublicReviewRequest,
   PublicWorkspace,
   ReadingStatus,
+  ReviewOutcome,
 } from "./api-types.js";
 
 export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
 export type WebWorkspace = PublicWorkspace;
+export type WebReviewRequest = PublicReviewRequest;
 
 export interface WebFilters {
   workspaceId?: string | undefined;
   status?: WebReadingStatus | "all" | undefined;
   search?: string | undefined;
+  actionsOnly?: boolean | undefined;
 }
 
 export interface DocumentOutlineItem {
@@ -47,6 +51,7 @@ interface RenderedDocument {
 interface WebState {
   documents: WebDocument[];
   filters: WebFilters;
+  reviewRequests: WebReviewRequest[];
   selectedId: string | undefined;
   workspaces: WebWorkspace[];
 }
@@ -70,6 +75,7 @@ declare global {
 export function filterQueue(
   documents: WebDocument[],
   filters: WebFilters,
+  reviewRequests: WebReviewRequest[] = [],
 ): WebDocument[] {
   const terms = (filters.search ?? "")
     .trim()
@@ -77,6 +83,12 @@ export function filterQueue(
     .split(/\s+/)
     .filter(Boolean);
   return documents.filter((document) => {
+    if (
+      filters.actionsOnly === true &&
+      pendingReviewForDocument(reviewRequests, document.id) === undefined
+    ) {
+      return false;
+    }
     if (
       filters.workspaceId !== undefined &&
       document.workspaceId !== filters.workspaceId
@@ -107,6 +119,25 @@ export function filterQueue(
       .toLowerCase();
     return terms.every((term) => haystack.includes(term));
   });
+}
+
+export function pendingReviewForDocument(
+  reviewRequests: WebReviewRequest[],
+  documentId: string,
+): WebReviewRequest | undefined {
+  return reviewRequests.find(
+    (request) =>
+      request.documentId === documentId && request.status === "pending",
+  );
+}
+
+export function reviewResponseError(
+  outcome: ReviewOutcome,
+  message: string,
+): string | undefined {
+  return outcome === "changes_requested" && message.trim() === ""
+    ? "Explain what needs to change."
+    : undefined;
 }
 
 export function queueCounts(
@@ -191,6 +222,7 @@ export function webLoadFailure(code?: string): WebLoadFailure {
 async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
+    reviewRequests: [],
     filters: {
       status: "all",
       workspaceId:
@@ -207,6 +239,8 @@ async function boot(): Promise<void> {
   };
 
   const projectNav = element("project-nav");
+  const actionsFilter = element("actions-filter") as HTMLButtonElement;
+  const actionsCount = element("actions-count");
   const queue = element("document-queue");
   const queuePanel = element("queue-panel");
   const reader = element("document-reader");
@@ -215,6 +249,15 @@ async function boot(): Promise<void> {
   const readerTocList = element("reader-toc-list");
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
+  const reviewPanel = element("review-panel");
+  const reviewRequestMessage = element("review-request-message");
+  const reviewStatus = element("review-status");
+  const reviewResponse = element("review-response") as HTMLTextAreaElement;
+  const reviewError = element("review-error");
+  const reviewActions = element("review-actions");
+  const reviewApprove = element("review-approve") as HTMLButtonElement;
+  const reviewChanges = element("review-changes") as HTMLButtonElement;
+  const reviewReject = element("review-reject") as HTMLButtonElement;
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
   const print = element("print") as HTMLButtonElement;
@@ -265,6 +308,11 @@ async function boot(): Promise<void> {
         ),
       );
     }
+    const pendingCount = state.reviewRequests.filter(
+      ({ status }) => status === "pending",
+    ).length;
+    actionsCount.textContent = String(pendingCount);
+    actionsFilter.classList.toggle("active", state.filters.actionsOnly === true);
   }
 
   function projectButton(
@@ -286,6 +334,7 @@ async function boot(): Promise<void> {
     button.append(label, badge);
     button.addEventListener("click", () => {
       state.filters.workspaceId = workspaceId;
+      state.filters.actionsOnly = false;
       render();
     });
     return button;
@@ -311,7 +360,11 @@ async function boot(): Promise<void> {
 
   function renderQueue(): void {
     queue.replaceChildren();
-    const documents = filterQueue(state.documents, state.filters);
+    const documents = filterQueue(
+      state.documents,
+      state.filters,
+      state.reviewRequests,
+    );
     empty.toggleAttribute("hidden", documents.length !== 0);
     for (const item of documents) {
       const card = document.createElement("button");
@@ -349,6 +402,12 @@ async function boot(): Promise<void> {
       ]
         .filter(Boolean)
         .join(" · ");
+      if (pendingReviewForDocument(state.reviewRequests, item.id)) {
+        const action = document.createElement("span");
+        action.className = "action-required";
+        action.textContent = "action required";
+        detail.append(document.createTextNode(detail.textContent ? " · " : ""), action);
+      }
       const tags = document.createElement("span");
       tags.className = "tag-row";
       for (const tag of item.tags) {
@@ -399,15 +458,19 @@ async function boot(): Promise<void> {
   }
 
   async function load(openSelected = true): Promise<void> {
-    const [documents, workspaces] = await Promise.all([
+    const [documents, workspaces, reviewRequests] = await Promise.all([
       api<WebDocument[]>("/api/v1/documents"),
       api<WebWorkspace[]>("/api/v1/workspaces"),
+      api<WebReviewRequest[]>("/api/v1/review-requests"),
     ]);
     state.documents = documents;
     state.workspaces = workspaces;
+    state.reviewRequests = reviewRequests;
     render();
     if (openSelected && state.selectedId) {
       await openDocument(state.selectedId, false);
+    } else if (state.selectedId) {
+      renderReviewPanel(state.selectedId);
     }
   }
 
@@ -431,6 +494,7 @@ async function boot(): Promise<void> {
           .filter(Boolean)
           .join(" / ")
       : "";
+    renderReviewPanel(id);
     try {
       const rendered = await api<RenderedDocument>(
         `/api/v1/documents/${id}/render?target=web`,
@@ -465,7 +529,12 @@ async function boot(): Promise<void> {
     } catch (error) {
       if (error instanceof WebApiError && error.code === "source_missing") {
         try {
-          state.documents = await api<WebDocument[]>("/api/v1/documents");
+          const [documents, reviewRequests] = await Promise.all([
+            api<WebDocument[]>("/api/v1/documents"),
+            api<WebReviewRequest[]>("/api/v1/review-requests"),
+          ]);
+          state.documents = documents;
+          state.reviewRequests = reviewRequests;
           render();
         } catch {
           // The safe missing-source state remains actionable without a refresh.
@@ -482,6 +551,84 @@ async function boot(): Promise<void> {
       }
       readerContent.textContent =
         error instanceof Error ? error.message : "Could not render document";
+    }
+  }
+
+  function renderReviewPanel(documentId: string): void {
+    const requests = state.reviewRequests.filter(
+      (request) => request.documentId === documentId,
+    );
+    const current =
+      pendingReviewForDocument(requests, documentId) ?? requests[0];
+    if (!current) {
+      reviewPanel.setAttribute("hidden", "");
+      reviewRequestMessage.textContent = "";
+      reviewStatus.textContent = "";
+      reviewResponse.value = "";
+      reviewError.textContent = "";
+      return;
+    }
+    reviewPanel.removeAttribute("hidden");
+    reviewRequestMessage.textContent = current.requestMessage;
+    reviewError.textContent = "";
+    const pending = current.status === "pending";
+    reviewResponse.toggleAttribute("hidden", !pending);
+    reviewActions.toggleAttribute("hidden", !pending);
+    if (pending) {
+      reviewStatus.textContent = "Waiting for your decision.";
+      return;
+    }
+    reviewStatus.textContent = [
+      current.status.replaceAll("_", " "),
+      current.response?.message ?? "",
+    ]
+      .filter(Boolean)
+      .join(" — ");
+  }
+
+  async function respondToReview(outcome: ReviewOutcome): Promise<void> {
+    if (!state.selectedId) {
+      return;
+    }
+    const request = pendingReviewForDocument(
+      state.reviewRequests,
+      state.selectedId,
+    );
+    if (!request) {
+      return;
+    }
+    const message = reviewResponse.value;
+    const validation = reviewResponseError(outcome, message);
+    if (validation) {
+      reviewError.textContent = validation;
+      reviewResponse.focus();
+      return;
+    }
+    reviewError.textContent = "";
+    for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+      button.disabled = true;
+    }
+    try {
+      const updated = await api<WebReviewRequest>(
+        `/api/v1/review-requests/${request.id}/respond`,
+        {
+          method: "POST",
+          body: JSON.stringify({ outcome, message }),
+        },
+      );
+      state.reviewRequests = state.reviewRequests.map((item) =>
+        item.id === updated.id ? updated : item,
+      );
+      reviewResponse.value = "";
+      render();
+      renderReviewPanel(state.selectedId);
+    } catch (error) {
+      reviewError.textContent =
+        error instanceof Error ? error.message : "Could not submit response";
+    } finally {
+      for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+        button.disabled = false;
+      }
     }
   }
 
@@ -550,6 +697,10 @@ async function boot(): Promise<void> {
     state.filters.search = search.value;
     renderQueue();
   });
+  actionsFilter.addEventListener("click", () => {
+    state.filters.actionsOnly = state.filters.actionsOnly !== true;
+    render();
+  });
   for (const button of statusButtons) {
     button.addEventListener("click", () => {
       state.filters.status =
@@ -563,6 +714,15 @@ async function boot(): Promise<void> {
   markUnread.addEventListener("click", () => void act("unread"));
   print.addEventListener("click", () => requestDocumentPrint(window));
   element("archive").addEventListener("click", () => void act("archive"));
+  reviewApprove.addEventListener("click", () =>
+    void respondToReview("approved"),
+  );
+  reviewChanges.addEventListener("click", () =>
+    void respondToReview("changes_requested"),
+  );
+  reviewReject.addEventListener("click", () =>
+    void respondToReview("rejected"),
+  );
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
   document.documentElement.dataset.theme =

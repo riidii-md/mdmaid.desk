@@ -4,8 +4,10 @@
 
 Mdmaid.desk turns durable Markdown files into a persistent local review
 surface. Producers register artifacts; humans discover and read them in a web
-or terminal workspace; external systems record any resulting decisions
-separately.
+or terminal workspace. When a producer explicitly creates a review request,
+mdmaid.desk also persists the human decision and response text for that exact
+document revision; the producer remains responsible for applying that result
+to its workflow.
 
 ## Project Boundaries
 
@@ -41,8 +43,10 @@ stateDiagram-v2
     Reviewed --> [*]
 ```
 
-Generation, registration, presentation, and approval are separate operations.
-Approval is not part of mdmaid.desk catalog state.
+Generation, registration, presentation, reading, and workflow decisions are
+separate operations. Registration and reading never imply approval. Explicit
+review requests are stored as separate coordination records rather than fields
+on the document or its reading progress.
 
 ## Current Foundation
 
@@ -67,6 +71,13 @@ are copied atomically into mode-`0700` managed storage beside the catalog;
 snapshot files are mode `0600`. The original canonical path is retained only
 as private provenance. Public API responses expose the storage mode but never
 the source or managed filesystem paths.
+
+Review requests bind the document ID, revision, and private content hash at
+creation. Only one request may be pending for a document. A content change or
+missing source makes that request stale. Responses are immutable, exactly-once
+decisions with optional text, except that requested changes require an
+explanation. Request and response text are plain text and are never interpreted
+as HTML, terminal control data, callback configuration, or executable commands.
 
 Registration and import parse Markdown links on every ingress. Relative local
 links are resolved from the original Markdown path, authorized against the
@@ -208,6 +219,25 @@ failure
 changes_requested
 ```
 
+Attention remains presentation metadata. It does not create buttons or a
+workflow gate. A producer that expects a decision creates an explicit review
+request after registration:
+
+```json
+{
+  "documentId": "doc-0123456789abcdefabcd",
+  "documentRevision": 4,
+  "kind": "plan-decision",
+  "requestMessage": "Verify the migration and rollback strategy."
+}
+```
+
+Web and TUI controls appear only while this request is pending. A producer may
+block on `mdmaid-desk review wait`; SSE is only a wake signal, while SQLite is
+the durable source of truth. A daemon restart reconnects the wait. If the
+producer process itself exits, the response remains recoverable, but
+mdmaid.desk does not relaunch that process.
+
 ## Implementation Sequence
 
 ### 1. Catalog Foundation
@@ -264,6 +294,16 @@ Status: complete.
 - mdmaid.nvim daemon mode;
 - generic shell integration.
 
+### 7. Explicit Human Review Gates
+
+- revision-bound durable review requests;
+- preserved producer request and human response text;
+- conditional web and TUI decision controls;
+- exactly-once response transitions;
+- SSE-assisted CLI wait with daemonless SQLite fallback;
+- no inference from attention or reading state;
+- no provider process launch or arbitrary callbacks.
+
 ## Initial Success Criteria
 
 The first coherent release is complete when:
@@ -276,4 +316,6 @@ The first coherent release is complete when:
 6. the daemon reads documents only from registered artifact roots and linked
    sources only from their registered workspace roots;
 7. generic harnesses and mdmaid.nvim can act as clients;
-8. the same reading workflow is available in web and TUI clients.
+8. the same reading workflow is available in web and TUI clients;
+9. explicit pending reviews expose equivalent actions in web and TUI;
+10. a waiting live producer receives the persisted decision and response text.

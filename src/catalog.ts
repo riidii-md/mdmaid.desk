@@ -26,13 +26,22 @@ import {
 import {
   isAttention,
   isDocumentKind,
+  isReviewKind,
+  isReviewOutcome,
+  isReviewStatus,
   presentDocument,
+  presentReviewRequest,
   type Attention,
   type Document,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type ReviewKind,
+  type ReviewOutcome,
+  type ReviewRequest,
+  type ReviewRequestFilters,
+  type StoredReviewRequest,
   type StoredDocument,
   type Workspace,
 } from "./domain.js";
@@ -53,6 +62,12 @@ export type {
   DocumentSourceLink,
   DocumentStorage,
   ReadingStatus,
+  ReviewKind,
+  ReviewOutcome,
+  ReviewRequest,
+  ReviewRequestFilters,
+  ReviewResponse,
+  ReviewStatus,
   Workspace,
 } from "./domain.js";
 
@@ -62,6 +77,7 @@ const MAX_LEGACY_CATALOG_BYTES = 4 * 1024 * 1024;
 const MAX_TITLE_LENGTH = 512;
 const MAX_CONTEXT_LENGTH = 256;
 const MAX_LINKED_SOURCE_LINES = 50_000;
+const MAX_REVIEW_MESSAGE_LENGTH = 16 * 1024;
 const TAG_PATTERN = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
 const WORKSPACE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -108,6 +124,18 @@ export interface RegisterDocumentInput {
 
 export type ImportDocumentInput = RegisterDocumentInput;
 
+export interface CreateReviewRequestInput {
+  documentId: string;
+  documentRevision?: number;
+  kind: ReviewKind;
+  requestMessage: string;
+}
+
+export interface RespondToReviewRequestInput {
+  outcome: ReviewOutcome;
+  message: string;
+}
+
 export interface DocumentSource {
   content: string;
   document: Document;
@@ -145,6 +173,13 @@ export class LinkedSourceUnavailableError extends Error {
   constructor(message = "linked source is unavailable") {
     super(message);
     this.name = "LinkedSourceUnavailableError";
+  }
+}
+
+export class ReviewConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewConflictError";
   }
 }
 
@@ -219,6 +254,230 @@ export class Catalog {
     return document ? presentDocument(document) : undefined;
   }
 
+  async #inspectStoredDocument(
+    document: StoredDocument,
+  ): Promise<InspectedDocument> {
+    const workspace = this.#storage.getWorkspace(document.workspaceId);
+    if (!workspace) {
+      throw new Error(`unknown workspace ${document.workspaceId}`);
+    }
+    return document.storage === "managed"
+      ? await inspectManagedMarkdownDocument(
+          document.path,
+          this.#managedRoot,
+          this.#maxDocumentBytes,
+        )
+      : await inspectMarkdownDocument(
+          document.path,
+          workspace,
+          this.#maxDocumentBytes,
+        );
+  }
+
+  listReviewRequests(
+    filters: ReviewRequestFilters = {},
+  ): ReviewRequest[] {
+    const validated = validateReviewRequestFilters(filters);
+    return this.#storage
+      .listReviewRequests(validated)
+      .map((request) => presentReviewRequest(request));
+  }
+
+  getReviewRequest(id: string): ReviewRequest | undefined {
+    validateReviewRequestId(id);
+    const request = this.#storage.getReviewRequest(id);
+    return request ? presentReviewRequest(request) : undefined;
+  }
+
+  async createReviewRequest(
+    input: CreateReviewRequestInput,
+  ): Promise<ReviewRequest> {
+    const validated = validateCreateReviewRequestInput(input);
+    const initialDocument = this.#storage.getDocument(validated.documentId);
+    if (!initialDocument) {
+      throw new Error(`unknown document ${validated.documentId}`);
+    }
+    if (initialDocument.archivedAt !== null) {
+      throw new ReviewConflictError("document is archived");
+    }
+    if (
+      validated.documentRevision !== undefined &&
+      validated.documentRevision !== initialDocument.revision
+    ) {
+      throw new ReviewConflictError("document revision changed");
+    }
+    let inspected: InspectedDocument;
+    try {
+      inspected = await this.#inspectStoredDocument(initialDocument);
+    } catch {
+      throw new ReviewConflictError(
+        "document source is unavailable; re-register before requesting review",
+      );
+    }
+    if (inspected.contentHash !== initialDocument.contentHash) {
+      throw new ReviewConflictError(
+        "document content changed; re-register before requesting review",
+      );
+    }
+    return this.#storage.transaction(() => {
+      const document = this.#storage.getDocument(validated.documentId);
+      if (!document) {
+        throw new Error(`unknown document ${validated.documentId}`);
+      }
+      if (
+        document.revision !== initialDocument.revision ||
+        document.contentHash !== inspected.contentHash ||
+        document.missingAt !== null ||
+        document.archivedAt !== null ||
+        validated.documentRevision !== undefined &&
+        validated.documentRevision !== document.revision
+      ) {
+        throw new ReviewConflictError("document revision changed");
+      }
+      const pending = this.#storage.listReviewRequests({
+        documentId: document.id,
+        status: "pending",
+      })[0];
+      if (pending) {
+        if (
+          pending.documentRevision === document.revision &&
+          pending.documentContentHash === document.contentHash &&
+          pending.kind === validated.kind &&
+          pending.requestMessage === validated.requestMessage
+        ) {
+          return presentReviewRequest(pending);
+        }
+        throw new ReviewConflictError(
+          "document already has a pending review request",
+        );
+      }
+
+      let id: string;
+      do {
+        id = `review-${randomUUID().replaceAll("-", "").slice(0, 20)}`;
+      } while (this.#storage.getReviewRequest(id));
+      const request: StoredReviewRequest = {
+        id,
+        documentId: document.id,
+        documentRevision: document.revision,
+        documentContentHash: document.contentHash,
+        kind: validated.kind,
+        requestMessage: validated.requestMessage,
+        status: "pending",
+        response: null,
+        staleAt: null,
+        createdAt: new Date().toISOString(),
+      };
+      this.#storage.saveReviewRequest(request);
+      return presentReviewRequest(request);
+    });
+  }
+
+  async respondToReviewRequest(
+    id: string,
+    input: RespondToReviewRequestInput,
+  ): Promise<ReviewRequest> {
+    validateReviewRequestId(id);
+    const validated = validateRespondToReviewRequestInput(input);
+
+    const initial = this.#storage.getReviewRequest(id);
+    if (!initial) {
+      throw new Error(`unknown review request ${id}`);
+    }
+    if (initial.response !== null) {
+      if (
+        initial.response.outcome === validated.outcome &&
+        initial.response.message === validated.message
+      ) {
+        return presentReviewRequest(initial);
+      }
+      throw new ReviewConflictError(
+        "review request already has a different response",
+      );
+    }
+    if (initial.status === "stale") {
+      throw new ReviewConflictError("review request is stale");
+    }
+    const initialDocument = this.#storage.getDocument(initial.documentId);
+    if (
+      !initialDocument ||
+      initialDocument.revision !== initial.documentRevision ||
+      initialDocument.contentHash !== initial.documentContentHash ||
+      initialDocument.missingAt !== null
+    ) {
+      this.#storage.staleReviewRequest(id, new Date().toISOString());
+      throw new ReviewConflictError("review request is stale");
+    }
+    try {
+      const inspected = await this.#inspectStoredDocument(initialDocument);
+      if (inspected.contentHash !== initial.documentContentHash) {
+        this.#storage.staleReviewRequest(id, new Date().toISOString());
+        throw new ReviewConflictError("review request is stale");
+      }
+    } catch (error) {
+      if (error instanceof ReviewConflictError) {
+        throw error;
+      }
+      this.#storage.staleReviewRequest(id, new Date().toISOString());
+      throw new ReviewConflictError("review request is stale");
+    }
+
+    return this.#storage.transaction(() => {
+      const request = this.#storage.getReviewRequest(id);
+      if (!request) {
+        throw new Error(`unknown review request ${id}`);
+      }
+      if (request.response !== null) {
+        if (
+          request.response.outcome === validated.outcome &&
+          request.response.message === validated.message
+        ) {
+          return presentReviewRequest(request);
+        }
+        throw new ReviewConflictError(
+          "review request already has a different response",
+        );
+      }
+      if (request.status === "stale") {
+        throw new ReviewConflictError("review request is stale");
+      }
+      const document = this.#storage.getDocument(request.documentId);
+      if (
+        !document ||
+        document.revision !== request.documentRevision ||
+        document.contentHash !== request.documentContentHash ||
+        document.missingAt !== null
+      ) {
+        this.#storage.staleReviewRequest(id, new Date().toISOString());
+        throw new ReviewConflictError("review request is stale");
+      }
+      const responded: StoredReviewRequest = {
+        ...request,
+        status: validated.outcome,
+        response: {
+          outcome: validated.outcome,
+          message: validated.message,
+          createdAt: new Date().toISOString(),
+        },
+      };
+      if (this.#storage.completeReviewRequest(responded)) {
+        return presentReviewRequest(responded);
+      }
+      const winner = this.#storage.getReviewRequest(id);
+      if (
+        winner?.response?.outcome === validated.outcome &&
+        winner.response.message === validated.message
+      ) {
+        return presentReviewRequest(winner);
+      }
+      throw new ReviewConflictError(
+        winner?.status === "stale"
+          ? "review request is stale"
+          : "review request already has a different response",
+      );
+    });
+  }
+
   async readDocument(
     id: string,
   ): Promise<{ content: string; document: Document }> {
@@ -227,24 +486,9 @@ export class Catalog {
     if (!stored) {
       throw new Error(`unknown document ${id}`);
     }
-    const workspace = this.#storage.getWorkspace(stored.workspaceId);
-    if (!workspace) {
-      throw new Error(`unknown workspace ${stored.workspaceId}`);
-    }
     let inspected: InspectedDocument;
     try {
-      inspected =
-        stored.storage === "managed"
-          ? await inspectManagedMarkdownDocument(
-              stored.path,
-              this.#managedRoot,
-              this.#maxDocumentBytes,
-            )
-          : await inspectMarkdownDocument(
-              stored.path,
-              workspace,
-              this.#maxDocumentBytes,
-            );
+      inspected = await this.#inspectStoredDocument(stored);
     } catch (error) {
       if (
         isNodeError(error) &&
@@ -549,10 +793,21 @@ export class Catalog {
   }
 
   async archiveDocument(id: string): Promise<Document> {
-    return this.#updateDocument(id, (document) => ({
-      ...document,
-      archivedAt: document.archivedAt ?? new Date().toISOString(),
-    }));
+    validateDocumentId(id);
+    return this.#storage.transaction(() => {
+      if (
+        this.#storage.listReviewRequests({ documentId: id, status: "pending" })
+          .length > 0
+      ) {
+        throw new ReviewConflictError(
+          "document has a pending review request",
+        );
+      }
+      return this.#updateDocument(id, (document) => ({
+        ...document,
+        archivedAt: document.archivedAt ?? new Date().toISOString(),
+      }));
+    });
   }
 
   async restoreDocument(id: string): Promise<Document> {
@@ -859,6 +1114,94 @@ function validateFilters(filters: DocumentFilters): DocumentFilters {
       ? {}
       : { tag: filters.tag.trim().toLowerCase() }),
   };
+}
+
+function validateReviewRequestFilters(
+  filters: ReviewRequestFilters,
+): ReviewRequestFilters {
+  if (
+    !isRecord(filters) ||
+    !hasOnlyKeys(filters, ["documentId", "status"]) ||
+    (filters.documentId !== undefined &&
+      (typeof filters.documentId !== "string" ||
+        !/^doc-[a-f0-9]{20}$/.test(filters.documentId))) ||
+    (filters.status !== undefined &&
+      (typeof filters.status !== "string" ||
+        !isReviewStatus(filters.status)))
+  ) {
+    throw new Error("invalid review request filters");
+  }
+  return { ...filters };
+}
+
+function validateCreateReviewRequestInput(
+  input: CreateReviewRequestInput,
+): CreateReviewRequestInput {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, [
+      "documentId",
+      "documentRevision",
+      "kind",
+      "requestMessage",
+    ]) ||
+    typeof input.documentId !== "string" ||
+    !/^doc-[a-f0-9]{20}$/.test(input.documentId) ||
+    (input.documentRevision !== undefined &&
+      (!Number.isSafeInteger(input.documentRevision) ||
+        input.documentRevision <= 0)) ||
+    typeof input.kind !== "string" ||
+    !isReviewKind(input.kind) ||
+    typeof input.requestMessage !== "string"
+  ) {
+    throw new Error("invalid review request input");
+  }
+  return {
+    documentId: input.documentId,
+    ...(input.documentRevision === undefined
+      ? {}
+      : { documentRevision: input.documentRevision }),
+    kind: input.kind,
+    requestMessage: normalizeReviewMessage(input.requestMessage),
+  };
+}
+
+function validateRespondToReviewRequestInput(
+  input: RespondToReviewRequestInput,
+): RespondToReviewRequestInput {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, ["outcome", "message"]) ||
+    typeof input.outcome !== "string" ||
+    !isReviewOutcome(input.outcome) ||
+    typeof input.message !== "string"
+  ) {
+    throw new Error("invalid review response input");
+  }
+  const message = normalizeReviewMessage(input.message);
+  if (input.outcome === "changes_requested" && message.trim() === "") {
+    throw new Error("response message is required for requested changes");
+  }
+  return { outcome: input.outcome, message };
+}
+
+function normalizeReviewMessage(value: string): string {
+  const normalized = value.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+  if (
+    normalized.length > MAX_REVIEW_MESSAGE_LENGTH ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(normalized)
+  ) {
+    throw new Error(
+      `review messages must contain at most ${MAX_REVIEW_MESSAGE_LENGTH} safe characters`,
+    );
+  }
+  return normalized;
+}
+
+function validateReviewRequestId(id: string): void {
+  if (typeof id !== "string" || !/^review-[a-f0-9]{20}$/.test(id)) {
+    throw new Error("invalid review request id");
+  }
 }
 
 function normalizeTags(tags: string[]): string[] {

@@ -28,12 +28,14 @@ The repository contains the first usable shared-service vertical slice:
 - responsive browser queue, project/status filters, search, reader, and actions;
 - terminal-native queue, filters, search, reader, and lifecycle actions;
 - Server-Sent Event refreshes for both clients;
+- explicit revision-bound human review requests with durable request/response
+  text and conditional web/TUI actions;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
 - memorable `http://mdmaid.desk.localhost:43127/` browser origin;
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
 - selectable ports with automatic available-port fallback;
-- `workspace`, `register`, `import`, `list`, `web`, `tui`, and `daemon`
+- `workspace`, `register`, `import`, `review`, `list`, `web`, `tui`, and `daemon`
   commands.
 
 Directory watching, stdin import, comments, and editing remain planned
@@ -53,12 +55,13 @@ session-scoped embedded loopback service otherwise.
 - the browser document library;
 - local CLI and API access;
 - attention metadata;
+- explicit local human-review requests and their durable responses;
 - presentation security boundaries.
 
 It does not own:
 
 - agent workflow state;
-- task approvals;
+- agent workflow execution or provider-session relaunch;
 - model or provider routing;
 - Markdown rendering internals;
 - editor-specific keymaps.
@@ -129,6 +132,40 @@ node dist/cli.js register /path/to/repository/docs/plan.md \
   --kind plan \
   --attention approval \
   --tag architecture
+```
+
+Registration remains passive even when attention is `approval`. To ask for a
+human decision and keep the current agent command waiting, declare the review
+contract explicitly:
+
+```bash
+mdmaid-desk register /path/to/repository/docs/plan.md \
+  --workspace example \
+  --producer codex \
+  --kind plan \
+  --expect plan-decision \
+  --request-message "Verify the migration and rollback strategy." \
+  --wait \
+  --json
+```
+
+The web and TUI show Approve, Request changes, and Reject only while that exact
+document revision has a pending request. The response JSON includes both the
+producer's request message and the human's response text. `changes_requested`
+requires explanatory text. Updating document content makes the old request
+stale; opening, reading, or marking the document done never approves it.
+
+Review operations are also composable:
+
+```bash
+mdmaid-desk review create doc-0123456789abcdefabcd \
+  --kind plan-decision \
+  --message "Check rollback coverage."
+mdmaid-desk review show review-0123456789abcdefabcd --json
+mdmaid-desk review wait review-0123456789abcdefabcd --json
+mdmaid-desk review respond review-0123456789abcdefabcd \
+  --outcome changes_requested \
+  --message "Add a restore verification step."
 ```
 
 Import a durable copy when the original file may disappear (for example, an
@@ -232,6 +269,9 @@ node dist/cli.js tui
 The TUI reuses the running web daemon when available, so both clients share
 catalog events and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
+Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for
+Approve, Request changes, or Reject. The response composer uses `Enter` for a
+newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
 The default state directory is:
 
@@ -258,7 +298,8 @@ flowchart LR
     S --> T[TUI workspace]
     W --> H[Human]
     T --> H
-    H -->|reading status and tags| S
+    H -->|reading state or explicit review response| S
+    S -->|durable decision and feedback| A
 ```
 
 Document registration and presentation never imply workflow approval.
@@ -266,6 +307,7 @@ Document registration and presentation never imply workflow approval.
 ## Documentation
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
+- [Human review requests](docs/REVIEW_REQUESTS.md)
 - [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

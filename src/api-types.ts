@@ -2,9 +2,20 @@ import type {
   Attention,
   DocumentKind,
   ReadingStatus,
+  ReviewKind,
+  ReviewOutcome,
+  ReviewRequest,
+  ReviewStatus,
 } from "./domain.js";
 
-export type { Attention, DocumentKind, ReadingStatus };
+export type {
+  Attention,
+  DocumentKind,
+  ReadingStatus,
+  ReviewKind,
+  ReviewOutcome,
+  ReviewStatus,
+};
 
 export interface PublicDocument {
   id: string;
@@ -53,6 +64,20 @@ export interface DocumentRegistration {
 }
 
 export type DocumentImport = DocumentRegistration;
+
+export type PublicReviewRequest = ReviewRequest;
+
+export interface ReviewRequestRegistration {
+  documentId: string;
+  documentRevision?: number;
+  kind: ReviewKind;
+  requestMessage: string;
+}
+
+export interface ReviewRequestResponse {
+  outcome: ReviewOutcome;
+  message: string;
+}
 
 export interface HealthData {
   service: "mdmaid.desk";
