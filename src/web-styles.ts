@@ -49,7 +49,7 @@ body {
   color: var(--ink);
 }
 
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { color: inherit; }
 [hidden] { display: none !important; }
 
@@ -125,6 +125,10 @@ button { color: inherit; }
 .project-button:hover { border-color: var(--line); background: var(--surface-2); }
 .project-button.active { border-color: var(--ink); background: var(--ink); color: var(--surface); }
 .count { opacity: .68; font-variant-numeric: tabular-nums; }
+.actions-nav { margin-top: 28px; }
+.actions-nav h2 { margin-bottom: 10px; }
+.actions-nav .project-button { border-color: var(--line); }
+.actions-nav .project-button.active { border-color: var(--ink); }
 
 .reader-toc {
   margin-top: 30px;
@@ -224,6 +228,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .source-missing .status-label { color: var(--muted); }
 .document-card strong { font-size: 17px; line-height: 1.35; }
 .card-detail { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.action-required { color: var(--accent); font-weight: 700; text-transform: uppercase; }
 .tag-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: auto; }
 .tag { padding: 3px 6px; background: var(--surface-2); font-size: 9px; color: var(--muted); }
 
@@ -254,6 +259,30 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .reader-heading { margin: 34px 0 20px; }
 .reader-heading h1 { margin: 0 0 10px; font-size: clamp(25px, 5vw, 48px); line-height: 1.12; letter-spacing: -.07em; }
 .reader-heading p { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+
+.review-panel {
+  margin: 0 0 24px;
+  padding: 20px;
+  border: 2px solid var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 4px 4px 0 var(--ink);
+}
+.review-panel h2 { margin: 8px 0 14px; font-size: 22px; }
+.review-panel label { display: block; margin: 18px 0 7px; font-size: 10px; text-transform: uppercase; }
+.review-message, .review-status { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.review-status { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.review-panel textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 12px;
+  line-height: 1.5;
+}
+.review-panel textarea:focus { outline: 2px solid var(--reading); outline-offset: 2px; }
+.review-error { min-height: 1.4em; margin: 8px 0; color: var(--accent); font-size: 11px; }
+.review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .reader-content {
   overflow-wrap: anywhere;
@@ -341,7 +370,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
     --shadow: none;
   }
   body { min-height: auto; background: #fff; color: #000; }
-  .topbar, .sidebar, .reader-toolbar, #queue-panel { display: none !important; }
+  .topbar, .sidebar, .reader-toolbar, #queue-panel, .review-panel { display: none !important; }
   .workspace { display: block; min-height: auto; }
   .main { padding: 0; }
   .reader { width: 100%; max-width: none; margin: 0; }

@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { DeskApiClient } from "./api-client.js";
+import { Catalog } from "./catalog.js";
 import { isEntrypoint, run } from "./cli.js";
 import {
   daemonDescriptorPath,
@@ -95,6 +96,266 @@ test("adds a workspace, registers a document, and lists it", async () => {
   assert.match(stdout.text(), /registered doc-/);
   assert.match(stdout.text(), /PROJECT-123/);
   assert.equal(stderr.text(), "");
+});
+
+test("publishes an explicit review gate and returns its response as JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-review-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "plan.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Plan\n", "utf8");
+  const stderr = output();
+  assert.equal(
+    await run(
+      ["workspace", "add", workspace, "--id", "example"],
+      output(),
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+
+  const publishedOutput = output();
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "plan",
+        "--expect",
+        "plan-decision",
+        "--request-message",
+        "Verify rollback before approval.",
+        "--json",
+      ],
+      publishedOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  const published = JSON.parse(publishedOutput.text()) as {
+    document: { id: string; revision: number };
+    reviewRequest: { id: string; requestMessage: string; status: string };
+    schemaVersion: number;
+  };
+  assert.equal(published.schemaVersion, 1);
+  assert.equal(published.reviewRequest.status, "pending");
+  assert.equal(
+    published.reviewRequest.requestMessage,
+    "Verify rollback before approval.",
+  );
+
+  const responseOutput = output();
+  assert.equal(
+    await run(
+      [
+        "review",
+        "respond",
+        published.reviewRequest.id,
+        "--outcome",
+        "changes_requested",
+        "--message",
+        "Add a restore verification step.",
+        "--json",
+      ],
+      responseOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  assert.equal(
+    JSON.parse(responseOutput.text()).reviewRequest.response.message,
+    "Add a restore verification step.",
+  );
+
+  const waitOutput = output();
+  assert.equal(
+    await run(
+      ["review", "wait", published.reviewRequest.id, "--json"],
+      waitOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  const waited = JSON.parse(waitOutput.text());
+  assert.equal(waited.reviewRequest.status, "changes_requested");
+  assert.equal(
+    waited.reviewRequest.requestMessage,
+    "Verify rollback before approval.",
+  );
+
+  const createdOutput = output();
+  assert.equal(
+    await run(
+      [
+        "review",
+        "create",
+        published.document.id,
+        "--kind",
+        "plan-decision",
+        "--message",
+        "Verify the follow-up plan.",
+        "--json",
+      ],
+      createdOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  const created = JSON.parse(createdOutput.text());
+  assert.equal(created.reviewRequest.status, "pending");
+  assert.equal(
+    created.reviewRequest.requestMessage,
+    "Verify the follow-up plan.",
+  );
+
+  const shownOutput = output();
+  assert.equal(
+    await run(
+      ["review", "show", created.reviewRequest.id, "--json"],
+      shownOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  assert.deepEqual(
+    JSON.parse(shownOutput.text()).reviewRequest,
+    created.reviewRequest,
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("waits on daemon events and returns the durable review decision", async () => {
+  const pending = {
+    id: "review-0123456789abcdefabcd",
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "plan-decision" as const,
+    requestMessage: "Check the rollout.",
+    status: "pending" as const,
+    response: null,
+    staleAt: null,
+    createdAt: "2026-08-19T09:00:00.000Z",
+  };
+  const approved = {
+    ...pending,
+    status: "approved" as const,
+    response: {
+      outcome: "approved" as const,
+      message: "Proceed after the canary check.",
+      createdAt: "2026-08-19T09:05:00.000Z",
+    },
+  };
+  let current = pending as typeof pending | typeof approved;
+  const client = {
+    getReviewRequest: async () => current,
+    subscribeCatalog: async (
+      onEvent: (event: { action: string; reviewRequestId: string }) => void,
+      options: { signal?: AbortSignal; onReady?: () => void },
+    ) => {
+      options.onReady?.();
+      await new Promise<void>((resolvePromise) => {
+        const timer = setTimeout(() => {
+          current = approved;
+          onEvent({
+            action: "review-responded",
+            reviewRequestId: pending.id,
+          });
+        }, 1);
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolvePromise();
+          },
+          { once: true },
+        );
+      });
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      ["review", "wait", pending.id, "--json"],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        connectDaemon: async () => client,
+      },
+    ),
+    0,
+  );
+  const result = JSON.parse(stdout.text());
+  assert.equal(result.reviewRequest.status, "approved");
+  assert.equal(
+    result.reviewRequest.response.message,
+    "Proceed after the canary check.",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("keeps attention-only documents passive and validates review flags", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-passive-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "plan.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Plan\n", "utf8");
+  await run(
+    ["workspace", "add", workspace, "--id", "example"],
+    output(),
+    output(),
+    { statePath },
+  );
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--attention",
+        "approval",
+      ],
+      output(),
+      output(),
+      { statePath },
+    ),
+    0,
+  );
+  const catalog = await Catalog.open(statePath);
+  assert.deepEqual(catalog.listReviewRequests(), []);
+  catalog.close();
+
+  const stderr = output();
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--wait",
+      ],
+      output(),
+      stderr,
+      { statePath },
+    ),
+    2,
+  );
+  assert.match(stderr.text(), /--wait requires --expect/);
 });
 
 test("routes producer writes through a live daemon without opening local storage", async () => {

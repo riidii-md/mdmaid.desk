@@ -10,7 +10,11 @@ import type {
   CatalogSubscriptionOptions,
 } from "./api-client.js";
 import { DeskApiClient, DeskApiError } from "./api-client.js";
-import type { PublicDocument, PublicWorkspace } from "./api-types.js";
+import type {
+  PublicDocument,
+  PublicReviewRequest,
+  PublicWorkspace,
+} from "./api-types.js";
 import {
   applyTuiReader,
   applyTuiMissingReader,
@@ -66,6 +70,20 @@ const documents: PublicDocument[] = [
 const workspaces: PublicWorkspace[] = [
   { id: "alpha", name: "Alpha", documentCount: 1, route: "/w/alpha" },
   { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
+];
+
+const reviewRequests: PublicReviewRequest[] = [
+  {
+    id: "review-11111111111111111111",
+    documentId: documents[0]!.id,
+    documentRevision: documents[0]!.revision,
+    kind: "plan-decision",
+    requestMessage: "Verify rollback before approval.",
+    status: "pending",
+    response: null,
+    staleAt: null,
+    createdAt: "2026-08-19T10:00:00.000Z",
+  },
 ];
 
 test("navigates and opens the selected queue document", () => {
@@ -172,6 +190,58 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   ]);
   assert.equal(handleTuiKey(reader, "b").state.mode, "queue");
   assert.deepEqual(handleTuiKey(reader, "q").effects, [{ type: "quit" }]);
+});
+
+test("filters explicit actions and composes a review response", () => {
+  const queue = createTuiState(documents, workspaces, reviewRequests);
+  const queueFrame = renderTui(queue, 128, 30);
+  assert.match(queueFrame, /ACTIONS/);
+  assert.match(queueFrame, /Waiting for you/);
+
+  const actions = handleTuiKey(queue, "r").state;
+  assert.equal(actions.actionsOnly, true);
+  assert.deepEqual(
+    actions.visibleDocuments.map(({ id }) => id),
+    [documents[0]!.id],
+  );
+
+  const reader = applyTuiReader(
+    actions,
+    documents[0]!,
+    "Rendered plan.",
+    "beautiful-mermaid",
+    [],
+  );
+  const readerFrame = renderTui(reader, 100, 28);
+  assert.match(readerFrame, /Verify rollback before approval/);
+  assert.match(readerFrame, /y approve/);
+  assert.match(readerFrame, /c changes/);
+  assert.match(readerFrame, /x reject/);
+  assert.ok(
+    readerFrame.indexOf("Rendered plan.") <
+      readerFrame.indexOf("ACTION REQUIRED"),
+    "the decision section should follow the document content",
+  );
+
+  let composing = handleTuiKey(reader, "y").state;
+  assert.equal(composing.reviewComposer?.outcome, "approved");
+  for (const key of "Proceed after backup.") {
+    composing = handleTuiKey(composing, key).state;
+  }
+  const submitted = handleTuiKey(composing, "ctrl-d");
+  assert.deepEqual(submitted.effects, [
+    {
+      type: "review-response",
+      requestId: reviewRequests[0]!.id,
+      outcome: "approved",
+      message: "Proceed after backup.",
+    },
+  ]);
+
+  const changes = handleTuiKey(reader, "c").state;
+  const invalid = handleTuiKey(changes, "ctrl-d");
+  assert.deepEqual(invalid.effects, []);
+  assert.match(invalid.state.message ?? "", /Explain what needs to change/);
 });
 
 test("supports mouse navigation, direct actions, wheel, and page scrolling", () => {
@@ -311,7 +381,15 @@ test("preserves selection and allows only safe document styling", () => {
   assert.doesNotMatch(frame, /payload\u0007/);
 
   const styledReader = applyTuiReader(
-    refreshed,
+    {
+      ...refreshed,
+      reviewRequests: [
+        {
+          ...reviewRequests[0]!,
+          requestMessage: "unsafe\u001b]52;c;review-stolen\u0007\nmessage",
+        },
+      ],
+    },
     documents[0]!,
     "\u001b[36mTrusted heading\u001b[39m\n\u001b]52;c;stolen\u0007Unsafe",
     "beautiful-mermaid",
@@ -367,6 +445,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
       return structuredClone(current);
     },
     listWorkspaces: async () => structuredClone(workspaces),
+    listReviewRequests: async () => [],
     renderDocument: async (
       id: string,
       _target: string,
@@ -459,6 +538,7 @@ test("opens a safe missing-source reader when a source disappears during render"
   const client = {
     listDocuments: async () => [sourceMissing ? missing : present],
     listWorkspaces: async () => [workspaces[0]!],
+    listReviewRequests: async () => [],
     renderDocument: async () => {
       sourceMissing = true;
       throw new DeskApiError(

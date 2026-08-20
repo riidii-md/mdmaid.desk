@@ -6,14 +6,16 @@ import {
   documentOutline,
   filterQueue,
   isSourceMissing,
+  pendingReviewForDocument,
   queueCounts,
   requestDocumentPrint,
+  reviewResponseError,
   webLoadFailure,
   visibleWorkspaces,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
-import type { PublicWorkspace } from "./api-types.js";
+import type { PublicReviewRequest, PublicWorkspace } from "./api-types.js";
 
 const documents: WebDocument[] = [
   {
@@ -74,6 +76,18 @@ const documents: WebDocument[] = [
   },
 ];
 
+const pendingReview: PublicReviewRequest = {
+  id: "review-11111111111111111111",
+  documentId: documents[0]!.id,
+  documentRevision: documents[0]!.revision,
+  kind: "plan-decision",
+  requestMessage: "Check the rollback path.",
+  status: "pending",
+  response: null,
+  staleAt: null,
+  createdAt: "2026-08-19T10:00:00.000Z",
+};
+
 test("filters the browser queue by workspace, status, and search", () => {
   const filters: WebFilters = {
     workspaceId: "alpha",
@@ -99,6 +113,38 @@ test("counts reading states for the browser navigation", () => {
     reading: 1,
     done: 1,
   });
+});
+
+test("shows actions only for explicit pending review requests", () => {
+  assert.equal(
+    pendingReviewForDocument([pendingReview], documents[0]!.id)?.requestMessage,
+    "Check the rollback path.",
+  );
+  assert.equal(
+    pendingReviewForDocument([pendingReview], documents[2]!.id),
+    undefined,
+  );
+  assert.deepEqual(
+    filterQueue(
+      documents,
+      { status: "all", actionsOnly: true },
+      [pendingReview],
+    ).map(({ id }) => id),
+    [documents[0]!.id],
+  );
+});
+
+test("requires explanatory text only when changes are requested", () => {
+  assert.equal(
+    reviewResponseError("changes_requested", "  "),
+    "Explain what needs to change.",
+  );
+  assert.equal(
+    reviewResponseError("changes_requested", "Add rollback proof."),
+    undefined,
+  );
+  assert.equal(reviewResponseError("approved", ""), undefined);
+  assert.equal(reviewResponseError("rejected", ""), undefined);
 });
 
 test("hides projects without visible documents from browser navigation", () => {

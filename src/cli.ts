@@ -12,8 +12,11 @@ import {
   type DocumentKind,
   type ImportDocumentInput,
   type RegisterDocumentInput,
+  type ReviewKind,
+  type ReviewOutcome,
+  type ReviewRequest,
 } from "./catalog.js";
-import { DeskApiClient } from "./api-client.js";
+import { DeskApiClient, DeskApiError } from "./api-client.js";
 import {
   connectToDaemon,
   connectToDaemonInfo,
@@ -64,6 +67,12 @@ const ATTENTION_STATES = new Set<Attention>([
   "failure",
   "changes_requested",
 ]);
+const REVIEW_KINDS = new Set<ReviewKind>(["plan-decision"]);
+const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
+  "approved",
+  "changes_requested",
+  "rejected",
+]);
 
 const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 
@@ -75,9 +84,17 @@ Usage:
   mdmaid-desk register <file.md> --workspace <id>
       [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
+      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
   mdmaid-desk import <file.md> --workspace <id>
       [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
+      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+  mdmaid-desk review create <document-id> [--revision <number>]
+      [--kind plan-decision] [--message <text>] [--json]
+  mdmaid-desk review show <review-id> [--json]
+  mdmaid-desk review wait <review-id> [--json]
+  mdmaid-desk review respond <review-id> --outcome <outcome>
+      [--message <text>] [--json]
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]
       [--public-url <http[s]://name.localhost[:port]>]
@@ -109,6 +126,8 @@ export interface RunOptions {
   startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
   runTui?: (client: DeskApiClient) => Promise<void>;
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
+  signal?: AbortSignal;
+  reviewPollIntervalMs?: number;
   allowPortFallback?: boolean;
 }
 
@@ -192,6 +211,9 @@ export async function run(
     }
     if (args[0] === "import") {
       return await runImport(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "review") {
+      return await runReview(statePath, args.slice(1), stdout, options);
     }
     const catalog = await Catalog.open(statePath);
     try {
@@ -509,7 +531,7 @@ async function runRegister(
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
-  const parsed = parseArguments(args);
+  const parsed = parseArguments(args, new Set(["wait", "json"]));
   const path = parsed.positionals[0];
   if (!path) {
     throw new UsageError("document path is required");
@@ -527,6 +549,10 @@ async function runRegister(
       "title",
       "attention",
       "tag",
+      "expect",
+      "request-message",
+      "wait",
+      "json",
     ]),
   );
 
@@ -543,6 +569,7 @@ async function runRegister(
   const taskId = firstOption(parsed, "task");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
+  const review = parseReviewPublicationOptions(parsed);
   const input: RegisterDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
@@ -554,18 +581,49 @@ async function runRegister(
     ...(tags === undefined ? {} : { tags }),
   };
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let id: string;
+  let document: { id: string; revision: number; route?: string };
+  let reviewRequest: ReviewRequest | undefined;
   if (client) {
-    id = (await client.registerDocument(input)).id;
+    document = await client.registerDocument(input);
+    if (review.expect !== undefined) {
+      reviewRequest = await client.createReviewRequest({
+        documentId: document.id,
+        documentRevision: document.revision,
+        kind: review.expect,
+        requestMessage: review.requestMessage,
+      });
+    }
   } else {
     const catalog = await Catalog.open(statePath);
     try {
-      id = (await catalog.registerDocument(input)).id;
+      document = await catalog.registerDocument(input);
+      if (review.expect !== undefined) {
+        reviewRequest = await catalog.createReviewRequest({
+          documentId: document.id,
+          documentRevision: document.revision,
+          kind: review.expect,
+          requestMessage: review.requestMessage,
+        });
+      }
     } finally {
       catalog.close();
     }
   }
-  stdout.write(`registered ${id}: ${path}\n`);
+  if (review.wait && reviewRequest) {
+    reviewRequest = await waitForReviewRequest(
+      statePath,
+      reviewRequest.id,
+      options,
+    );
+  }
+  writePublicationResult(
+    stdout,
+    "registered",
+    path,
+    document,
+    reviewRequest,
+    review.json,
+  );
   return 0;
 }
 
@@ -575,25 +633,59 @@ async function runImport(
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
-  const input = parseImport(args);
+  const { input, review } = parseImport(args);
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let id: string;
+  let document: { id: string; revision: number; route?: string };
+  let reviewRequest: ReviewRequest | undefined;
   if (client) {
-    id = (await client.importDocument(input)).id;
+    document = await client.importDocument(input);
+    if (review.expect !== undefined) {
+      reviewRequest = await client.createReviewRequest({
+        documentId: document.id,
+        documentRevision: document.revision,
+        kind: review.expect,
+        requestMessage: review.requestMessage,
+      });
+    }
   } else {
     const catalog = await Catalog.open(statePath);
     try {
-      id = (await catalog.importDocument(input)).id;
+      document = await catalog.importDocument(input);
+      if (review.expect !== undefined) {
+        reviewRequest = await catalog.createReviewRequest({
+          documentId: document.id,
+          documentRevision: document.revision,
+          kind: review.expect,
+          requestMessage: review.requestMessage,
+        });
+      }
     } finally {
       catalog.close();
     }
   }
-  stdout.write(`imported ${id}: ${input.path}\n`);
+  if (review.wait && reviewRequest) {
+    reviewRequest = await waitForReviewRequest(
+      statePath,
+      reviewRequest.id,
+      options,
+    );
+  }
+  writePublicationResult(
+    stdout,
+    "imported",
+    input.path,
+    document,
+    reviewRequest,
+    review.json,
+  );
   return 0;
 }
 
-function parseImport(args: string[]): ImportDocumentInput {
-  const parsed = parseArguments(args);
+function parseImport(args: string[]): {
+  input: ImportDocumentInput;
+  review: ReviewPublicationOptions;
+} {
+  const parsed = parseArguments(args, new Set(["wait", "json"]));
   const path = parsed.positionals[0];
   if (!path) {
     throw new UsageError("document path is required");
@@ -611,6 +703,10 @@ function parseImport(args: string[]): ImportDocumentInput {
       "title",
       "attention",
       "tag",
+      "expect",
+      "request-message",
+      "wait",
+      "json",
     ]),
   );
   const kind = (firstOption(parsed, "kind") ?? "other") as DocumentKind;
@@ -624,7 +720,7 @@ function parseImport(args: string[]): ImportDocumentInput {
   const taskId = firstOption(parsed, "task");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
-  return {
+  const input: ImportDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
     ...(producer ? { producer } : {}),
@@ -634,6 +730,352 @@ function parseImport(args: string[]): ImportDocumentInput {
     attention,
     ...(tags === undefined ? {} : { tags }),
   };
+  return { input, review: parseReviewPublicationOptions(parsed) };
+}
+
+interface ReviewPublicationOptions {
+  expect?: ReviewKind;
+  requestMessage: string;
+  wait: boolean;
+  json: boolean;
+}
+
+function parseReviewPublicationOptions(
+  parsed: ParsedArguments,
+): ReviewPublicationOptions {
+  const rawExpectation = firstOption(parsed, "expect");
+  const requestMessage = firstOption(parsed, "request-message");
+  const wait = hasFlag(parsed, "wait");
+  if (rawExpectation === undefined) {
+    if (requestMessage !== undefined) {
+      throw new UsageError("--request-message requires --expect");
+    }
+    if (wait) {
+      throw new UsageError("--wait requires --expect");
+    }
+    return { requestMessage: "", wait: false, json: hasFlag(parsed, "json") };
+  }
+  if (!REVIEW_KINDS.has(rawExpectation as ReviewKind)) {
+    throw new UsageError(`unknown review expectation ${rawExpectation}`);
+  }
+  return {
+    expect: rawExpectation as ReviewKind,
+    requestMessage: requestMessage ?? "",
+    wait,
+    json: hasFlag(parsed, "json"),
+  };
+}
+
+function writePublicationResult(
+  stdout: Writer,
+  action: "registered" | "imported",
+  path: string,
+  document: { id: string; revision: number; route?: string },
+  reviewRequest: ReviewRequest | undefined,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(
+      `${JSON.stringify({
+        schemaVersion: 1,
+        document: {
+          id: document.id,
+          revision: document.revision,
+          route: document.route ?? `/d/${document.id}`,
+        },
+        ...(reviewRequest === undefined ? {} : { reviewRequest }),
+      })}\n`,
+    );
+    return;
+  }
+  stdout.write(`${action} ${document.id}: ${path}\n`);
+  if (reviewRequest) {
+    stdout.write(
+      `review ${reviewRequest.id}: ${reviewRequest.status}${
+        reviewRequest.response?.message
+          ? ` — ${reviewRequest.response.message}`
+          : ""
+      }\n`,
+    );
+  }
+}
+
+async function runReview(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (!action) {
+    throw new UsageError("review action is required");
+  }
+  const parsed = parseArguments(args.slice(1), new Set(["json"]));
+  const id = parsed.positionals[0];
+  if (!id) {
+    throw new UsageError(
+      action === "create" ? "document id is required" : "review id is required",
+    );
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError(`review ${action} accepts one id`);
+  }
+
+  let request: ReviewRequest;
+  if (action === "create") {
+    rejectUnknownOptions(
+      parsed,
+      new Set(["revision", "kind", "message", "json"]),
+    );
+    const kind = (firstOption(parsed, "kind") ?? "plan-decision") as ReviewKind;
+    if (!REVIEW_KINDS.has(kind)) {
+      throw new UsageError(`unknown review kind ${kind}`);
+    }
+    const revision = optionalPositiveInteger(parsed, "revision");
+    const input = {
+      documentId: id,
+      ...(revision === undefined ? {} : { documentRevision: revision }),
+      kind,
+      requestMessage: firstOption(parsed, "message") ?? "",
+    };
+    const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+    if (client) {
+      request = await client.createReviewRequest(input);
+    } else {
+      const catalog = await Catalog.open(statePath);
+      try {
+        request = await catalog.createReviewRequest(input);
+      } finally {
+        catalog.close();
+      }
+    }
+  } else if (action === "show") {
+    rejectUnknownOptions(parsed, new Set(["json"]));
+    request = await loadReviewRequest(statePath, id, options);
+  } else if (action === "wait") {
+    rejectUnknownOptions(parsed, new Set(["json"]));
+    request = await waitForReviewRequest(statePath, id, options);
+  } else if (action === "respond") {
+    rejectUnknownOptions(parsed, new Set(["outcome", "message", "json"]));
+    const outcome = requiredOption(parsed, "outcome") as ReviewOutcome;
+    if (!REVIEW_OUTCOMES.has(outcome)) {
+      throw new UsageError(`unknown review outcome ${outcome}`);
+    }
+    const input = {
+      outcome,
+      message: firstOption(parsed, "message") ?? "",
+    };
+    const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+    if (client) {
+      request = await client.respondToReviewRequest(id, input);
+    } else {
+      const catalog = await Catalog.open(statePath);
+      try {
+        request = await catalog.respondToReviewRequest(id, input);
+      } finally {
+        catalog.close();
+      }
+    }
+  } else {
+    throw new UsageError(
+      "review action must be create, show, wait, or respond",
+    );
+  }
+  writeReviewResult(stdout, request, hasFlag(parsed, "json"));
+  return 0;
+}
+
+function writeReviewResult(
+  stdout: Writer,
+  request: ReviewRequest,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(
+      `${JSON.stringify({ schemaVersion: 1, reviewRequest: request })}\n`,
+    );
+    return;
+  }
+  stdout.write(
+    `review ${request.id}: ${request.status}${
+      request.response?.message ? ` — ${request.response.message}` : ""
+    }\n`,
+  );
+}
+
+async function loadReviewRequest(
+  statePath: string,
+  id: string,
+  options: RunOptions,
+): Promise<ReviewRequest> {
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    return await client.getReviewRequest(id);
+  }
+  const catalog = await Catalog.open(statePath);
+  try {
+    const request = catalog.getReviewRequest(id);
+    if (!request) {
+      throw new Error(`unknown review request ${id}`);
+    }
+    return request;
+  } finally {
+    catalog.close();
+  }
+}
+
+async function waitForReviewRequest(
+  statePath: string,
+  id: string,
+  options: RunOptions,
+): Promise<ReviewRequest> {
+  const interval = options.reviewPollIntervalMs ?? 1_000;
+  while (true) {
+    throwIfAborted(options.signal);
+    const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+    if (client) {
+      try {
+        return await waitForReviewEvent(client, id, options.signal);
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw new Error("review wait cancelled");
+        }
+        if (error instanceof DeskApiError && error.status < 500) {
+          throw error;
+        }
+        if (
+          error instanceof Error &&
+          error.message.startsWith("unknown review")
+        ) {
+          throw error;
+        }
+      }
+    } else {
+      const catalog = await Catalog.open(statePath);
+      let request: ReviewRequest | undefined;
+      try {
+        request = catalog.getReviewRequest(id);
+      } finally {
+        catalog.close();
+      }
+      if (!request) {
+        throw new Error(`unknown review request ${id}`);
+      }
+      if (request.status !== "pending") {
+        return request;
+      }
+    }
+    await abortableDelay(interval, options.signal);
+  }
+}
+
+async function waitForReviewEvent(
+  client: DeskApiClient,
+  id: string,
+  signal?: AbortSignal,
+): Promise<ReviewRequest> {
+  const current = await client.getReviewRequest(id);
+  if (current.status !== "pending") {
+    return current;
+  }
+  const controller = new AbortController();
+  return await new Promise<ReviewRequest>((resolvePromise, reject) => {
+    let settled = false;
+    let checking = false;
+    const finish = (operation: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      controller.abort();
+      signal?.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = (): void => {
+      finish(() => reject(new Error("review wait cancelled")));
+    };
+    const check = (): void => {
+      if (settled || checking) {
+        return;
+      }
+      checking = true;
+      void client
+        .getReviewRequest(id)
+        .then((request) => {
+          if (request.status !== "pending") {
+            finish(() => resolvePromise(request));
+          }
+        })
+        .catch((error: unknown) => finish(() => reject(error)))
+        .finally(() => {
+          checking = false;
+        });
+    };
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    void client
+      .subscribeCatalog(
+        (event) => {
+          if (
+            event.reviewRequestId === id ||
+            event.documentId === current.documentId
+          ) {
+            check();
+          }
+        },
+        { signal: controller.signal, onReady: check },
+      )
+      .then(() => {
+        if (!settled) {
+          finish(() => reject(new Error("daemon event stream ended")));
+        }
+      })
+      .catch((error: unknown) => finish(() => reject(error)));
+  });
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new Error("review wait cancelled");
+  }
+}
+
+async function abortableDelay(
+  milliseconds: number,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolvePromise, reject) => {
+    const finish = (): void => {
+      signal?.removeEventListener("abort", onAbort);
+      resolvePromise();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new Error("review wait cancelled"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function optionalPositiveInteger(
+  parsed: ParsedArguments,
+  name: string,
+): number | undefined {
+  const raw = firstOption(parsed, name);
+  if (raw === undefined) {
+    return undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new UsageError(`--${name} must be a positive integer`);
+  }
+  return value;
 }
 
 function runList(
@@ -679,7 +1121,10 @@ interface ParsedArguments {
   options: Map<string, string[]>;
 }
 
-function parseArguments(args: string[]): ParsedArguments {
+function parseArguments(
+  args: string[],
+  booleanOptions: ReadonlySet<string> = new Set(),
+): ParsedArguments {
   const parsed: ParsedArguments = {
     positionals: [],
     options: new Map(),
@@ -694,6 +1139,12 @@ function parseArguments(args: string[]): ParsedArguments {
       continue;
     }
     const name = value.slice(2);
+    if (booleanOptions.has(name)) {
+      const values = parsed.options.get(name) ?? [];
+      values.push("true");
+      parsed.options.set(name, values);
+      continue;
+    }
     const optionValue = args[index + 1];
     if (!name || optionValue === undefined || optionValue.startsWith("--")) {
       throw new UsageError(`option --${name || "unknown"} requires a value`);
@@ -704,6 +1155,10 @@ function parseArguments(args: string[]): ParsedArguments {
     index += 1;
   }
   return parsed;
+}
+
+function hasFlag(parsed: ParsedArguments, name: string): boolean {
+  return parsed.options.has(name);
 }
 
 function firstOption(

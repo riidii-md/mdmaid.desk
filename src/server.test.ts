@@ -450,6 +450,137 @@ test("shares reading lifecycle mutations through the API", async () => {
   }
 });
 
+test("creates and resolves authenticated review requests without exposing hashes", async () => {
+  const value = await fixture();
+  try {
+    const unauthenticated = await fetch(
+      new URL("/api/v1/review-requests", value.server.url),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          documentId: value.document.id,
+          kind: "plan-decision",
+          requestMessage: "Review the rollback path.",
+        }),
+      },
+    );
+    assert.equal(unauthenticated.status, 401);
+
+    const unsafe = await authorized(value, "/api/v1/review-requests", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        documentId: value.document.id,
+        kind: "plan-decision",
+        requestMessage: "unsafe\u0000message",
+        callback: "file:///tmp/run-me",
+      }),
+    });
+    assert.equal(unsafe.status, 422);
+
+    const unsafeMessage = await authorized(
+      value,
+      "/api/v1/review-requests",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          documentId: value.document.id,
+          kind: "plan-decision",
+          requestMessage: "unsafe\u0000message",
+        }),
+      },
+    );
+    assert.equal(unsafeMessage.status, 422);
+
+    const created = await authorized(value, "/api/v1/review-requests", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        documentId: value.document.id,
+        documentRevision: value.document.revision,
+        kind: "plan-decision",
+        requestMessage: "Review the rollback path.",
+      }),
+    });
+    assert.equal(created.status, 201);
+    const createdBody = (await created.json()) as {
+      data: Record<string, unknown>;
+    };
+    const requestId = String(createdBody.data.id);
+    assert.match(requestId, /^review-[a-f0-9]{20}$/);
+    assert.equal(createdBody.data.status, "pending");
+    assert.equal(createdBody.data.requestMessage, "Review the rollback path.");
+    assert.equal("documentContentHash" in createdBody.data, false);
+    assert.equal("contentHash" in createdBody.data, false);
+
+    const listed = await authorized(
+      value,
+      `/api/v1/review-requests?document=${value.document.id}&status=pending`,
+    );
+    assert.equal(listed.status, 200);
+    assert.equal(
+      ((await listed.json()) as { data: unknown[] }).data.length,
+      1,
+    );
+
+    const invalid = await authorized(
+      value,
+      `/api/v1/review-requests/${requestId}/respond`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          outcome: "changes_requested",
+          message: "",
+        }),
+      },
+    );
+    assert.equal(invalid.status, 422);
+
+    const responded = await authorized(
+      value,
+      `/api/v1/review-requests/${requestId}/respond`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          outcome: "changes_requested",
+          message: "Restore the old schema in rollback.",
+        }),
+      },
+    );
+    assert.equal(responded.status, 200);
+    const responseBody = (await responded.json()) as {
+      data: {
+        status: string;
+        response: { outcome: string; message: string; createdAt: string };
+      };
+    };
+    assert.equal(responseBody.data.status, "changes_requested");
+    assert.equal(responseBody.data.response.outcome, "changes_requested");
+    assert.equal(
+      responseBody.data.response.message,
+      "Restore the old schema in rollback.",
+    );
+    assert.ok(!Number.isNaN(Date.parse(responseBody.data.response.createdAt)));
+
+    const conflict = await authorized(
+      value,
+      `/api/v1/review-requests/${requestId}/respond`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outcome: "approved", message: "" }),
+      },
+    );
+    assert.equal(conflict.status, 409);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("registers documents through validated producer-neutral input", async () => {
   const value = await fixture();
   try {
@@ -624,7 +755,19 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.equal(page.status, 200);
     assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'self'/);
     assert.equal(page.headers.get("x-content-type-options"), "nosniff");
-    assert.match(await page.text(), /mdmaid\.desk/);
+    const pageContent = await page.text();
+    assert.match(pageContent, /mdmaid\.desk/);
+    assert.match(pageContent, /id="actions-filter"/);
+    assert.match(pageContent, /id="review-panel"/);
+    assert.match(pageContent, /id="review-response"/);
+    assert.match(pageContent, /id="review-approve"/);
+    assert.match(pageContent, /id="review-changes"/);
+    assert.match(pageContent, /id="review-reject"/);
+    assert.ok(
+      pageContent.indexOf('id="reader-content"') <
+        pageContent.indexOf('id="review-panel"'),
+      "the human decision panel should follow the document content",
+    );
 
     const route = await fetch(
       new URL(`/d/${value.document.id}`, value.server.url),

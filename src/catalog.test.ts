@@ -721,6 +721,295 @@ test("tracks reading progress by content revision", async () => {
   restored.close();
 });
 
+test("persists explicit review requests separately from reading progress", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "approval.md");
+  await writeFile(documentPath, "# Approval\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    producer: "codex",
+    kind: "plan",
+    title: "Approval plan",
+    path: documentPath,
+    attention: "approval",
+  });
+
+  assert.deepEqual(catalog.listReviewRequests(), []);
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    documentRevision: document.revision,
+    kind: "plan-decision",
+    requestMessage: "Please verify rollback coverage.\r\nKeep the rationale.",
+  });
+  assert.match(request.id, /^review-[a-f0-9]{20}$/);
+  assert.equal(request.status, "pending");
+  assert.equal(
+    request.requestMessage,
+    "Please verify rollback coverage.\nKeep the rationale.",
+  );
+  assert.equal(request.response, null);
+
+  await catalog.markDocumentOpened(document.id);
+  await catalog.markDocumentRead(document.id);
+  assert.equal(catalog.getReviewRequest(request.id)?.status, "pending");
+
+  catalog.close();
+  const restored = await Catalog.open(statePath);
+  assert.deepEqual(restored.getReviewRequest(request.id), request);
+  restored.close();
+});
+
+test("records one durable human response and requires reasons for changes", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "decision.md");
+  await writeFile(documentPath, "# Decision\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Decision plan",
+    path: documentPath,
+    attention: "none",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "Check the deployment order.",
+  });
+
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "   ",
+    }),
+    /response message is required/,
+  );
+  const responded = await catalog.respondToReviewRequest(request.id, {
+    outcome: "changes_requested",
+    message: "Move the database migration before the daemon restart.",
+  });
+  assert.equal(responded.status, "changes_requested");
+  assert.equal(
+    responded.response?.message,
+    "Move the database migration before the daemon restart.",
+  );
+
+  await catalog.archiveDocument(document.id);
+
+  assert.deepEqual(
+    await catalog.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "Move the database migration before the daemon restart.",
+    }),
+    responded,
+  );
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "",
+    }),
+    /already has a different response/,
+  );
+  catalog.close();
+});
+
+test("stales a pending review when document content changes", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "revision-gate.md");
+  await writeFile(documentPath, "# Version one\n", "utf8");
+  const first = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Revision gate",
+    path: documentPath,
+    attention: "none",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: first.id,
+    documentRevision: first.revision,
+    kind: "plan-decision",
+    requestMessage: "Review this exact revision.",
+  });
+
+  await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Metadata only",
+    path: documentPath,
+    attention: "review",
+  });
+  assert.equal(catalog.getReviewRequest(request.id)?.status, "pending");
+
+  await writeFile(documentPath, "# Version two\n", "utf8");
+  await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Revision gate",
+    path: documentPath,
+    attention: "none",
+  });
+  assert.equal(catalog.getReviewRequest(request.id)?.status, "stale");
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "",
+    }),
+    /review request is stale/,
+  );
+  catalog.close();
+});
+
+test("refuses a response when the source changed without re-registration", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "unobserved-revision.md");
+  await writeFile(documentPath, "# Reviewed version\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Unobserved revision",
+    path: documentPath,
+    attention: "none",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "Review this exact file content.",
+  });
+
+  await writeFile(documentPath, "# Changed behind the catalog\n", "utf8");
+
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "Looks good.",
+    }),
+    /review request is stale/,
+  );
+  assert.equal(catalog.getReviewRequest(request.id)?.status, "stale");
+  catalog.close();
+});
+
+test("refuses to create a review for unregistered source changes", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "unregistered-create.md");
+  await writeFile(documentPath, "# Registered version\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Registered version",
+    path: documentPath,
+    attention: "none",
+  });
+
+  await writeFile(documentPath, "# Changed before review creation\n", "utf8");
+
+  await assert.rejects(
+    catalog.createReviewRequest({
+      documentId: document.id,
+      kind: "plan-decision",
+      requestMessage: "Review the current content.",
+    }),
+    /document content changed/,
+  );
+  assert.deepEqual(catalog.listReviewRequests(), []);
+  catalog.close();
+});
+
+test("fails review creation and response closed when sources disappear", async () => {
+  const { catalog, workspace } = await fixture();
+  const responsePath = join(workspace, "reports", "missing-response.md");
+  await writeFile(responsePath, "# Response source\n", "utf8");
+  const responseDocument = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Response source",
+    path: responsePath,
+    attention: "none",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: responseDocument.id,
+    kind: "plan-decision",
+    requestMessage: "Review before it disappears.",
+  });
+  await rm(responsePath);
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "Approved.",
+    }),
+    /review request is stale/,
+  );
+  assert.equal(catalog.getReviewRequest(request.id)?.status, "stale");
+
+  const createPath = join(workspace, "reports", "missing-create.md");
+  await writeFile(createPath, "# Creation source\n", "utf8");
+  const createDocument = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Creation source",
+    path: createPath,
+    attention: "none",
+  });
+  await rm(createPath);
+  await assert.rejects(
+    catalog.createReviewRequest({
+      documentId: createDocument.id,
+      kind: "plan-decision",
+      requestMessage: "This cannot be reviewed.",
+    }),
+    /document source is unavailable/,
+  );
+  catalog.close();
+});
+
+test("creates pending review requests idempotently and rejects conflicts", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "idempotent-review.md");
+  await writeFile(documentPath, "# Plan\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Plan",
+    path: documentPath,
+    attention: "none",
+  });
+  const input = {
+    documentId: document.id,
+    documentRevision: document.revision,
+    kind: "plan-decision" as const,
+    requestMessage: "Review it.",
+  };
+  const first = await catalog.createReviewRequest(input);
+  await assert.rejects(
+    catalog.archiveDocument(document.id),
+    /document has a pending review request/,
+  );
+  assert.deepEqual(await catalog.createReviewRequest(input), first);
+  await assert.rejects(
+    catalog.createReviewRequest({
+      ...input,
+      requestMessage: "Review a different concern.",
+    }),
+    /already has a pending review request/,
+  );
+  await assert.rejects(
+    catalog.createReviewRequest({
+      ...input,
+      documentRevision: 99,
+    }),
+    /document revision changed/,
+  );
+  await catalog.respondToReviewRequest(first.id, {
+    outcome: "approved",
+    message: "Approved.",
+  });
+  await catalog.archiveDocument(document.id);
+  await assert.rejects(
+    catalog.createReviewRequest(input),
+    /document is archived/,
+  );
+  catalog.close();
+});
+
 test("persists tags and filters status, archive, and missing state", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const planPath = join(workspace, "reports", "plan.md");
@@ -847,8 +1136,18 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   });
   migratedAgain.close();
 
+  const versionThree = new Database(databasePath);
+  versionThree.exec("DROP TABLE review_responses");
+  versionThree.exec("DROP TABLE review_requests");
+  versionThree.pragma("user_version = 3");
+  versionThree.close();
+  const migratedReviews = await Catalog.open(databasePath, {
+    legacyStatePath: false,
+  });
+  migratedReviews.close();
+
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 3);
+  assert.equal(database.pragma("user_version", { simple: true }), 4);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -868,6 +1167,8 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       "document_source_links",
       "document_tags",
       "documents",
+      "review_requests",
+      "review_responses",
       "tags",
       "workspace_artifact_roots",
       "workspaces",
