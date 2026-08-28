@@ -617,6 +617,25 @@ test("registers documents through validated producer-neutral input", async () =>
         message: "Invalid document registration",
       },
     });
+
+    const rejected = await authorized(value, "/api/v1/documents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "example",
+        kind: "review",
+        title: "Not Markdown",
+        path: join(value.workspace, "review.txt"),
+        attention: "none",
+      }),
+    });
+    assert.equal(rejected.status, 422);
+    assert.deepEqual(await rejected.json(), {
+      error: {
+        code: "validation_error",
+        message: "only Markdown files can be registered",
+      },
+    });
   } finally {
     await closeFixture(value);
   }
@@ -666,6 +685,25 @@ test("imports outside documents without leaking source or managed paths", async 
       error: {
         code: "validation_error",
         message: "Invalid document import",
+      },
+    });
+
+    const rejected = await authorized(value, "/api/v1/imports", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "example",
+        kind: "brief",
+        title: "Not Markdown",
+        path: join(value.root, "outside.txt"),
+        attention: "none",
+      }),
+    });
+    assert.equal(rejected.status, 422);
+    assert.deepEqual(await rejected.json(), {
+      error: {
+        code: "validation_error",
+        message: "only Markdown files can be imported",
       },
     });
   } finally {

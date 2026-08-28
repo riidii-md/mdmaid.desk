@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -490,6 +490,53 @@ test("routes producer writes through a live daemon without opening local storage
   await assert.rejects(readFile(statePath), /ENOENT/);
   assert.equal(stderr.text(), "");
   assert.match(stdout.text(), /imported doc-fedcba9876543210abcd/);
+});
+
+test("resolves relative document paths before sending them to a live daemon", async () => {
+  const relativePath = ".agent-runs/review.md";
+  const calls: Array<[string, { path: string }]> = [];
+  const client = {
+    registerDocument: async (input: { path: string }) => {
+      calls.push(["register", input]);
+      return { id: "doc-0123456789abcdefabcd", revision: 1 };
+    },
+    importDocument: async (input: { path: string }) => {
+      calls.push(["import", input]);
+      return { id: "doc-fedcba9876543210abcd", revision: 1 };
+    },
+  } as unknown as DeskApiClient;
+  const options = {
+    statePath: "/unused/catalog.sqlite3",
+    connectDaemon: async () => client,
+  };
+
+  assert.equal(
+    await run(
+      ["register", relativePath, "--workspace", "example"],
+      output(),
+      output(),
+      options,
+    ),
+    0,
+  );
+  assert.equal(
+    await run(
+      ["import", relativePath, "--workspace", "example"],
+      output(),
+      output(),
+      options,
+    ),
+    0,
+  );
+
+  assert.deepEqual(
+    calls.map(([action, input]) => [action, input.path]),
+    [
+      ["register", resolve(relativePath)],
+      ["import", resolve(relativePath)],
+    ],
+  );
+  assert.ok(calls.every(([, input]) => isAbsolute(input.path)));
 });
 
 test("returns a usage error for incomplete commands", async () => {

@@ -359,7 +359,7 @@ async function handleRequest(
         throw new HttpError(
           422,
           "validation_error",
-          "Invalid document registration",
+          error.message,
         );
       }
       throw error;
@@ -386,7 +386,7 @@ async function handleRequest(
         throw new HttpError(
           422,
           "validation_error",
-          "Invalid document import",
+          error.message,
         );
       }
       throw error;
