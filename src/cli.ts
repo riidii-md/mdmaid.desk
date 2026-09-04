@@ -576,7 +576,7 @@ async function runRegister(
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
-    path,
+    path: resolve(path),
     attention,
     ...(tags === undefined ? {} : { tags }),
   };
@@ -726,7 +726,7 @@ function parseImport(args: string[]): {
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
-    path,
+    path: resolve(path),
     attention,
     ...(tags === undefined ? {} : { tags }),
   };
