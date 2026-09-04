@@ -108,6 +108,9 @@ function collectLinkHrefs(content: Buffer): string[] {
     if (node.type === "link" && typeof node.url === "string") {
       hrefs.add(node.url);
     }
+    if (node.type === "image" && typeof node.url === "string") {
+      hrefs.add(node.url);
+    }
     if (
       node.type === "definition" &&
       typeof node.identifier === "string" &&
@@ -116,7 +119,7 @@ function collectLinkHrefs(content: Buffer): string[] {
       definitions.set(node.identifier, node.url);
     }
     if (
-      node.type === "linkReference" &&
+      (node.type === "linkReference" || node.type === "imageReference") &&
       typeof node.identifier === "string"
     ) {
       references.add(node.identifier);

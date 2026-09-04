@@ -24,6 +24,8 @@ The repository contains the first usable shared-service vertical slice:
 - authenticated loopback HTTP API and stable document/workspace routes;
 - registered workspace-local Markdown links rewritten to authenticated source
   viewers with line anchors;
+- registered workspace-local SVG images rewritten to authenticated,
+  same-origin media routes with isolated content security policy;
 - sanitized `mdmaid` HTML and terminal rendering;
 - responsive browser queue, project/status filters, search, reader, and actions;
 - terminal-native queue, filters, search, reader, and lifecycle actions;

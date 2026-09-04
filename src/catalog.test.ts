@@ -137,6 +137,49 @@ test("registers workspace-local source links and persists their safe mappings", 
   restored.close();
 });
 
+test("discovers Markdown image references as authorized local media", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "explanation.md");
+  const mediaPath = join(workspace, "reports", "flow.svg");
+  await writeFile(
+    mediaPath,
+    '<svg xmlns="http://www.w3.org/2000/svg"><circle r="2"><animateMotion path="M0 0 L10 0" dur="1s" repeatCount="indefinite"/></circle></svg>\n',
+    "utf8",
+  );
+  await writeFile(
+    documentPath,
+    [
+      "# Change explanation",
+      "",
+      "![Animated request flow][flow]",
+      "",
+      "[flow]: flow.svg",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "showcase",
+    title: "Change explanation",
+    path: documentPath,
+    attention: "review",
+  });
+
+  const media = document.sourceLinks.find(({ href }) => href === "flow.svg");
+  assert.ok(media);
+  assert.equal(media.workspacePath, relative(workspace, mediaPath));
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(
+    restored.getDocument(document.id)?.sourceLinks,
+    document.sourceLinks,
+  );
+  restored.close();
+  catalog.close();
+});
+
 test("resolves registered Markdown source links to catalog documents", async () => {
   const { catalog, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "index.md");

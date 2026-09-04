@@ -43,6 +43,8 @@ The public origin then becomes
 - browser mutations authenticated by cookie must send the exact public origin;
 - forwarding headers are not trusted or used for authentication;
 - browser cookies are token-scoped and marked `HttpOnly` and `SameSite=Strict`;
+- registered workspace-local SVGs are served only through authenticated opaque
+  media routes with repeated realpath checks and a script-denying sandbox CSP;
 - the persistent random `auth-token` and transient `daemon.json` descriptor use
   mode `0600` in the mode-`0700` state directory;
 - bearer-authenticated local clients connect directly to the loopback address
