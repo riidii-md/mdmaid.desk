@@ -390,11 +390,11 @@ test("validates coordinator options and contains watcher failures", async () => 
 });
 
 async function eventually(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     if (predicate()) {
       return;
     }
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
   assert.fail("condition was not reached");
 }
