@@ -63,9 +63,12 @@ openedRevision == revision     -> Reading
 otherwise                      -> Unread
 ```
 
-Changing document content increments its revision and makes it Unread.
-Metadata-only updates preserve progress. Existing version 1 JSON catalogs are
-imported in one transaction and retained as `catalog.json.migrated`.
+Reconciling changed document content increments its revision exactly once and
+makes it Unread. Reconciliation also replaces local-link mappings and stales a
+pending review bound to the previous revision. Duplicate or metadata-only
+filesystem events preserve the revision and progress. Existing version 1 JSON
+catalogs are imported in one transaction and retained as
+`catalog.json.migrated`.
 Registered Markdown remains at its authorized original path. Explicit imports
 are copied atomically into mode-`0700` managed storage beside the catalog;
 snapshot files are mode `0600`. The original canonical path is retained only
@@ -101,7 +104,9 @@ local file and remote media access.
 
 The catalog is the durable product state. It does not depend on a running
 daemon: harnesses, editors, scripts, and users can register documents through
-short-lived CLI commands and view the same queue later.
+short-lived CLI commands and view the same queue later. Reading a registered
+document reconciles it against the current authorized source even without a
+daemon; only automatic push refresh depends on the daemon.
 
 ## Hybrid Runtime and Optional Daemon
 
@@ -145,6 +150,25 @@ The daemon is an opt-in live coordination and presentation service. It owns
 continuous behavior while active: HTTP/API access, Server-Sent Events,
 directory watching, and future comment/edit coordination. It does not own the
 existence of the queue. Starting or stopping it never removes catalog entries.
+
+For each directory containing at least one active registered reference, the
+daemon creates one non-recursive watch and filters notifications to exact
+registered basenames. Watching the parent directory avoids binding the watcher
+to a file inode that an atomic save may replace. A notification with no
+filename reconciles every registered source in that directory. Notifications
+are debounced and treated only as hints: reconciliation repeats realpath,
+artifact-root containment, symlink, regular-file, size, Markdown, and local-link
+authorization before committing. Missing references stay watched so a restored
+path can recover. Imports and archived references are not watched.
+
+After a committed transition, the daemon publishes only the action
+(`source-changed`, `source-missing`, or `source-restored`), opaque document ID,
+and revision. No watched path enters the API or event stream. Web rerenders only
+the matching reader, reruns Mermaid, and preserves the nearest available
+heading without recording another open action or history entry. TUI applies
+the same document scoping at its current width and preferences while preserving
+a clamped line offset. Linked source pages and SVG media remain live on request
+but are not watched in this release.
 
 `daemon start` is idempotent. The daemon publishes its PID, loopback host,
 port, and protocol version through `daemon.json`. `daemon install` explicitly
@@ -287,10 +311,14 @@ Status: complete.
 
 ### 4. Directory Watching
 
-- configured artifact roots;
-- add, change, and unlink reconciliation;
-- ignore policy;
-- watcher recovery after restart.
+Status: complete for registered Markdown sources.
+
+- shared non-recursive parent-directory watches;
+- filtered and debounced change, unlink, replacement, and restore
+  reconciliation;
+- path re-authorization and atomic revision/link/review persistence;
+- document-scoped path-free events;
+- watcher reconstruction from persisted active references after restart.
 
 ### 5. Web and TUI Workspaces
 

@@ -26,6 +26,17 @@ export interface DocumentOutlineItem {
   text: string;
 }
 
+export interface HeadingPosition {
+  id: string;
+  top: number;
+}
+
+export interface LiveSourceCatalogEvent {
+  action: "source-changed" | "source-missing" | "source-restored";
+  documentId: string;
+  revision: number;
+}
+
 export interface WebLoadFailure {
   guidance: string;
   liveStatus: string;
@@ -199,6 +210,73 @@ export function documentFragmentId(hash: string): string | undefined {
   }
 }
 
+export function parseLiveSourceCatalogEvent(
+  data: string,
+): LiveSourceCatalogEvent | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+  if (
+    !isRecord(value) ||
+    !Object.keys(value).every((key) =>
+      ["action", "documentId", "revision"].includes(key),
+    ) ||
+    (value.action !== "source-changed" &&
+      value.action !== "source-missing" &&
+      value.action !== "source-restored") ||
+    typeof value.documentId !== "string" ||
+    !/^doc-[a-f0-9]{20}$/.test(value.documentId) ||
+    typeof value.revision !== "number" ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 1
+  ) {
+    return undefined;
+  }
+  return {
+    action: value.action,
+    documentId: value.documentId,
+    revision: value.revision,
+  };
+}
+
+export function shouldRefreshWebReader(
+  event: LiveSourceCatalogEvent | undefined,
+  selectedId: string | undefined,
+  renderedRevision: number | undefined,
+): boolean {
+  return Boolean(
+    event &&
+      selectedId === event.documentId &&
+      (event.action !== "source-changed" ||
+        renderedRevision === undefined ||
+        event.revision > renderedRevision),
+  );
+}
+
+export function nearestHeadingPosition(
+  headings: readonly HeadingPosition[],
+): HeadingPosition | undefined {
+  let nearest: HeadingPosition | undefined;
+  for (const heading of headings) {
+    if (heading.id === "" || heading.top > 24) {
+      continue;
+    }
+    if (!nearest || heading.top > nearest.top) {
+      nearest = heading;
+    }
+  }
+  return nearest ? { ...nearest } : undefined;
+}
+
+export function sourceModeLabel(
+  storage: WebDocument["storage"],
+): "live source" | "snapshot" {
+  return storage === "reference" ? "live source" : "snapshot";
+}
+
 export function requestDocumentPrint(target: PrintTarget): void {
   target.print();
 }
@@ -217,6 +295,10 @@ export function webLoadFailure(code?: string): WebLoadFailure {
         liveStatus: "○ unavailable",
         title: "Could not load documents",
       };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function boot(): Promise<void> {
@@ -267,6 +349,9 @@ async function boot(): Promise<void> {
   const statusButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>("[data-status-filter]"),
   );
+  let renderedRevision: number | undefined;
+  let renderSequence = 0;
+  let catalogRefresh = Promise.resolve();
 
   async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await fetch(path, {
@@ -385,7 +470,7 @@ async function boot(): Promise<void> {
         item.workspaceId,
         item.taskId,
         item.kind,
-        item.storage,
+        sourceModeLabel(item.storage),
       ]
         .filter(Boolean)
         .join(" / ");
@@ -474,31 +559,76 @@ async function boot(): Promise<void> {
     }
   }
 
-  async function openDocument(id: string, pushHistory = true): Promise<void> {
-    state.selectedId = id;
-    queuePanel.setAttribute("hidden", "");
-    reader.removeAttribute("hidden");
-    readerToc.setAttribute("hidden", "");
-    readerTocList.replaceChildren();
-    setMissingReader(false);
-    readerContent.textContent = "Rendering…";
-    const selected = state.documents.find((item) => item.id === id);
+  function renderReaderMetadata(selected: WebDocument | undefined): void {
     readerTitle.textContent = selected?.title ?? "Document";
     readerMeta.textContent = selected
       ? [
           selected.workspaceId,
           selected.taskId,
           selected.kind,
-          selected.storage,
+          sourceModeLabel(selected.storage),
         ]
           .filter(Boolean)
           .join(" / ")
       : "";
+  }
+
+  function captureHeadingPosition(): HeadingPosition | undefined {
+    return nearestHeadingPosition(
+      Array.from(
+        readerContent.querySelectorAll<HTMLElement>(
+          "h1[id], h2[id], h3[id], h4[id], h5[id], h6[id]",
+        ),
+      ).map((heading) => ({
+        id: heading.id,
+        top: heading.getBoundingClientRect().top,
+      })),
+    );
+  }
+
+  function restoreHeadingPosition(position: HeadingPosition): void {
+    const heading = Array.from(
+      readerContent.querySelectorAll<HTMLElement>("[id]"),
+    ).find(({ id }) => id === position.id);
+    if (heading) {
+      window.scrollBy({
+        top: heading.getBoundingClientRect().top - position.top,
+      });
+    }
+  }
+
+  async function renderSelectedDocument(
+    id: string,
+    options: {
+      markOpened: boolean;
+      preserveHeading: boolean;
+      pushHistory: boolean;
+      showLoading: boolean;
+    },
+  ): Promise<void> {
+    const sequence = ++renderSequence;
+    const selected = state.documents.find((item) => item.id === id);
+    renderReaderMetadata(selected);
     renderReviewPanel(id);
+    if (!options.markOpened && selected && isSourceMissing(selected)) {
+      showMissingSource(selected);
+      renderedRevision = selected.revision;
+      return;
+    }
+    const headingPosition = options.preserveHeading
+      ? captureHeadingPosition()
+      : undefined;
+    if (options.showLoading) {
+      readerContent.textContent = "Rendering…";
+    }
     try {
       const rendered = await api<RenderedDocument>(
         `/api/v1/documents/${id}/render?target=web`,
       );
+      if (sequence !== renderSequence || state.selectedId !== id) {
+        return;
+      }
+      setMissingReader(false);
       readerContent.innerHTML = rendered.content;
       renderDocumentOutline();
       if (window.mermaid) {
@@ -512,21 +642,36 @@ async function boot(): Promise<void> {
           nodes: Array.from(readerContent.querySelectorAll(".mermaid")),
         });
       }
-      const fragmentId = documentFragmentId(location.hash);
-      if (fragmentId !== undefined) {
+      if (sequence !== renderSequence || state.selectedId !== id) {
+        return;
+      }
+      if (headingPosition) {
+        restoreHeadingPosition(headingPosition);
+      } else if (options.markOpened) {
+        const fragmentId = documentFragmentId(location.hash);
         Array.from(readerContent.querySelectorAll<HTMLElement>("[id]"))
           .find(({ id: candidate }) => candidate === fragmentId)
           ?.scrollIntoView({ block: "start" });
+      }
+      renderedRevision = rendered.document.revision;
+      if (!options.markOpened) {
+        return;
       }
       const updated = await api<WebDocument>(
         `/api/v1/documents/${id}/opened`,
         { method: "POST" },
       );
+      if (sequence !== renderSequence || state.selectedId !== id) {
+        return;
+      }
       replaceDocument(updated);
-      if (pushHistory) {
+      if (options.pushHistory) {
         history.pushState({ documentId: id }, "", updated.route);
       }
     } catch (error) {
+      if (sequence !== renderSequence || state.selectedId !== id) {
+        return;
+      }
       if (error instanceof WebApiError && error.code === "source_missing") {
         try {
           const [documents, reviewRequests] = await Promise.all([
@@ -543,15 +688,42 @@ async function boot(): Promise<void> {
           state.documents.find((item) => item.id === id) ?? selected;
         if (missing) {
           showMissingSource(missing);
-          if (pushHistory) {
+          renderedRevision = missing.revision;
+          if (options.pushHistory) {
             history.pushState({ documentId: id }, "", missing.route);
           }
           return;
         }
       }
-      readerContent.textContent =
-        error instanceof Error ? error.message : "Could not render document";
+      if (options.markOpened) {
+        readerContent.textContent =
+          error instanceof Error ? error.message : "Could not render document";
+      }
     }
+  }
+
+  async function openDocument(id: string, pushHistory = true): Promise<void> {
+    state.selectedId = id;
+    queuePanel.setAttribute("hidden", "");
+    reader.removeAttribute("hidden");
+    readerToc.setAttribute("hidden", "");
+    readerTocList.replaceChildren();
+    setMissingReader(false);
+    await renderSelectedDocument(id, {
+      markOpened: true,
+      preserveHeading: false,
+      pushHistory,
+      showLoading: true,
+    });
+  }
+
+  async function refreshOpenDocument(id: string): Promise<void> {
+    await renderSelectedDocument(id, {
+      markOpened: false,
+      preserveHeading: true,
+      pushHistory: false,
+      showLoading: false,
+    });
   }
 
   function renderReviewPanel(documentId: string): void {
@@ -656,6 +828,8 @@ async function boot(): Promise<void> {
   }
 
   function closeReader(pushHistory = true): void {
+    renderSequence += 1;
+    renderedRevision = undefined;
     state.selectedId = undefined;
     reader.setAttribute("hidden", "");
     readerToc.setAttribute("hidden", "");
@@ -780,7 +954,25 @@ async function boot(): Promise<void> {
     live.textContent = "● live";
     live.classList.remove("offline");
   });
-  events.addEventListener("catalog", () => void load(false));
+  events.addEventListener("catalog", (event) => {
+    const liveSourceEvent = parseLiveSourceCatalogEvent(
+      (event as MessageEvent<string>).data,
+    );
+    catalogRefresh = catalogRefresh
+      .then(async () => {
+        await load(false);
+        if (
+          shouldRefreshWebReader(
+            liveSourceEvent,
+            state.selectedId,
+            renderedRevision,
+          ) && state.selectedId
+        ) {
+          await refreshOpenDocument(state.selectedId);
+        }
+      })
+      .catch(() => undefined);
+  });
   events.addEventListener("error", () => {
     live.textContent = "○ reconnecting";
     live.classList.add("offline");

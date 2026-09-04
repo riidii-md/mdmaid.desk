@@ -149,6 +149,18 @@ export interface DocumentMedia {
   name: string;
 }
 
+export type ReferenceDocumentReconciliationAction =
+  | "unchanged"
+  | "source-changed"
+  | "source-missing"
+  | "source-restored";
+
+export interface ReferenceDocumentReconciliation {
+  action: ReferenceDocumentReconciliationAction;
+  content: string | null;
+  document: Document;
+}
+
 interface InspectedDocument {
   path: string;
   contentHash: string;
@@ -194,6 +206,10 @@ export class Catalog {
   readonly #storage: CatalogStorage;
   readonly #maxDocumentBytes: number;
   readonly #managedRoot: string;
+  readonly #referenceReconciliations = new Map<
+    string,
+    Promise<ReferenceDocumentReconciliation>
+  >();
 
   private constructor(
     storage: CatalogStorage,
@@ -493,6 +509,16 @@ export class Catalog {
     if (!stored) {
       throw new Error(`unknown document ${id}`);
     }
+    if (stored.storage === "reference") {
+      const reconciled = await this.reconcileReferenceDocument(id);
+      if (reconciled.document.missingAt !== null || reconciled.content === null) {
+        throw new DocumentSourceMissingError(reconciled.document);
+      }
+      return {
+        content: reconciled.content,
+        document: reconciled.document,
+      };
+    }
     let inspected: InspectedDocument;
     try {
       inspected = await this.#inspectStoredDocument(stored);
@@ -513,6 +539,128 @@ export class Catalog {
       content: inspected.content.toString("utf8"),
       document,
     };
+  }
+
+  async reconcileReferenceDocument(
+    id: string,
+  ): Promise<ReferenceDocumentReconciliation> {
+    validateDocumentId(id);
+    const previous = this.#referenceReconciliations.get(id);
+    const operation = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.#reconcileReferenceDocument(id));
+    this.#referenceReconciliations.set(id, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.#referenceReconciliations.get(id) === operation) {
+        this.#referenceReconciliations.delete(id);
+      }
+    }
+  }
+
+  async #reconcileReferenceDocument(
+    id: string,
+  ): Promise<ReferenceDocumentReconciliation> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const initial = this.#storage.getDocument(id);
+      if (!initial) {
+        throw new Error(`unknown document ${id}`);
+      }
+      if (initial.storage !== "reference") {
+        throw new Error("managed document is not a live reference");
+      }
+      const workspace = this.#storage.getWorkspace(initial.workspaceId);
+      if (!workspace) {
+        throw new Error(`unknown workspace ${initial.workspaceId}`);
+      }
+
+      let inspected: InspectedDocument;
+      try {
+        inspected = await inspectMarkdownDocument(
+          initial.path,
+          workspace,
+          this.#maxDocumentBytes,
+        );
+      } catch (error) {
+        if (
+          isNodeError(error) &&
+          (error.code === "ENOENT" || error.code === "ENOTDIR")
+        ) {
+          const missing = this.#storage.transaction(() => {
+            const current = this.#storage.getDocument(id);
+            if (!current || !sameReconciliationVersion(current, initial)) {
+              return undefined;
+            }
+            if (current.missingAt !== null) {
+              return {
+                action: "unchanged" as const,
+                content: null,
+                document: presentDocument(current),
+              };
+            }
+            const now = new Date().toISOString();
+            const updated: StoredDocument = {
+              ...current,
+              missingAt: now,
+              updatedAt: now,
+            };
+            this.#storage.saveDocument(updated);
+            return {
+              action: "source-missing" as const,
+              content: null,
+              document: presentDocument(updated),
+            };
+          });
+          if (missing) {
+            return missing;
+          }
+          continue;
+        }
+        throw error;
+      }
+
+      const sourceLinks = await discoverDocumentSourceLinks({
+        content: inspected.content,
+        documentId: initial.id,
+        documentPath: inspected.path,
+        workspaceRoot: workspace.root,
+      });
+      const reconciled = this.#storage.transaction(() => {
+        const current = this.#storage.getDocument(id);
+        if (!current || !sameReconciliationVersion(current, initial)) {
+          return undefined;
+        }
+        const content = inspected.content.toString("utf8");
+        const contentChanged = current.contentHash !== inspected.contentHash;
+        const restored = current.missingAt !== null;
+        if (!contentChanged && !restored) {
+          return {
+            action: "unchanged" as const,
+            content,
+            document: presentDocument(current),
+          };
+        }
+        const updated: StoredDocument = {
+          ...current,
+          sourceLinks,
+          contentHash: inspected.contentHash,
+          revision: current.revision + (contentChanged ? 1 : 0),
+          missingAt: null,
+          updatedAt: new Date().toISOString(),
+        };
+        this.#storage.saveDocument(updated);
+        return {
+          action: restored ? "source-restored" as const : "source-changed" as const,
+          content,
+          document: presentDocument(updated),
+        };
+      });
+      if (reconciled) {
+        return reconciled;
+      }
+    }
+    throw new Error("document changed during reconciliation");
   }
 
   async readDocumentSource(
@@ -1262,6 +1410,22 @@ function normalizeTags(tags: string[]): string[] {
     return value;
   });
   return [...new Set(normalized)].sort();
+}
+
+function sameReconciliationVersion(
+  current: StoredDocument,
+  initial: StoredDocument,
+): boolean {
+  return (
+    current.id === initial.id &&
+    current.workspaceId === initial.workspaceId &&
+    current.storage === initial.storage &&
+    current.path === initial.path &&
+    current.contentHash === initial.contentHash &&
+    current.revision === initial.revision &&
+    current.missingAt === initial.missingAt &&
+    current.updatedAt === initial.updatedAt
+  );
 }
 
 async function inspectMarkdownDocument(

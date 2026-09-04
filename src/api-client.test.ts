@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -10,6 +10,7 @@ import {
   type CatalogEvent,
 } from "./api-client.js";
 import { Catalog } from "./catalog.js";
+import { startLiveSourceCoordinator } from "./live-sources.js";
 import { startDeskServer } from "./server.js";
 
 test("uses the versioned daemon API for terminal client operations", async () => {
@@ -138,6 +139,94 @@ test("preserves typed source-missing errors for client recovery", async () => {
     await server.close();
     catalog.close();
   }
+});
+
+test("receives validated path-free live source events with revisions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-live-source-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "live.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Original\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  let emitChange: ((filename: string | Buffer | null) => void) | undefined;
+  let watchClosed = false;
+  const server = await startDeskServer(
+    {
+      catalog,
+      host: "127.0.0.1",
+      port: 0,
+      token: "live-source-token",
+    },
+    {
+      startLiveSources: (sourceCatalog, options) =>
+        startLiveSourceCoordinator(sourceCatalog, {
+          ...options,
+          debounceMs: 0,
+          watchDirectory: (_directory, listener) => {
+            emitChange = listener;
+            const watcher = {
+              close: () => {
+                watchClosed = true;
+              },
+              on: (_event: "error", _listener: (error?: unknown) => void) => watcher,
+            };
+            return watcher;
+          },
+        }),
+    },
+  );
+
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    const document = await client.registerDocument({
+      workspaceId: "example",
+      kind: "brief",
+      title: "Live source",
+      path: documentPath,
+      attention: "none",
+    });
+    assert.ok(emitChange);
+    const controller = new AbortController();
+    let ready!: () => void;
+    let received!: (value: CatalogEvent) => void;
+    const readyEvent = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const sourceEvent = new Promise<CatalogEvent>((resolve) => {
+      received = resolve;
+    });
+    const subscription = client.subscribeCatalog(received, {
+      signal: controller.signal,
+      onReady: ready,
+    });
+    await readyEvent;
+
+    await writeFile(documentPath, "# Changed\n", "utf8");
+    assert.ok(emitChange);
+    emitChange(basename(documentPath));
+    assert.deepEqual(await sourceEvent, {
+      action: "source-changed",
+      documentId: document.id,
+      revision: 2,
+    });
+    assert.equal(catalog.getDocument(document.id)?.revision, 2);
+    controller.abort();
+    await subscription;
+    await client.act(document.id, "archive");
+    assert.equal(watchClosed, true);
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+  assert.equal(watchClosed, true);
 });
 
 test("validates review requests and receives their live events", async () => {
