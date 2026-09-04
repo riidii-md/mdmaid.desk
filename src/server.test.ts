@@ -368,6 +368,119 @@ test("serves authenticated local source links without exposing filesystem paths"
   }
 });
 
+test("renders and serves authenticated workspace-local SVG media", async () => {
+  const value = await fixture();
+  const documentPath = join(value.workspace, "explanation.md");
+  const mediaPath = join(value.workspace, "change-flow.svg");
+  const svg = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10">',
+    "<style>circle{fill:#3fb950}</style>",
+    '<circle r="2"><animateMotion path="M2 5 L18 5" dur="1s" repeatCount="indefinite"/></circle>',
+    "</svg>",
+    "",
+  ].join("\n");
+  await writeFile(mediaPath, svg, "utf8");
+  await writeFile(
+    documentPath,
+    "# Change explanation\n\n![Animated request flow](change-flow.svg)\n",
+    "utf8",
+  );
+  const document = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "showcase",
+    title: "Change explanation",
+    path: documentPath,
+    attention: "review",
+  });
+  const media = document.sourceLinks.find(({ href }) => href === "change-flow.svg");
+  assert.ok(media);
+  const route = `/d/${document.id}/media/${media.id}`;
+
+  try {
+    const rendered = await authorized(
+      value,
+      `/api/v1/documents/${document.id}/render?target=web`,
+    );
+    assert.equal(rendered.status, 200);
+    const body = (await rendered.json()) as { data: { content: string } };
+    assert.match(
+      body.data.content,
+      new RegExp(`<img src="${route}" alt="Animated request flow"`),
+    );
+    assert.doesNotMatch(body.data.content, /src="change-flow\.svg"/);
+    assert.doesNotMatch(body.data.content, new RegExp(value.root));
+
+    const unauthorized = await fetch(new URL(route, value.server.url));
+    assert.equal(unauthorized.status, 401);
+
+    const response = await authorized(value, route);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "image/svg+xml");
+    const mediaPolicy = response.headers.get("content-security-policy") ?? "";
+    assert.match(mediaPolicy, /sandbox/);
+    assert.match(mediaPolicy, /default-src 'none'/);
+    assert.match(mediaPolicy, /script-src 'none'/);
+    assert.match(mediaPolicy, /style-src 'unsafe-inline'/);
+    assert.equal(response.headers.get("cross-origin-resource-policy"), "same-origin");
+    assert.equal(await response.text(), svg);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("refuses non-SVG files through document media routes", async () => {
+  const value = await fixture();
+  const sourceLink = value.document.sourceLinks[0]!;
+  try {
+    const response = await authorized(
+      value,
+      `/d/${value.document.id}/media/${sourceLink.id}`,
+    );
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: "linked_source_unavailable",
+        message: "Linked source is unavailable",
+      },
+    });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("refuses malformed files carrying an SVG extension", async () => {
+  const value = await fixture();
+  const documentPath = join(value.workspace, "malformed-media.md");
+  const mediaPath = join(value.workspace, "not-really.svg");
+  await writeFile(mediaPath, "<html><script>alert(1)</script></html>\n", "utf8");
+  await writeFile(documentPath, "![Malformed](not-really.svg)\n", "utf8");
+  const document = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "showcase",
+    title: "Malformed media",
+    path: documentPath,
+    attention: "review",
+  });
+  const media = document.sourceLinks.find(({ href }) => href === "not-really.svg");
+  assert.ok(media);
+
+  try {
+    const response = await authorized(
+      value,
+      `/d/${document.id}/media/${media.id}`,
+    );
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: "linked_source_unavailable",
+        message: "Linked source is unavailable",
+      },
+    });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("reports missing sources safely while keeping their records archivable", async () => {
   const value = await fixture();
   await rm(join(value.workspace, "plan.md"));

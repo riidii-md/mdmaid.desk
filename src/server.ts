@@ -267,6 +267,22 @@ async function handleRequest(
     return;
   }
 
+  const mediaMatch = url.pathname.match(
+    /^\/d\/(doc-[a-f0-9]{20})\/media\/(source-[a-f0-9]{20})$/,
+  );
+  if (request.method === "GET" && mediaMatch) {
+    try {
+      const media = await catalog.readDocumentMedia(
+        mediaMatch[1] ?? "",
+        mediaMatch[2] ?? "",
+      );
+      sendDocumentMedia(response, media.contentType, media.content);
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
   if (
     request.method === "GET" &&
     (url.pathname === "/" ||
@@ -933,6 +949,20 @@ function sanitizeRenderedHtml(
             : attribs,
         };
       },
+      img: (tagName, attribs) => {
+        const media = attribs.src
+          ? sourceLinks.get(attribs.src)
+          : undefined;
+        return {
+          tagName,
+          attribs: media
+            ? {
+                ...attribs,
+                src: documentMediaRoute(document.id, media),
+              }
+            : attribs,
+        };
+      },
     },
   });
 }
@@ -949,6 +979,13 @@ function documentSourceRoute(
 ): string {
   const line = link.href.match(/#(L[1-9][0-9]*)$/)?.[1];
   return `/d/${documentId}/source/${link.id}${line ? `#${line}` : ""}`;
+}
+
+function documentMediaRoute(
+  documentId: string,
+  link: Document["sourceLinks"][number],
+): string {
+  return `/d/${documentId}/media/${link.id}`;
 }
 
 function sourceViewerHtml(
@@ -1175,6 +1212,22 @@ function sendAsset(
   response.statusCode = 200;
   response.setHeader("content-type", contentType);
   response.setHeader("cache-control", "private, max-age=300");
+  response.end(body);
+}
+
+function sendDocumentMedia(
+  response: ServerResponse,
+  contentType: "image/svg+xml",
+  body: Buffer,
+): void {
+  response.statusCode = 200;
+  response.setHeader("content-type", contentType);
+  response.setHeader("cache-control", "private, no-cache");
+  response.setHeader("cross-origin-resource-policy", "same-origin");
+  response.setHeader(
+    "content-security-policy",
+    "sandbox; default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'",
+  );
   response.end(body);
 }
 

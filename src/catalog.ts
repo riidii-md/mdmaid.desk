@@ -142,6 +142,13 @@ export interface DocumentSource {
   name: string;
 }
 
+export interface DocumentMedia {
+  content: Buffer;
+  contentType: "image/svg+xml";
+  document: Document;
+  name: string;
+}
+
 interface InspectedDocument {
   path: string;
   contentHash: string;
@@ -550,6 +557,40 @@ export class Catalog {
       content,
       document: presentDocument(stored),
       name: basename(source.path),
+    };
+  }
+
+  async readDocumentMedia(
+    documentId: string,
+    sourceLinkId: string,
+  ): Promise<DocumentMedia> {
+    validateDocumentId(documentId);
+    validateSourceLinkId(sourceLinkId);
+    const stored = this.#storage.getDocument(documentId);
+    const sourceLink = stored?.sourceLinks.find(({ id }) => id === sourceLinkId);
+    if (!stored || !sourceLink) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
+    const workspace = this.#storage.getWorkspace(stored.workspaceId);
+    if (!workspace) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
+    const media = await inspectLinkedSource(
+      sourceLink,
+      workspace,
+      this.#maxDocumentBytes,
+    );
+    if (extname(media.path).toLowerCase() !== ".svg") {
+      throw new LinkedSourceUnavailableError(
+        "linked document media must be an SVG file",
+      );
+    }
+    assertSvgDocument(media.content);
+    return {
+      content: media.content,
+      contentType: "image/svg+xml",
+      document: presentDocument(stored),
+      name: basename(media.path),
     };
   }
 
@@ -1377,6 +1418,25 @@ async function inspectLinkedSource(
     }
     throw new LinkedSourceUnavailableError(
       error instanceof Error ? error.message : undefined,
+    );
+  }
+}
+
+function assertSvgDocument(content: Buffer): void {
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    throw new LinkedSourceUnavailableError(
+      "linked document media must contain UTF-8 SVG",
+    );
+  }
+  if (
+    !/^\s*(?:<\?xml[^>]*>\s*)?<svg(?:\s|>)/i.test(source) ||
+    !/<\/svg>\s*$/i.test(source)
+  ) {
+    throw new LinkedSourceUnavailableError(
+      "linked document media must contain a complete SVG document",
     );
   }
 }

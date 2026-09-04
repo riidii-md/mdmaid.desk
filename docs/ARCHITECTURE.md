@@ -80,14 +80,24 @@ explanation. Request and response text are plain text and are never interpreted
 as HTML, terminal control data, callback configuration, or executable commands.
 
 Registration and import parse Markdown links on every ingress. Relative local
-links are resolved from the original Markdown path, authorized against the
-canonical workspace root, and persisted only as workspace-relative paths.
+links and image references are resolved from the original Markdown path,
+authorized against the canonical workspace root, and persisted only as
+workspace-relative paths.
 Rendered web links use opaque, document-scoped identifiers under
 `/d/:document/source/:source`. The authenticated source viewer repeats
 realpath, regular-file, symlink, size, and UTF-8 checks on every read. It does
 not expose absolute paths. External HTTP(S) and mail links bypass this mapping
 unchanged. Linked sources are live references; managed import snapshots only
 the Markdown document, not its linked repository files.
+
+Registered local SVG images use the same opaque source identities under
+`/d/:document/media/:source`. Rendering rewrites only a Markdown image whose
+source exactly matches a registered workspace-local link. Media reads repeat
+the containment, symlink, regular-file, and size checks, require a complete
+UTF-8 `.svg` document, and return it with `nosniff`, same-origin resource policy,
+and a media-specific sandbox content security policy that denies scripts and
+external subresources. The main document CSP continues to reject arbitrary
+local file and remote media access.
 
 The catalog is the durable product state. It does not depend on a running
 daemon: harnesses, editors, scripts, and users can register documents through
@@ -172,6 +182,8 @@ issued.
 /w/<workspace-id>
 /t/<task-id>
 /d/<document-id>
+/d/<document-id>/source/<source-id>
+/d/<document-id>/media/<source-id>
 ```
 
 Each document route is independent. There is no server-global active document.
