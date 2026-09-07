@@ -74,6 +74,18 @@ const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
   "rejected",
 ]);
 
+const registerUsage = `Usage:
+  mdmaid-desk register <file.md> --workspace <id>
+      [--live] [--task <id>] [--producer <name>] [--kind <kind>]
+      [--title <title>] [--attention <state>] [--tag <tag> ...]
+      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+
+  register keeps the authorized Markdown source as a live reference.
+  --live explicitly requests this default live-reference behavior.
+  A running web service or daemon watches it and refreshes open Web and TUI
+  readers after saved changes. Use import for a managed snapshot instead.
+`;
+
 const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 
 Usage:
@@ -82,7 +94,7 @@ Usage:
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
   mdmaid-desk register <file.md> --workspace <id>
-      [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--live] [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision] [--request-message <text>] [--wait] [--json]
   mdmaid-desk import <file.md> --workspace <id>
@@ -104,6 +116,10 @@ Usage:
   mdmaid-desk daemon stop
   mdmaid-desk daemon install [--port <port>]
   mdmaid-desk daemon uninstall
+
+Document sources:
+  register keeps an authorized source as a live reference; --live explicitly
+  requests that default behavior. import creates a managed snapshot instead.
 `;
 
 interface Writer {
@@ -157,6 +173,15 @@ export async function run(
       (args[0] === "version" || args[0] === "--version" || args[0] === "-V")
     ) {
       stdout.write(`${readPackageVersion()}\n`);
+      return 0;
+    }
+
+    if (
+      args[0] === "register" &&
+      args.length === 2 &&
+      (args[1] === "help" || args[1] === "--help" || args[1] === "-h")
+    ) {
+      stdout.write(registerUsage);
       return 0;
     }
 
@@ -531,7 +556,7 @@ async function runRegister(
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
-  const parsed = parseArguments(args, new Set(["wait", "json"]));
+  const parsed = parseArguments(args, new Set(["live", "wait", "json"]));
   const path = parsed.positionals[0];
   if (!path) {
     throw new UsageError("document path is required");
@@ -551,6 +576,7 @@ async function runRegister(
       "tag",
       "expect",
       "request-message",
+      "live",
       "wait",
       "json",
     ]),
@@ -570,6 +596,8 @@ async function runRegister(
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
   const review = parseReviewPublicationOptions(parsed);
+  // `register` is always a live reference. The flag is accepted so callers can
+  // state and discover that intent without changing the API payload.
   const input: RegisterDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
