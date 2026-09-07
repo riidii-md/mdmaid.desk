@@ -40,8 +40,8 @@ The repository contains the first usable shared-service vertical slice:
 - `workspace`, `register`, `import`, `review`, `list`, `web`, `tui`, and `daemon`
   commands.
 
-Directory watching, stdin import, comments, and editing remain planned
-milestones. Document registration works without a daemon, but automatically
+Stdin import, comments, and editing remain planned milestones. Document
+registration works without a daemon, but automatically
 uses its authenticated API when one is running. `web` reuses a daemon or runs
 the service in the foreground; `tui` attaches to it when present and uses a
 session-scoped embedded loopback service otherwise.
@@ -129,6 +129,7 @@ Register a document:
 ```bash
 node dist/cli.js register /path/to/repository/docs/plan.md \
   --workspace example \
+  --live \
   --task PROJECT-123 \
   --producer codex \
   --kind plan \
@@ -182,7 +183,9 @@ mdmaid-desk import /path/to/worktree/.agent-runs/readability/adapted.md \
 ```
 
 `register` keeps the document at its authorized workspace path and continues
-to reflect later file changes. `import` is explicit: it accepts a regular,
+to reflect later file changes. Live-reference behavior is already the default;
+`--live` is an optional explicit intent/capability marker for humans and
+automation. `import` is explicit: it accepts a regular,
 non-symlink Markdown file from any local path, makes a private durable snapshot,
 and queues that snapshot under the selected workspace. Removing the original
 file does not remove the imported copy.
