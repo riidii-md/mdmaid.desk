@@ -277,6 +277,135 @@ test("replaces source-link mappings when a document is registered again", async 
   catalog.close();
 });
 
+test("reconciles changed reference content, progress, links, and reviews on read", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "live.md");
+  const firstSource = join(workspace, "first.ts");
+  const secondSource = join(workspace, "second.ts");
+  await writeFile(firstSource, "export const first = true;\n", "utf8");
+  await writeFile(secondSource, "export const second = true;\n", "utf8");
+  await writeFile(documentPath, "# First\n\n[first](../first.ts)\n", "utf8");
+
+  const registered = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Live document",
+    path: documentPath,
+    attention: "review",
+  });
+  await catalog.markDocumentOpened(registered.id);
+  await catalog.markDocumentRead(registered.id);
+  const review = await catalog.createReviewRequest({
+    documentId: registered.id,
+    kind: "plan-decision",
+    requestMessage: "Review this exact source.",
+  });
+
+  await writeFile(
+    documentPath,
+    "# Second\n\n[second](../second.ts)\n",
+    "utf8",
+  );
+  const read = await catalog.readDocument(registered.id);
+
+  assert.equal(read.content, "# Second\n\n[second](../second.ts)\n");
+  assert.equal(read.document.revision, 2);
+  assert.equal(read.document.status, "unread");
+  assert.equal(read.document.openedRevision, 1);
+  assert.equal(read.document.completedRevision, 1);
+  assert.deepEqual(
+    read.document.sourceLinks.map(({ href }) => href),
+    ["../second.ts"],
+  );
+  assert.equal(catalog.getReviewRequest(review.id)?.status, "stale");
+
+  const repeated = await catalog.readDocument(registered.id);
+  assert.equal(repeated.document.revision, 2);
+  catalog.close();
+});
+
+test("reports distinct reference reconciliation transitions without duplicate revisions", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "transitions.md");
+  await writeFile(documentPath, "# Original\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Transitions",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const unchanged = await catalog.reconcileReferenceDocument(document.id);
+  assert.equal(unchanged.action, "unchanged");
+  assert.equal(unchanged.document.revision, 1);
+
+  await rm(documentPath);
+  const missing = await catalog.reconcileReferenceDocument(document.id);
+  assert.equal(missing.action, "source-missing");
+  assert.equal(missing.document.revision, 1);
+  assert.notEqual(missing.document.missingAt, null);
+  assert.equal(
+    (await catalog.reconcileReferenceDocument(document.id)).action,
+    "unchanged",
+  );
+
+  await writeFile(documentPath, "# Original\n", "utf8");
+  const restored = await catalog.reconcileReferenceDocument(document.id);
+  assert.equal(restored.action, "source-restored");
+  assert.equal(restored.document.revision, 1);
+  assert.equal(restored.document.missingAt, null);
+
+  await writeFile(documentPath, "# Changed\n", "utf8");
+  const concurrent = await Promise.all([
+    catalog.reconcileReferenceDocument(document.id),
+    catalog.reconcileReferenceDocument(document.id),
+  ]);
+  assert.deepEqual(
+    concurrent.map(({ action }) => action),
+    ["source-changed", "unchanged"],
+  );
+  assert.equal(catalog.getDocument(document.id)?.revision, 2);
+  catalog.close();
+});
+
+test("reconciliation rejects managed documents and unsafe source replacements", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "safe.md");
+  const outsidePath = join(workspace, "..", "outside-live.md");
+  await writeFile(documentPath, "# Safe\n", "utf8");
+  await writeFile(outsidePath, "# Outside\n", "utf8");
+  const reference = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Safe",
+    path: documentPath,
+    attention: "none",
+  });
+  const managed = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Snapshot",
+    path: outsidePath,
+    attention: "none",
+  });
+
+  await assert.rejects(
+    catalog.reconcileReferenceDocument(managed.id),
+    /managed document is not a live reference/,
+  );
+
+  await rm(documentPath);
+  await symlink(outsidePath, documentPath);
+  await assert.rejects(
+    catalog.reconcileReferenceDocument(reference.id),
+    /document path must not be a symlink/,
+  );
+  assert.equal(catalog.getDocument(reference.id)?.revision, 1);
+  assert.equal(catalog.getDocument(reference.id)?.missingAt, null);
+  catalog.close();
+});
+
 test("rejects local source links that escape the workspace or use symlinks", async () => {
   const { catalog, workspace } = await fixture();
   const outside = join(workspace, "..", "outside-secret.cs");

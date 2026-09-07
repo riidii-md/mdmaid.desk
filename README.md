@@ -187,6 +187,19 @@ non-symlink Markdown file from any local path, makes a private durable snapshot,
 and queues that snapshot under the selected workspace. Removing the original
 file does not remove the imported copy.
 
+Every registered-source render re-authorizes the real path and reconciles its
+content hash, revision, reading state, review state, and local-link mappings.
+When a foreground web service or daemon is running, mdmaid.desk also watches
+the parent directories of active registered sources. A committed source
+change, disappearance, or restoration publishes a document-scoped event: an
+open matching Web or TUI reader rerenders automatically, while unrelated
+readers only refresh queue metadata. The interfaces label registered documents
+as `live source` and imports as `snapshot`.
+
+Without a running service, registration and rendering still work and a manual
+render reconciles current source state. Automatic push refresh is
+daemon-dependent.
+
 During either operation, Markdown links such as
 `../../Backend/Feature.cs#L124` are resolved relative to the original Markdown
 file. Targets under the registered workspace are stored as private,
@@ -197,7 +210,10 @@ targets use the authenticated source viewer. External `http`, `https`, and
 Linked source files remain live references rather than snapshots: each read
 rechecks the workspace boundary, file type, size, and symlink policy. Re-run
 `register` or `import` after upgrading an existing catalog to populate mappings
-for documents that were already queued.
+for documents that were already queued. The primary Markdown watcher does not
+watch linked files; changing a linked source is visible on its next request but
+does not itself refresh an open document. Local media remains limited to
+validated SVG documents.
 
 List documents:
 

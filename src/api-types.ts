@@ -38,6 +38,12 @@ export interface PublicDocument {
   route: string;
 }
 
+export function documentStorageLabel(
+  storage: PublicDocument["storage"],
+): "live source" | "snapshot" {
+  return storage === "reference" ? "live source" : "snapshot";
+}
+
 export interface PublicWorkspace {
   id: string;
   name: string;

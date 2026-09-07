@@ -34,6 +34,21 @@ node dist/cli.js web --port 43128
 The public origin then becomes
 `http://mdmaid.desk.localhost:43128/` automatically.
 
+## Live source refresh
+
+Registered documents are shown as `live source`; imported durable copies are
+shown as `snapshot`. While this service is running, mdmaid.desk watches only
+the parent directories needed by active registered Markdown sources. Editing,
+atomically replacing, removing, or restoring a registered source reconciles
+its revision and refreshes an open matching Web or TUI reader. Web refresh
+preserves the nearest available heading and reruns Mermaid without adding a
+history entry or marking the revision opened again.
+
+Linked text files and validated SVG media are re-read and re-authorized on each
+request but are not watched. Without this service, opening or rendering a
+registered document still reconciles its current source; there is simply no
+automatic push event.
+
 ## Security boundary
 
 - the application server refuses non-loopback bind addresses;

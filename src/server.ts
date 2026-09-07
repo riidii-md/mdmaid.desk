@@ -33,6 +33,11 @@ import type {
   ReviewRequestRegistration,
   ReviewRequestResponse,
 } from "./api-types.js";
+import {
+  startLiveSourceCoordinator,
+  type LiveSourceCoordinator,
+  type LiveSourceCoordinatorOptions,
+} from "./live-sources.js";
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -63,6 +68,10 @@ export interface DeskServerOptions {
 
 export interface DeskServerDependencies {
   readWebClient?: (() => Promise<Buffer>) | undefined;
+  startLiveSources?: (
+    catalog: Catalog,
+    options: LiveSourceCoordinatorOptions,
+  ) => LiveSourceCoordinator;
 }
 
 export interface RunningDeskServer {
@@ -149,6 +158,7 @@ export async function startDeskServer(
   const webClient = await (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))();
 
   const events = new EventHub();
+  let liveSources: LiveSourceCoordinator | undefined;
   const server = createServer((request, response) => {
     void handleRequest(
       request,
@@ -160,6 +170,7 @@ export async function startDeskServer(
       publicOrigin,
       securePublicOrigin,
       webClient,
+      liveSources,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
@@ -176,6 +187,18 @@ export async function startDeskServer(
   });
 
   await listen(server, host, port);
+  try {
+    liveSources = (dependencies.startLiveSources ?? startLiveSourceCoordinator)(
+      options.catalog,
+      {
+        onEvent: (event) => events.publish("catalog", event),
+      },
+    );
+  } catch (error) {
+    events.close();
+    await closeServer(server);
+    throw error;
+  }
   const address = server.address() as AddressInfo;
   const urlHost = address.address.includes(":")
     ? `[${address.address}]`
@@ -188,6 +211,7 @@ export async function startDeskServer(
     url,
     webUrl: `${publicOrigin ?? url}/?token=${encodeURIComponent(token)}`,
     close: async () => {
+      await liveSources?.close();
       events.close();
       await closeServer(server);
     },
@@ -204,6 +228,7 @@ async function handleRequest(
   publicOrigin: string | undefined,
   securePublicOrigin: boolean,
   webClient: Buffer,
+  liveSources: LiveSourceCoordinator | undefined,
 ): Promise<void> {
   applySecurityHeaders(response, securePublicOrigin);
   const baseUrl =
@@ -367,6 +392,7 @@ async function handleRequest(
     }
     try {
       const document = await catalog.registerDocument(body);
+      liveSources?.refresh();
       response.setHeader("location", `/api/v1/documents/${document.id}`);
       sendJson(response, 201, { data: publicDocument(document) });
       events.publish("catalog", { action: "registered", documentId: document.id });
@@ -582,6 +608,9 @@ async function handleRequest(
     }
     try {
       const document = await operation();
+      if (action === "archive" || action === "restore") {
+        liveSources?.refresh();
+      }
       sendJson(response, 200, { data: publicDocument(document) });
       events.publish("catalog", {
         action,

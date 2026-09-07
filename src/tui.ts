@@ -4,14 +4,19 @@ import { Chalk, type ChalkInstance } from "chalk";
 import sliceAnsi from "slice-ansi";
 import stringWidth from "string-width";
 
-import { DeskApiError, type DeskApiClient } from "./api-client.js";
-import type {
-  DocumentAction,
-  PublicDocument,
-  PublicReviewRequest,
-  PublicWorkspace,
-  ReadingStatus,
-  ReviewOutcome,
+import {
+  DeskApiError,
+  type CatalogEvent,
+  type DeskApiClient,
+} from "./api-client.js";
+import {
+  documentStorageLabel,
+  type DocumentAction,
+  type PublicDocument,
+  type PublicReviewRequest,
+  type PublicWorkspace,
+  type ReadingStatus,
+  type ReviewOutcome,
 } from "./api-types.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 
@@ -139,6 +144,24 @@ export function applyTuiMissingReader(
     ].join("\n"),
     "unavailable",
     [],
+  );
+}
+
+export function shouldRefreshTuiReader(
+  event: CatalogEvent,
+  readerDocumentId: string | undefined,
+  renderedRevision: number | undefined,
+): boolean {
+  const liveSourceAction =
+    event.action === "source-changed" ||
+    event.action === "source-missing" ||
+    event.action === "source-restored";
+  return Boolean(
+    liveSourceAction &&
+      event.documentId === readerDocumentId &&
+      (event.action !== "source-changed" ||
+        renderedRevision === undefined ||
+        (event.revision !== undefined && event.revision > renderedRevision)),
   );
 }
 
@@ -340,6 +363,7 @@ export async function runTui(
   let refreshing = Promise.resolve();
   let resizeTimer: NodeJS.Timeout | undefined;
   let renderedWidth = readerRenderWidth(output.columns ?? 100);
+  let renderedRevision: number | undefined;
   let inputBuffer = "";
   let previousFrame: string[] | undefined;
 
@@ -395,6 +419,7 @@ export async function runTui(
           { color, unicode },
         );
         renderedWidth = readerRenderWidth(output.columns ?? 100);
+        renderedRevision = rendered.document.revision;
         state = applyTuiReader(
           state,
           rendered.document,
@@ -447,6 +472,7 @@ export async function runTui(
           );
           const missing = documents.find(({ id }) => id === effect.documentId);
           if (missing) {
+            renderedRevision = missing.revision;
             state = applyTuiMissingReader(state, missing);
             draw();
             return;
@@ -517,6 +543,7 @@ export async function runTui(
             { color, unicode },
           );
           renderedWidth = nextWidth;
+          renderedRevision = rendered.document.revision;
           const scroll = state.scroll;
           state = applyTuiReader(
             state,
@@ -547,9 +574,16 @@ export async function runTui(
   process.on("SIGWINCH", onResize);
   draw();
   void client
-    .subscribeCatalog(() => {
+    .subscribeCatalog((event) => {
       refreshing = refreshing
         .then(async () => {
+          const readerDocumentId = state.reader?.document.id;
+          const refreshReader = shouldRefreshTuiReader(
+            event,
+            readerDocumentId,
+            renderedRevision,
+          );
+          const scroll = state.scroll;
           const [documents, workspaces, reviewRequests] = await Promise.all([
             client.listDocuments(),
             client.listWorkspaces(),
@@ -561,6 +595,38 @@ export async function runTui(
             workspaces,
             reviewRequests,
           );
+          if (refreshReader && readerDocumentId) {
+            const document = documents.find(({ id }) => id === readerDocumentId);
+            if (document?.missingAt) {
+              renderedRevision = document.revision;
+              state = applyTuiMissingReader(state, document);
+              state = clampReaderScroll(
+                { ...state, scroll },
+                output.rows ?? 30,
+              );
+            } else if (document) {
+              const width = readerRenderWidth(output.columns ?? 100);
+              const rendered = await client.renderDocument(
+                readerDocumentId,
+                "terminal",
+                width,
+                { color, unicode },
+              );
+              renderedWidth = width;
+              renderedRevision = rendered.document.revision;
+              state = applyTuiReader(
+                state,
+                rendered.document,
+                rendered.content,
+                rendered.backend,
+                rendered.warnings,
+              );
+              state = clampReaderScroll(
+                { ...state, scroll },
+                output.rows ?? 30,
+              );
+            }
+          }
           draw();
         })
         .catch((error: unknown) => {
@@ -1358,7 +1424,7 @@ function renderDocumentCard(
   const meta = [
     document.workspaceId,
     document.kind,
-    document.storage,
+    documentStorageLabel(document.storage),
     document.taskId,
     actionRequired ? "ACTION REQUIRED" : undefined,
   ]
@@ -1397,7 +1463,7 @@ function readerLines(
     document.workspaceId,
     document.taskId,
     document.kind,
-    document.storage,
+    documentStorageLabel(document.storage),
     state.reader.backend,
   ].filter((value): value is string => Boolean(value)).join(" · ");
   const heading = spread(

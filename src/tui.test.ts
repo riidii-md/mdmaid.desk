@@ -15,6 +15,7 @@ import type {
   PublicReviewRequest,
   PublicWorkspace,
 } from "./api-types.js";
+import { documentStorageLabel } from "./api-types.js";
 import {
   applyTuiReader,
   applyTuiMissingReader,
@@ -24,6 +25,7 @@ import {
   replaceTuiDocuments,
   renderTui,
   runTui,
+  shouldRefreshTuiReader,
 } from "./tui.js";
 
 const documents: PublicDocument[] = [
@@ -151,6 +153,7 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.match(queueFrame, /STATUS/);
   assert.match(queueFrame, /Daemon plan/);
   assert.match(queueFrame, /Terminal review/);
+  assert.match(queueFrame, /live source/);
   assert.match(queueFrame, /j\/k/);
   assert.match(queueFrame, /\u001b\[38;2;143;181;175m/);
 
@@ -170,6 +173,7 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.match(readerFrame, /Daemon plan/);
   assert.match(readerFrame, /Rendered terminal document/);
   assert.match(readerFrame, /DOCUMENT READER/);
+  assert.match(readerFrame, /live source/);
   assert.match(readerFrame, /\u001b\[[0-9;]*m/);
   assert.match(readerFrame, /m.*read/);
   assert.doesNotMatch(readerFrame, / DOCUMENT /);
@@ -190,6 +194,52 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   ]);
   assert.equal(handleTuiKey(reader, "b").state.mode, "queue");
   assert.deepEqual(handleTuiKey(reader, "q").effects, [{ type: "quit" }]);
+});
+
+test("targets only new live-source revisions at the open TUI reader", () => {
+  const documentId = documents[0]!.id;
+  assert.equal(
+    shouldRefreshTuiReader(
+      { action: "source-changed", documentId, revision: 2 },
+      documentId,
+      1,
+    ),
+    true,
+  );
+  assert.equal(
+    shouldRefreshTuiReader(
+      { action: "source-changed", documentId, revision: 1 },
+      documentId,
+      1,
+    ),
+    false,
+  );
+  assert.equal(
+    shouldRefreshTuiReader(
+      { action: "source-restored", documentId, revision: 1 },
+      documentId,
+      1,
+    ),
+    true,
+  );
+  assert.equal(
+    shouldRefreshTuiReader(
+      { action: "tags", documentId },
+      documentId,
+      1,
+    ),
+    false,
+  );
+  assert.equal(
+    shouldRefreshTuiReader(
+      { action: "source-missing", documentId, revision: 1 },
+      documents[1]!.id,
+      1,
+    ),
+    false,
+  );
+  assert.equal(documentStorageLabel("reference"), "live source");
+  assert.equal(documentStorageLabel("managed"), "snapshot");
 });
 
 test("filters explicit actions and composes a review response", () => {
@@ -454,10 +504,11 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
     ) => {
       renders += 1;
       renderPreferences = preferences;
+      const renderedDocument = current.find((document) => document.id === id)!;
       return {
-        document: current.find((document) => document.id === id)!,
+        document: renderedDocument,
         target: "terminal" as const,
-        content: "# Live reader\n\nRendered by mdmaid.",
+        content: `# Live reader\n\nRendered revision ${renderedDocument.revision} by mdmaid.`,
         backend: "source",
         warnings: [],
       };
@@ -501,12 +552,38 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   const listsBeforeEvent = lists;
   onCatalog?.({ action: "tags", documentId: documents[1]!.id });
   await eventually(() => lists > listsBeforeEvent);
+  assert.equal(renders, 1);
+
+  const openedId = actions
+    .find((value) => value.startsWith("opened:"))
+    ?.slice("opened:".length);
+  assert.ok(openedId);
+  current = current.map((document) =>
+    document.id === openedId
+      ? {
+          ...document,
+          revision: document.revision + 1,
+          status: "unread" as const,
+        }
+      : document,
+  );
+  const nextRevision = current.find(({ id }) => id === openedId)!.revision;
+  onCatalog?.({
+    action: "source-changed",
+    documentId: openedId,
+    revision: nextRevision,
+  });
+  await eventually(() => renders === 2);
+  assert.equal(
+    actions.filter((value) => value === `opened:${openedId}`).length,
+    1,
+  );
   input.write("m");
   await eventually(() => actions.some((value) => value.startsWith("read:")));
   input.write("bq");
   await running;
 
-  assert.match(terminal, /Rendered by mdmaid/);
+  assert.match(terminal, /Rendered revision 2 by mdmaid/);
   assert.match(terminal, /\u001b\[\?1049h/);
   assert.match(terminal, /\u001b\[\?1049l/);
   assert.match(terminal, /\u001b\[\?1000h\u001b\[\?1006h/);

@@ -44,6 +44,7 @@ export class DeskApiError extends Error {
 export interface CatalogEvent {
   action: string;
   documentId?: string;
+  revision?: number;
   reviewRequestId?: string;
   workspaceId?: string;
 }
@@ -480,8 +481,22 @@ function dispatchEventBlock(
   } catch {
     throw new Error("Daemon returned an invalid catalog event");
   }
+  const liveSourceAction =
+    isRecord(value) &&
+    (value.action === "source-changed" ||
+      value.action === "source-missing" ||
+      value.action === "source-restored");
   if (
     !isRecord(value) ||
+    !Object.keys(value).every((key) =>
+      [
+        "action",
+        "documentId",
+        "revision",
+        "reviewRequestId",
+        "workspaceId",
+      ].includes(key),
+    ) ||
     typeof value.action !== "string" ||
     (value.documentId !== undefined &&
       (typeof value.documentId !== "string" ||
@@ -492,6 +507,13 @@ function dispatchEventBlock(
     (value.reviewRequestId !== undefined &&
       (typeof value.reviewRequestId !== "string" ||
         !/^review-[a-f0-9]{20}$/.test(value.reviewRequestId))) ||
+    (value.revision !== undefined &&
+      (typeof value.revision !== "number" ||
+        !Number.isSafeInteger(value.revision) ||
+        value.revision < 1)) ||
+    (liveSourceAction &&
+      (value.documentId === undefined || value.revision === undefined)) ||
+    (!liveSourceAction && value.revision !== undefined) ||
     (value.documentId === undefined &&
       value.workspaceId === undefined &&
       value.reviewRequestId === undefined)
@@ -503,6 +525,9 @@ function dispatchEventBlock(
     ...(value.documentId === undefined
       ? {}
       : { documentId: value.documentId as string }),
+    ...(value.revision === undefined
+      ? {}
+      : { revision: value.revision as number }),
     ...(value.workspaceId === undefined
       ? {}
       : { workspaceId: value.workspaceId as string }),

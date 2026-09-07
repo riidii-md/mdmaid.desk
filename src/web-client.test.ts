@@ -6,10 +6,14 @@ import {
   documentOutline,
   filterQueue,
   isSourceMissing,
+  nearestHeadingPosition,
+  parseLiveSourceCatalogEvent,
   pendingReviewForDocument,
   queueCounts,
   requestDocumentPrint,
   reviewResponseError,
+  shouldRefreshWebReader,
+  sourceModeLabel,
   webLoadFailure,
   visibleWorkspaces,
   type WebDocument,
@@ -194,6 +198,79 @@ test("decodes document fragments after asynchronous rendering", () => {
   assert.equal(documentFragmentId(""), undefined);
   assert.equal(documentFragmentId("#"), undefined);
   assert.equal(documentFragmentId("#invalid%2"), undefined);
+});
+
+test("validates targeted live-source refresh events", () => {
+  const selectedId = documents[0]!.id;
+  const changed = parseLiveSourceCatalogEvent(JSON.stringify({
+    action: "source-changed",
+    documentId: selectedId,
+    revision: 2,
+  }));
+  assert.deepEqual(changed, {
+    action: "source-changed",
+    documentId: selectedId,
+    revision: 2,
+  });
+  assert.equal(shouldRefreshWebReader(changed, selectedId, 1), true);
+  assert.equal(shouldRefreshWebReader(changed, selectedId, 2), false);
+  assert.equal(
+    shouldRefreshWebReader(changed, documents[1]!.id, 1),
+    false,
+  );
+  assert.equal(
+    shouldRefreshWebReader(
+      { ...changed, action: "source-missing", revision: 1 },
+      selectedId,
+      1,
+    ),
+    true,
+  );
+  assert.equal(parseLiveSourceCatalogEvent("not json"), undefined);
+  assert.equal(
+    parseLiveSourceCatalogEvent(JSON.stringify({
+      action: "source-changed",
+      documentId: selectedId,
+      revision: 0,
+    })),
+    undefined,
+  );
+  assert.equal(
+    parseLiveSourceCatalogEvent(JSON.stringify({
+      action: "source-changed",
+      documentId: selectedId,
+      revision: 2,
+      path: "/private/source.md",
+    })),
+    undefined,
+  );
+  assert.equal(
+    parseLiveSourceCatalogEvent(JSON.stringify({
+      action: "tags",
+      documentId: selectedId,
+    })),
+    undefined,
+  );
+});
+
+test("selects the nearest heading for live reader position restoration", () => {
+  assert.deepEqual(
+    nearestHeadingPosition([
+      { id: "overview", top: -240 },
+      { id: "current", top: -12 },
+      { id: "next", top: 180 },
+    ]),
+    { id: "current", top: -12 },
+  );
+  assert.equal(
+    nearestHeadingPosition([{ id: "", top: -1 }]),
+    undefined,
+  );
+});
+
+test("labels reference and managed storage for readers", () => {
+  assert.equal(sourceModeLabel("reference"), "live source");
+  assert.equal(sourceModeLabel("managed"), "snapshot");
 });
 
 test("requests the browser print dialog for PDF export", () => {
