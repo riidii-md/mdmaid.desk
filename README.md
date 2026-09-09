@@ -325,6 +325,7 @@ Document registration and presentation never imply workflow approval.
 ## Documentation
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
+- [Deferred HTML and PDF artifact proposal](docs/plans/html-pdf-artifacts.md)
 - [Human review requests](docs/REVIEW_REQUESTS.md)
 - [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
