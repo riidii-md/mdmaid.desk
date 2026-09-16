@@ -452,6 +452,7 @@ test("routes producer writes through a live daemon without opening local storage
         documentPath,
         "--workspace",
         "example",
+        "--live",
         "--kind",
         "review",
         "--attention",
@@ -553,13 +554,22 @@ test("returns a usage error for incomplete commands", async () => {
   assert.match(stderr.text(), /workspace root is required/);
 });
 
-test("uses the mdmaid-desk executable name in help output", async () => {
+test("documents live registration in global and command help", async () => {
   const stdout = output();
   const stderr = output();
 
   assert.equal(await run(["--help"], stdout, stderr), 0);
   assert.match(stdout.text(), /mdmaid-desk/);
+  assert.match(stdout.text(), /\[--live\]/);
+  assert.match(stdout.text(), /register.*live reference/is);
+  assert.match(stdout.text(), /import.*managed snapshot/is);
   assert.doesNotMatch(stdout.text(), /mdmaid-show/);
+  assert.equal(stderr.text(), "");
+
+  const registerHelp = output();
+  assert.equal(await run(["register", "--help"], registerHelp, stderr), 0);
+  assert.match(registerHelp.text(), /--live/);
+  assert.match(registerHelp.text(), /default live-reference behavior/i);
   assert.equal(stderr.text(), "");
 });
 
