@@ -80,7 +80,7 @@ button { color: inherit; }
 .live { font-size: 10px; color: var(--done); text-transform: uppercase; }
 .live.offline { color: var(--accent); }
 
-.icon-button, .action, .status-filter, .project-button, .document-card {
+.icon-button, .action, .status-filter, .grouping-button, .project-button, .document-card {
   border: 1px solid var(--ink);
   background: var(--surface);
   cursor: pointer;
@@ -189,7 +189,28 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .status-filter { padding: 9px 10px; font-size: 10px; text-transform: uppercase; }
 .status-filter.active { background: var(--ink); color: var(--surface); }
 
+.grouping-switch { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.grouping-label { margin-right: 3px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.grouping-button { padding: 7px 9px; font-size: 10px; text-transform: uppercase; }
+.grouping-button:hover { background: var(--surface-2); }
+.grouping-button.active { background: var(--ink); color: var(--surface); }
+
 .document-queue {
+  display: grid;
+  gap: 28px;
+}
+
+.document-group { display: grid; gap: 12px; }
+.document-group h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+  font-size: 15px;
+}
+.document-group-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr));
   gap: 16px;

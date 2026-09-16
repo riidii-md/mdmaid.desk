@@ -12,6 +12,7 @@ export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
 export type WebWorkspace = PublicWorkspace;
 export type WebReviewRequest = PublicReviewRequest;
+export type WebQueueGrouping = "project" | "tag" | "all";
 
 export interface WebFilters {
   workspaceId?: string | undefined;
@@ -35,6 +36,12 @@ export interface LiveSourceCatalogEvent {
   action: "source-changed" | "source-missing" | "source-restored";
   documentId: string;
   revision: number;
+}
+
+export interface WebDocumentGroup {
+  key: string;
+  label?: string;
+  documents: WebDocument[];
 }
 
 export interface WebLoadFailure {
@@ -62,6 +69,7 @@ interface RenderedDocument {
 interface WebState {
   documents: WebDocument[];
   filters: WebFilters;
+  grouping: WebQueueGrouping;
   reviewRequests: WebReviewRequest[];
   selectedId: string | undefined;
   workspaces: WebWorkspace[];
@@ -162,6 +170,71 @@ export function queueCounts(
     },
     { all: 0, unread: 0, reading: 0, done: 0 },
   );
+}
+
+export function queueGroupingPreference(
+  value: string | null,
+): WebQueueGrouping {
+  return value === "tag" || value === "all" || value === "project"
+    ? value
+    : "project";
+}
+
+export function groupQueue(
+  documents: WebDocument[],
+  grouping: WebQueueGrouping,
+  workspaces: WebWorkspace[],
+): WebDocumentGroup[] {
+  if (grouping === "all") {
+    return [{ key: "all", documents }];
+  }
+
+  if (grouping === "project") {
+    const names = new Map(workspaces.map(({ id, name }) => [id, name]));
+    const groups = new Map<string, WebDocumentGroup>();
+    for (const document of documents) {
+      let group = groups.get(document.workspaceId);
+      if (!group) {
+        group = {
+          key: `project:${document.workspaceId}`,
+          label: names.get(document.workspaceId) ?? document.workspaceId,
+          documents: [],
+        };
+        groups.set(document.workspaceId, group);
+      }
+      group.documents.push(document);
+    }
+    return [...groups.values()];
+  }
+
+  const tagged = new Map<string, WebDocument[]>();
+  const untagged: WebDocument[] = [];
+  for (const document of documents) {
+    if (document.tags.length === 0) {
+      untagged.push(document);
+      continue;
+    }
+    for (const tag of new Set(document.tags)) {
+      const matches = tagged.get(tag) ?? [];
+      matches.push(document);
+      tagged.set(tag, matches);
+    }
+  }
+  const groups = [...tagged.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([tag, matches]) => ({
+      key: `tag:${tag}`,
+      label: `#${tag}`,
+      documents: matches,
+    }));
+  if (untagged.length > 0) {
+    groups.push({
+      key: "tag:untagged",
+      label: "untagged",
+      documents: untagged,
+    });
+  }
+  return groups;
 }
 
 export function visibleWorkspaces(
@@ -313,6 +386,9 @@ async function boot(): Promise<void> {
           : document.body.dataset.workspaceId,
       search: "",
     },
+    grouping: queueGroupingPreference(
+      localStorage.getItem("mdmaid-desk-queue-grouping"),
+    ),
     selectedId:
       document.body.dataset.documentId === ""
         ? undefined
@@ -348,6 +424,9 @@ async function boot(): Promise<void> {
   const live = element("live-status");
   const statusButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>("[data-status-filter]"),
+  );
+  const groupingButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("[data-grouping]"),
   );
   let renderedRevision: number | undefined;
   let renderSequence = 0;
@@ -451,66 +530,101 @@ async function boot(): Promise<void> {
       state.reviewRequests,
     );
     empty.toggleAttribute("hidden", documents.length !== 0);
-    for (const item of documents) {
-      const card = document.createElement("button");
-      card.type = "button";
-      card.className = `document-card status-${item.status}`;
-      card.classList.toggle("source-missing", isSourceMissing(item));
-      card.dataset.documentId = item.id;
-      card.setAttribute("aria-label", `Open ${item.title}`);
-
-      const top = document.createElement("span");
-      top.className = "card-topline";
-      const status = document.createElement("span");
-      status.className = "status-label";
-      status.textContent = isSourceMissing(item) ? "source missing" : item.status;
-      const context = document.createElement("span");
-      context.className = "card-context";
-      context.textContent = [
-        item.workspaceId,
-        item.taskId,
-        item.kind,
-        sourceModeLabel(item.storage),
-      ]
-        .filter(Boolean)
-        .join(" / ");
-      top.append(status, context);
-
-      const title = document.createElement("strong");
-      title.textContent = item.title;
-      const detail = document.createElement("span");
-      detail.className = "card-detail";
-      detail.textContent = [
-        item.producer ? `from ${item.producer}` : "",
-        item.attention !== "none" ? item.attention.replaceAll("_", " ") : "",
-        `rev ${item.revision}`,
-      ]
-        .filter(Boolean)
-        .join(" · ");
-      if (pendingReviewForDocument(state.reviewRequests, item.id)) {
-        const action = document.createElement("span");
-        action.className = "action-required";
-        action.textContent = "action required";
-        detail.append(document.createTextNode(detail.textContent ? " · " : ""), action);
+    for (const group of groupQueue(documents, state.grouping, state.workspaces)) {
+      const grid = document.createElement("div");
+      grid.className = "document-group-grid";
+      for (const item of group.documents) {
+        grid.append(documentCard(item));
       }
-      const tags = document.createElement("span");
-      tags.className = "tag-row";
-      for (const tag of item.tags) {
-        const chip = document.createElement("span");
-        chip.className = "tag";
-        chip.textContent = `#${tag}`;
-        tags.append(chip);
+      if (group.label === undefined) {
+        queue.append(grid);
+        continue;
       }
+      const section = document.createElement("section");
+      section.className = "document-group";
+      section.dataset.groupKey = group.key;
+      const heading = document.createElement("h2");
+      heading.textContent = group.label;
+      const count = document.createElement("span");
+      count.className = "count";
+      count.textContent = String(group.documents.length);
+      heading.append(count);
+      section.append(heading, grid);
+      queue.append(section);
+    }
+  }
 
-      card.append(top, title, detail, tags);
-      card.addEventListener("click", () => void openDocument(item.id));
-      queue.append(card);
+  function documentCard(item: WebDocument): HTMLButtonElement {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = `document-card status-${item.status}`;
+    card.classList.toggle("source-missing", isSourceMissing(item));
+    card.dataset.documentId = item.id;
+    card.setAttribute("aria-label", `Open ${item.title}`);
+
+    const top = document.createElement("span");
+    top.className = "card-topline";
+    const status = document.createElement("span");
+    status.className = "status-label";
+    status.textContent = isSourceMissing(item) ? "source missing" : item.status;
+    const context = document.createElement("span");
+    context.className = "card-context";
+    context.textContent = [
+      item.workspaceId,
+      item.taskId,
+      item.kind,
+      sourceModeLabel(item.storage),
+    ]
+      .filter(Boolean)
+      .join(" / ");
+    top.append(status, context);
+
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+    const detail = document.createElement("span");
+    detail.className = "card-detail";
+    detail.textContent = [
+      item.producer ? `from ${item.producer}` : "",
+      item.attention !== "none" ? item.attention.replaceAll("_", " ") : "",
+      `rev ${item.revision}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    if (pendingReviewForDocument(state.reviewRequests, item.id)) {
+      const action = document.createElement("span");
+      action.className = "action-required";
+      action.textContent = "action required";
+      detail.append(
+        document.createTextNode(detail.textContent ? " · " : ""),
+        action,
+      );
+    }
+    const tags = document.createElement("span");
+    tags.className = "tag-row";
+    for (const tag of item.tags) {
+      const chip = document.createElement("span");
+      chip.className = "tag";
+      chip.textContent = `#${tag}`;
+      tags.append(chip);
+    }
+
+    card.append(top, title, detail, tags);
+    card.addEventListener("click", () => void openDocument(item.id));
+    return card;
+  }
+
+  function renderGroupingControls(): void {
+    for (const button of groupingButtons) {
+      const active = button.dataset.grouping === state.grouping;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
     }
   }
 
   function render(): void {
     renderProjects();
     renderStatusCounts();
+    renderGroupingControls();
     renderQueue();
   }
 
@@ -880,6 +994,14 @@ async function boot(): Promise<void> {
       state.filters.status =
         button.dataset.statusFilter as WebFilters["status"];
       renderStatusCounts();
+      renderQueue();
+    });
+  }
+  for (const button of groupingButtons) {
+    button.addEventListener("click", () => {
+      state.grouping = queueGroupingPreference(button.dataset.grouping ?? null);
+      localStorage.setItem("mdmaid-desk-queue-grouping", state.grouping);
+      renderGroupingControls();
       renderQueue();
     });
   }

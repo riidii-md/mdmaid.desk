@@ -5,10 +5,12 @@ import {
   documentFragmentId,
   documentOutline,
   filterQueue,
+  groupQueue,
   isSourceMissing,
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
   pendingReviewForDocument,
+  queueGroupingPreference,
   queueCounts,
   requestDocumentPrint,
   reviewResponseError,
@@ -117,6 +119,82 @@ test("counts reading states for the browser navigation", () => {
     reading: 1,
     done: 1,
   });
+});
+
+test("groups the queue by project without changing document order", () => {
+  const workspaces: PublicWorkspace[] = [
+    {
+      id: "alpha",
+      name: "Alpha project",
+      documentCount: 2,
+      route: "/w/alpha",
+    },
+    { id: "beta", name: "Beta project", documentCount: 1, route: "/w/beta" },
+  ];
+
+  assert.deepEqual(groupQueue(documents, "project", workspaces), [
+    {
+      key: "project:alpha",
+      label: "Alpha project",
+      documents: [documents[0], documents[2]],
+    },
+    {
+      key: "project:beta",
+      label: "Beta project",
+      documents: [documents[1]],
+    },
+  ]);
+});
+
+test("groups multi-tag documents under every tag and puts untagged last", () => {
+  const untagged = {
+    ...documents[1]!,
+    id: "doc-44444444444444444444",
+    tags: [],
+  };
+  const multiTagged = {
+    ...documents[0]!,
+    tags: ["architecture", "planning"],
+  };
+
+  assert.deepEqual(
+    groupQueue([multiTagged, documents[1]!, untagged], "tag", []),
+    [
+      {
+        key: "tag:architecture",
+        label: "#architecture",
+        documents: [multiTagged],
+      },
+      {
+        key: "tag:planning",
+        label: "#planning",
+        documents: [multiTagged],
+      },
+      {
+        key: "tag:terminal",
+        label: "#terminal",
+        documents: [documents[1]],
+      },
+      {
+        key: "tag:untagged",
+        label: "untagged",
+        documents: [untagged],
+      },
+    ],
+  );
+});
+
+test("keeps one flat ordered group for the all view", () => {
+  assert.deepEqual(groupQueue(documents, "all", []), [
+    { key: "all", documents },
+  ]);
+});
+
+test("defaults invalid or missing grouping preferences to projects", () => {
+  assert.equal(queueGroupingPreference(null), "project");
+  assert.equal(queueGroupingPreference("unexpected"), "project");
+  assert.equal(queueGroupingPreference("tag"), "tag");
+  assert.equal(queueGroupingPreference("all"), "all");
 });
 
 test("shows actions only for explicit pending review requests", () => {
