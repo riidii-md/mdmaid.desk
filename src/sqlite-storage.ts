@@ -15,6 +15,7 @@ import {
   type DocumentSourceLink,
   type DocumentStorage,
   type ReviewRequestFilters,
+  type ReviewFeedbackItem,
   type ReviewResponse,
   type StoredDocument,
   type StoredReviewRequest,
@@ -22,7 +23,7 @@ import {
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 6;
 
 interface WorkspaceRow {
   id: string;
@@ -84,6 +85,7 @@ interface ReviewRequestRow {
 interface ReviewResponseRow {
   outcome: string;
   message: string;
+  items_json: string | null;
   created_at: string;
 }
 
@@ -136,7 +138,7 @@ const INITIAL_SCHEMA = `
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
     document_revision INTEGER NOT NULL CHECK (document_revision > 0),
     document_content_hash TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('plan-decision')),
+    kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
     request_message TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
     stale_at TEXT,
@@ -147,6 +149,7 @@ const INITIAL_SCHEMA = `
     review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
     outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
     message TEXT NOT NULL,
+    items_json TEXT,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -539,13 +542,14 @@ export class SqliteCatalogStorage implements CatalogStorage {
       this.#database
         .prepare(
           `INSERT INTO review_responses (
-             review_request_id, outcome, message, created_at
-           ) VALUES (?, ?, ?, ?)`,
+             review_request_id, outcome, message, items_json, created_at
+           ) VALUES (?, ?, ?, ?, ?)`,
         )
         .run(
           request.id,
           response.outcome,
           response.message,
+          response.items === undefined ? null : JSON.stringify(response.items),
           response.createdAt,
         );
       return true;
@@ -615,7 +619,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
   #mapReviewRequest(row: ReviewRequestRow): StoredReviewRequest {
     const responseRow = this.#database
       .prepare<[string], ReviewResponseRow>(
-        `SELECT outcome, message, created_at
+        `SELECT outcome, message, items_json, created_at
          FROM review_responses WHERE review_request_id = ?`,
       )
       .get(row.id);
@@ -623,6 +627,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
       ? {
           outcome: responseRow.outcome as ReviewResponse["outcome"],
           message: responseRow.message,
+          ...parseReviewFeedbackItems(responseRow.items_json),
           createdAt: responseRow.created_at,
         }
       : null;
@@ -711,6 +716,51 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 4");
     })();
   }
+  if (rawVersion < 5) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE review_requests_v5 (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
+           request_message TEXT NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
+           stale_at TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE review_responses_v5 (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests_v5(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+           message TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO review_requests_v5 SELECT * FROM review_requests;
+         INSERT INTO review_responses_v5 (
+           review_request_id, outcome, message, created_at
+         ) SELECT review_request_id, outcome, message, created_at
+           FROM review_responses;
+         DROP TABLE review_responses;
+         DROP TABLE review_requests;
+         ALTER TABLE review_requests_v5 RENAME TO review_requests;
+         ALTER TABLE review_responses_v5 RENAME TO review_responses;
+         CREATE UNIQUE INDEX review_requests_pending_document_idx
+           ON review_requests(document_id) WHERE status = 'pending';
+         CREATE INDEX review_requests_document_idx
+           ON review_requests(document_id, created_at DESC);
+         CREATE INDEX review_requests_status_idx
+           ON review_requests(status, created_at DESC);`,
+      );
+      database.pragma("user_version = 5");
+    })();
+  }
+  if (rawVersion < 6) {
+    database.transaction(() => {
+      database.exec("ALTER TABLE review_responses ADD COLUMN items_json TEXT");
+      database.pragma("user_version = 6");
+    })();
+  }
 }
 
 function validateWorkspaceRow(
@@ -794,11 +844,75 @@ function validateReviewRequestRow(
     (response !== null &&
       (!isReviewOutcome(response.outcome) ||
         !isValidReviewMessage(response.message) ||
+        (response.items !== undefined &&
+          (response.outcome !== "changes_requested" ||
+            !response.items.every(isValidReviewFeedbackItem))) ||
         !isDate(response.createdAt) ||
         response.outcome !== row.status))
   ) {
     throw new Error(`invalid review request row ${row.id}`);
   }
+}
+
+function parseReviewFeedbackItems(
+  value: string | null,
+): { items?: ReviewFeedbackItem[] } {
+  if (value === null) {
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("invalid stored review feedback items");
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    parsed.length > 32 ||
+    !parsed.every(isValidReviewFeedbackItem)
+  ) {
+    throw new Error("invalid stored review feedback items");
+  }
+  return { items: structuredClone(parsed) as ReviewFeedbackItem[] };
+}
+
+function isValidReviewFeedbackItem(value: unknown): value is ReviewFeedbackItem {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const item = value as Record<string, unknown>;
+  const allowed = new Set(["id", "kind", "path", "hunkId", "message"]);
+  return Object.keys(item).every((key) => allowed.has(key)) &&
+    typeof item.id === "string" &&
+    /^feedback-[a-f0-9]{20}$/.test(item.id) &&
+    (item.kind === "feedback" || item.kind === "todo") &&
+    typeof item.path === "string" &&
+    item.path.length <= 1_024 &&
+    isSafeFeedbackPath(item.path) &&
+    typeof item.message === "string" &&
+    item.message.trim() !== "" &&
+    item.message.length <= 512 &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.message) &&
+    (item.kind === "feedback"
+      ? typeof item.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(item.hunkId)
+      : item.hunkId === undefined);
+}
+
+function isSafeFeedbackPath(value: string): boolean {
+  if (
+    value === "" ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .replaceAll("\\", "/")
+    .split("/")
+    .every((segment) => segment !== "" && segment !== "." && segment !== "..");
 }
 
 function isValidReviewMessage(value: string): boolean {

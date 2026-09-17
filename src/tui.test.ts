@@ -16,10 +16,12 @@ import type {
   PublicWorkspace,
 } from "./api-types.js";
 import { documentStorageLabel } from "./api-types.js";
+import { parseChangeReviewDiffs } from "./change-review.js";
 import {
   applyTuiReader,
   applyTuiMissingReader,
   createTuiState,
+  groupTuiQueue,
   handleTuiKey,
   handleTuiMouse,
   replaceTuiDocuments,
@@ -98,6 +100,62 @@ test("navigates and opens the selected queue document", () => {
   assert.deepEqual(opened.effects, [
     { type: "open", documentId: documents[1]?.id },
   ]);
+});
+
+test("groups the TUI queue by project, tag, or one ordered list", () => {
+  const tagged: PublicDocument = {
+    ...documents[0]!,
+    id: "doc-33333333333333333333",
+    title: "Tagged decision",
+    tags: ["architecture", "release"],
+  };
+  const queue = [documents[0]!, documents[1]!, tagged];
+
+  assert.deepEqual(
+    groupTuiQueue(queue, "project", workspaces).map(({ key, label, documents }) => ({
+      key,
+      label,
+      ids: documents.map(({ id }) => id),
+    })),
+    [
+      {
+        key: "project:alpha",
+        label: "Alpha",
+        ids: [documents[0]!.id, tagged.id],
+      },
+      {
+        key: "project:beta",
+        label: "Beta",
+        ids: [documents[1]!.id],
+      },
+    ],
+  );
+  assert.deepEqual(
+    groupTuiQueue(queue, "tag", workspaces).map(({ key, label }) => ({ key, label })),
+    [
+      { key: "tag:architecture", label: "architecture" },
+      { key: "tag:terminal", label: "terminal" },
+      { key: "tag:release", label: "release" },
+    ],
+  );
+  assert.deepEqual(groupTuiQueue(queue, "all", workspaces), [
+    { key: "all", documents: queue },
+  ]);
+});
+
+test("renders TUI group sections and cycles the grouping mode", () => {
+  let state = createTuiState(documents, workspaces);
+  assert.equal(state.grouping, "project");
+  assert.match(renderTui(state, 128, 30), /PROJECT · Alpha/);
+  assert.match(renderTui(state, 128, 30), /PROJECT · Beta/);
+
+  state = handleTuiKey(state, "g").state;
+  assert.equal(state.grouping, "tag");
+  assert.match(renderTui(state, 128, 30), /TAG · architecture/);
+
+  state = handleTuiKey(state, "g").state;
+  assert.equal(state.grouping, "all");
+  assert.doesNotMatch(renderTui(state, 128, 30), /PROJECT ·|TAG ·/);
 });
 
 test("keeps missing documents visible and directly archivable", () => {
@@ -294,6 +352,192 @@ test("filters explicit actions and composes a review response", () => {
   assert.match(invalid.state.message ?? "", /Explain what needs to change/);
 });
 
+test("provides a dedicated Change Reviews space", () => {
+  const changeReview: PublicDocument = {
+    ...documents[0]!,
+    id: "doc-33333333333333333333",
+    kind: "change-review",
+    title: "Checkout refactor",
+    attention: "approval",
+  };
+  const changeDecision: PublicReviewRequest = {
+    ...reviewRequests[0]!,
+    id: "review-33333333333333333333",
+    documentId: changeReview.id,
+    kind: "change-decision",
+    requestMessage: "Review the exact implementation before publication.",
+  };
+  let state = createTuiState(
+    [...documents, changeReview],
+    workspaces,
+    [...reviewRequests, changeDecision],
+  );
+
+  const inbox = renderTui(state, 128, 30);
+  assert.match(inbox, /c Change reviews/);
+  assert.match(inbox, /Checkout refactor/);
+
+  state = handleTuiKey(state, "c").state;
+  assert.equal(state.changeReviewsOnly, true);
+  assert.deepEqual(
+    state.visibleDocuments.map(({ id }) => id),
+    [changeReview.id],
+  );
+  const changes = renderTui(state, 128, 30);
+  assert.match(changes, /mdmaid\.desk.*CHANGE REVIEWS/);
+  assert.match(changes, /1 change review/);
+  assert.doesNotMatch(changes, /Daemon plan/);
+
+  const reader = applyTuiReader(
+    state,
+    changeReview,
+    "Changed files and relationship diagram.",
+    "beautiful-mermaid",
+    [],
+  );
+  const readerFrame = renderTui(reader, 100, 28);
+  assert.match(readerFrame, /CHANGE REVIEW/);
+  assert.match(readerFrame, /Review the exact implementation/);
+  assert.match(readerFrame, /y approve/);
+
+  const blocked = handleTuiKey(reader, "y").state;
+  assert.equal(blocked.reviewComposer, undefined);
+  assert.match(blocked.message ?? "", /complete native diff/i);
+});
+
+test("navigates a native diff and returns multiple anchored feedback items", () => {
+  const changeReview: PublicDocument = {
+    ...documents[0]!,
+    id: "doc-44444444444444444444",
+    kind: "change-review",
+    title: "Authentication refactor",
+    attention: "approval",
+  };
+  const changeDecision: PublicReviewRequest = {
+    ...reviewRequests[0]!,
+    id: "review-44444444444444444444",
+    documentId: changeReview.id,
+    kind: "change-decision",
+    requestMessage: "Review this exact implementation.",
+  };
+  const parsed = parseChangeReviewDiffs([
+    "```diff",
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -1 +1 @@",
+    "-return token == expected;",
+    "+return token === expected;",
+    "diff --git a/test/auth.test.ts b/test/auth.test.ts",
+    "--- a/test/auth.test.ts",
+    "+++ b/test/auth.test.ts",
+    "@@ -4 +4,2 @@",
+    " expect(valid).toBe(true);",
+    "+expect(expired).toBe(false);",
+    "```",
+  ].join("\n"));
+  let state = applyTuiReader(
+    createTuiState([changeReview], [workspaces[0]!], [changeDecision]),
+    changeReview,
+    "Rendered narrative",
+    "beautiful-mermaid",
+    [],
+    parsed,
+  );
+
+  assert.equal(state.reader?.changeView, "diff");
+  let frame = renderTui(state, 130, 32, { color: true });
+  const plainFrame = stripVTControlCharacters(frame);
+  assert.match(plainFrame, /FILES/);
+  assert.match(plainFrame, /src\/auth\.ts/);
+  assert.match(plainFrame, /UNIFIED/);
+  assert.match(plainFrame, /token === expected/);
+  assert.match(plainFrame, /f feedback/);
+  assert.match(frame, /\u001b\[[0-9;]*4m/);
+  assert.match(frame, /\u001b\[48;2;/);
+  assert.match(
+    frame,
+    /\u001b\[38;2;227;166;239m(?:\u001b\[[0-9;]*m)*return/,
+  );
+
+  const incomplete = structuredClone(state);
+  incomplete.reader!.changeReview!.warnings.push("A diff hunk was omitted.");
+  const blocked = handleTuiKey(incomplete, "y").state;
+  assert.equal(blocked.reviewComposer, undefined);
+  assert.match(blocked.message ?? "", /incomplete/i);
+
+  const hostile = structuredClone(parsed);
+  hostile.files[0]!.hunks[0]!.lines[0]!.text += "\u001b]52;c;ZXhmaWx0cmF0ZQ==\u0007";
+  const hostileState = applyTuiReader(
+    createTuiState([changeReview], [workspaces[0]!], [changeDecision]),
+    changeReview,
+    "Rendered narrative",
+    "beautiful-mermaid",
+    [],
+    hostile,
+  );
+  assert.doesNotMatch(renderTui(hostileState, 130, 32, { color: true }), /\u001b\]52/);
+
+  state = handleTuiKey(state, "]").state;
+  assert.equal(state.reader?.changeFileIndex, 1);
+  assert.match(renderTui(state, 130, 32), /test\/auth\.test\.ts/);
+  state = handleTuiKey(state, "k").state;
+  assert.equal(state.reader?.changeFileIndex, 0);
+  state = handleTuiKey(state, "j").state;
+  assert.equal(state.reader?.changeFileIndex, 1);
+  state = handleTuiKey(state, "up").state;
+  assert.equal(state.reader?.changeFileIndex, 0);
+  assert.match(renderTui(state, 130, 32), /j \/ k file/);
+  state = handleTuiKey(state, "m").state;
+  assert.equal(state.reader?.changeLayout, "side-by-side");
+  frame = renderTui(state, 130, 32);
+  assert.match(frame, /OLD.*NEW/);
+
+  state = handleTuiKey(state, "f").state;
+  assert.equal(state.annotationComposer?.kind, "feedback");
+  for (const key of "Use constant-time comparison.") {
+    state = handleTuiKey(state, key).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.feedbackItems.length, 1);
+  assert.equal(state.reader?.feedbackItems[0]?.path, "src/auth.ts");
+  assert.match(state.reader?.feedbackItems[0]?.hunkId ?? "", /^hunk-/);
+
+  state = handleTuiKey(state, "t").state;
+  for (const key of "Add an expired-token test.") {
+    state = handleTuiKey(state, key).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.feedbackItems.length, 2);
+  assert.equal(state.reader?.feedbackItems[1]?.kind, "todo");
+
+  state = handleTuiKey(state, "y").state;
+  assert.equal(state.reviewComposer, undefined);
+  assert.match(state.message ?? "", /remove the open feedback/i);
+
+  state = handleTuiKey(state, "z").state;
+  assert.equal(state.reader?.feedbackItems.length, 1);
+  state = handleTuiKey(state, "t").state;
+  for (const key of "Add an expired-token test.") {
+    state = handleTuiKey(state, key).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.feedbackItems.length, 2);
+
+  state = handleTuiKey(state, "c").state;
+  assert.equal(state.reviewComposer?.outcome, "changes_requested");
+  assert.equal(state.reviewComposer?.items.length, 2);
+  assert.match(state.reviewComposer?.message ?? "", /Use constant-time comparison/);
+  const submitted = handleTuiKey(state, "ctrl-d");
+  assert.equal(submitted.effects[0]?.type, "review-response");
+  assert.deepEqual(
+    submitted.effects[0]?.type === "review-response"
+      ? submitted.effects[0].items
+      : undefined,
+    state.reader?.feedbackItems,
+  );
+});
+
 test("supports mouse navigation, direct actions, wheel, and page scrolling", () => {
   const queue = createTuiState(documents, workspaces);
 
@@ -338,14 +582,14 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
     [],
   );
   assert.deepEqual(
-    handleTuiMouse(queue, { button: "left", x: 80, y: 7 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: 30, y: 15 }, 128, 28)
       .effects,
     [{ type: "open", documentId: documents[1]!.id }],
   );
 
   const opened = handleTuiMouse(
     queue,
-    { button: "left", x: 30, y: 7 },
+    { button: "left", x: 30, y: 8 },
     128,
     28,
   );
@@ -411,7 +655,7 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
     ],
   );
   assert.equal(
-    handleTuiMouse(queue, { button: "left", x: 64, y: 27 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: 74, y: 27 }, 128, 28)
       .state.searching,
     true,
   );

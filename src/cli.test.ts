@@ -234,6 +234,54 @@ test("publishes an explicit review gate and returns its response as JSON", async
   assert.equal(stderr.text(), "");
 });
 
+test("publishes a change review with a revision-bound change decision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-change-review-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "change-review.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Change review\n", "utf8");
+  const stderr = output();
+  assert.equal(
+    await run(
+      ["workspace", "add", workspace, "--id", "example"],
+      output(),
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+
+  const publishedOutput = output();
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "change-review",
+        "--attention",
+        "approval",
+        "--expect",
+        "change-decision",
+        "--request-message",
+        "Review the exact implementation before publication.",
+        "--json",
+      ],
+      publishedOutput,
+      stderr,
+      { statePath },
+    ),
+    0,
+  );
+  const published = JSON.parse(publishedOutput.text());
+  assert.equal(published.reviewRequest.kind, "change-decision");
+  assert.equal(published.reviewRequest.status, "pending");
+  assert.equal(stderr.text(), "");
+});
+
 test("waits on daemon events and returns the durable review decision", async () => {
   const pending = {
     id: "review-0123456789abcdefabcd",

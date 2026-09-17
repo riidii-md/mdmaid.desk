@@ -248,6 +248,98 @@ test("renders authorized Markdown for web and terminal targets", async () => {
   }
 });
 
+test("returns a bounded native diff model for change-review documents", async () => {
+  const value = await fixture();
+  const documentPath = join(value.workspace, "change-review.md");
+  await writeFile(documentPath, [
+    "# Authentication change",
+    "",
+    "```diff",
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -1 +1 @@",
+    "-return token == expected;",
+    "+return token === expected;",
+    "```",
+  ].join("\n"), "utf8");
+  const document = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Authentication change",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await value.catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review this exact implementation.",
+  });
+
+  try {
+    const response = await authorized(
+      value,
+      `/api/v1/documents/${document.id}/render?target=terminal&width=100`,
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      data: {
+        changeReview: {
+          schemaVersion: number;
+          files: Array<{ path: string; hunks: Array<{ id: string }> }>;
+          warnings: string[];
+        };
+      };
+    };
+    assert.equal(body.data.changeReview.schemaVersion, 1);
+    assert.equal(body.data.changeReview.files[0]?.path, "src/auth.ts");
+    assert.match(
+      body.data.changeReview.files[0]?.hunks[0]?.id ?? "",
+      /^hunk-[a-f0-9]{20}$/,
+    );
+    assert.doesNotMatch(JSON.stringify(body), new RegExp(value.root));
+
+    const webResponse = await authorized(
+      value,
+      `/api/v1/documents/${document.id}/render?target=web`,
+    );
+    const webBody = (await webResponse.json()) as {
+      data: { content: string; changeReview: { files: unknown[] } };
+    };
+    assert.equal(webBody.data.changeReview.files.length, 1);
+    assert.match(webBody.data.content, /Authentication change/);
+    assert.doesNotMatch(webBody.data.content, /diff --git|token === expected/);
+
+    const feedback = {
+      id: "feedback-33333333333333333333",
+      kind: "feedback",
+      path: "src/auth.ts",
+      hunkId: body.data.changeReview.files[0]?.hunks[0]?.id,
+      message: "Use a constant-time comparison.",
+    };
+    const responded = await authorized(
+      value,
+      `/api/v1/review-requests/${request.id}/respond`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          outcome: "changes_requested",
+          message: "Address the anchored feedback.",
+          items: [feedback],
+        }),
+      },
+    );
+    assert.equal(responded.status, 200);
+    const responseBody = (await responded.json()) as {
+      data: { response: { items: unknown[] } };
+    };
+    assert.deepEqual(responseBody.data.response.items, [feedback]);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("routes registered Markdown links to the document reader with source fallbacks", async () => {
   const value = await fixture();
   const documentPath = join(value.workspace, "plan.md");
@@ -909,6 +1001,11 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     const pageContent = await page.text();
     assert.match(pageContent, /mdmaid\.desk/);
     assert.match(pageContent, /id="actions-filter"/);
+    assert.match(pageContent, /id="change-reviews-filter"/);
+    assert.match(pageContent, /id="change-review-viewer"/);
+    assert.match(pageContent, /id="change-file-list"/);
+    assert.match(pageContent, /id="change-layout"/);
+    assert.match(pageContent, /id="change-view-document"/);
     assert.match(pageContent, /id="review-panel"/);
     assert.match(pageContent, /id="review-response"/);
     assert.match(pageContent, /id="review-approve"/);
@@ -1204,6 +1301,8 @@ test("serves the browser workspace and local visual assets", async () => {
     );
     assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
     assert.match(cssText, /\.reader-toc/);
+    assert.match(cssText, /\.syntax-keyword/);
+    assert.match(cssText, /--syntax-string:/);
     assert.match(cssText, /@media print/);
 
     const app = await fetch(new URL("/assets/app.js", value.server.url), {

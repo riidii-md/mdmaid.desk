@@ -931,6 +931,53 @@ test("persists explicit review requests separately from reading progress", async
   restored.close();
 });
 
+test("binds change decisions to change-review documents", async () => {
+  const { catalog, workspace } = await fixture();
+  const changePath = join(workspace, "reports", "change-review.md");
+  const planPath = join(workspace, "reports", "ordinary-plan.md");
+  await writeFile(changePath, "# Change review\n", "utf8");
+  await writeFile(planPath, "# Plan\n", "utf8");
+  const changeReview = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Change review",
+    path: changePath,
+    attention: "approval",
+  });
+  const plan = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Plan",
+    path: planPath,
+    attention: "approval",
+  });
+
+  await assert.rejects(
+    catalog.createReviewRequest({
+      documentId: plan.id,
+      kind: "change-decision",
+      requestMessage: "This is not a change review.",
+    }),
+    /change-decision requires a change-review document/,
+  );
+  await assert.rejects(
+    catalog.createReviewRequest({
+      documentId: changeReview.id,
+      kind: "plan-decision",
+      requestMessage: "This is not a plan decision.",
+    }),
+    /change-review documents require a change-decision/,
+  );
+  const request = await catalog.createReviewRequest({
+    documentId: changeReview.id,
+    documentRevision: changeReview.revision,
+    kind: "change-decision",
+    requestMessage: "Review this exact implementation.",
+  });
+  assert.equal(request.kind, "change-decision");
+  catalog.close();
+});
+
 test("records one durable human response and requires reasons for changes", async () => {
   const { catalog, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "decision.md");
@@ -982,6 +1029,68 @@ test("records one durable human response and requires reasons for changes", asyn
     /already has a different response/,
   );
   catalog.close();
+});
+
+test("persists structured file, hunk, and todo feedback", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "change-feedback.md");
+  await writeFile(documentPath, "# Change feedback\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Change feedback",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review the exact implementation.",
+  });
+  const items = [
+    {
+      id: "feedback-11111111111111111111",
+      kind: "feedback" as const,
+      path: "src/auth.ts",
+      hunkId: "hunk-11111111111111111111",
+      message: "Use constant-time comparison here.",
+    },
+    {
+      id: "feedback-22222222222222222222",
+      kind: "todo" as const,
+      path: "test/auth.test.ts",
+      message: "Cover the expired-token boundary.",
+    },
+  ];
+
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "approved",
+      message: "Looks good.",
+      items,
+    }),
+    /feedback items require a changes_requested outcome/,
+  );
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "Address the anchored feedback.",
+      items: [{ ...items[0]!, path: "../../private.txt" }],
+    }),
+    /invalid review feedback item/,
+  );
+
+  const responded = await catalog.respondToReviewRequest(request.id, {
+    outcome: "changes_requested",
+    message: "Address the anchored feedback.",
+    items,
+  });
+  assert.deepEqual(responded.response?.items, items);
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getReviewRequest(request.id)?.response?.items, items);
+  restored.close();
 });
 
 test("stales a pending review when document content changes", async () => {
@@ -1319,7 +1428,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 4);
+  assert.equal(database.pragma("user_version", { simple: true }), 6);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -1356,6 +1465,51 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
     Catalog.open(futurePath, { legacyStatePath: false }),
     /unsupported SQLite catalog schema 99/,
   );
+});
+
+test("migrates version four review requests without losing decisions", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "existing-plan.md");
+  await writeFile(documentPath, "# Existing plan\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Existing plan",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "Preserve this request.",
+  });
+  await catalog.respondToReviewRequest(request.id, {
+    outcome: "approved",
+    message: "Preserve this response too.",
+  });
+  catalog.close();
+
+  const versionFour = new Database(statePath);
+  versionFour.pragma("user_version = 4");
+  versionFour.close();
+
+  const migrated = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.equal(migrated.getReviewRequest(request.id)?.status, "approved");
+  assert.equal(
+    migrated.getReviewRequest(request.id)?.response?.message,
+    "Preserve this response too.",
+  );
+  migrated.close();
+
+  const database = new Database(statePath, { readonly: true });
+  assert.equal(database.pragma("user_version", { simple: true }), 6);
+  const schema = database
+    .prepare<[], { sql: string }>(
+      "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",
+    )
+    .get()?.sql;
+  assert.match(schema ?? "", /change-decision/);
+  database.close();
 });
 
 test("rolls back the entire legacy import when one document conflicts", async () => {

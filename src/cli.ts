@@ -55,6 +55,7 @@ const DOCUMENT_KINDS = new Set<DocumentKind>([
   "progress",
   "verification",
   "review",
+  "change-review",
   "pr",
   "showcase",
   "other",
@@ -67,7 +68,10 @@ const ATTENTION_STATES = new Set<Attention>([
   "failure",
   "changes_requested",
 ]);
-const REVIEW_KINDS = new Set<ReviewKind>(["plan-decision"]);
+const REVIEW_KINDS = new Set<ReviewKind>([
+  "plan-decision",
+  "change-decision",
+]);
 const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
   "approved",
   "changes_requested",
@@ -96,13 +100,15 @@ Usage:
   mdmaid-desk register <file.md> --workspace <id>
       [--live] [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
-      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+      [--expect plan-decision|change-decision] [--request-message <text>]
+      [--wait] [--json]
   mdmaid-desk import <file.md> --workspace <id>
       [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
-      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+      [--expect plan-decision|change-decision] [--request-message <text>]
+      [--wait] [--json]
   mdmaid-desk review create <document-id> [--revision <number>]
-      [--kind plan-decision] [--message <text>] [--json]
+      [--kind plan-decision|change-decision] [--message <text>] [--json]
   mdmaid-desk review show <review-id> [--json]
   mdmaid-desk review wait <review-id> [--json]
   mdmaid-desk review respond <review-id> --outcome <outcome>

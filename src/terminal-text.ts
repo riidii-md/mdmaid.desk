@@ -133,7 +133,7 @@ function isSafeSgr(parameters: string): boolean {
   const values = parameters.split(";").map(Number);
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index] ?? -1;
-    if (value === 38) {
+    if (value === 38 || value === 48) {
       const mode = values[index + 1];
       if (mode === 5 && isByte(values[index + 2])) {
         index += 2;
@@ -151,7 +151,7 @@ function isSafeSgr(parameters: string): boolean {
       return false;
     }
     if (
-      [0, 1, 2, 3, 4, 7, 9, 22, 23, 24, 27, 29, 39].includes(value) ||
+      [0, 1, 2, 3, 4, 7, 9, 22, 23, 24, 27, 29, 39, 49].includes(value) ||
       (value >= 30 && value <= 37) ||
       (value >= 90 && value <= 97)
     ) {

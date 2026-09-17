@@ -9,6 +9,7 @@ export const DOCUMENT_KINDS = [
   "progress",
   "verification",
   "review",
+  "change-review",
   "pr",
   "showcase",
   "other",
@@ -28,7 +29,7 @@ export type Attention = (typeof ATTENTION_STATES)[number];
 export type ReadingStatus = "unread" | "reading" | "done";
 export type DocumentStorage = "reference" | "managed";
 
-export const REVIEW_KINDS = ["plan-decision"] as const;
+export const REVIEW_KINDS = ["plan-decision", "change-decision"] as const;
 export type ReviewKind = (typeof REVIEW_KINDS)[number];
 
 export const REVIEW_STATUSES = [
@@ -47,9 +48,21 @@ export const REVIEW_OUTCOMES = [
 ] as const;
 export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 
+export const REVIEW_FEEDBACK_KINDS = ["feedback", "todo"] as const;
+export type ReviewFeedbackKind = (typeof REVIEW_FEEDBACK_KINDS)[number];
+
+export interface ReviewFeedbackItem {
+  id: string;
+  kind: ReviewFeedbackKind;
+  path: string;
+  hunkId?: string;
+  message: string;
+}
+
 export interface ReviewResponse {
   outcome: ReviewOutcome;
   message: string;
+  items?: ReviewFeedbackItem[];
   createdAt: string;
 }
 
