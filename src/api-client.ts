@@ -22,6 +22,7 @@ import type {
   ReviewStatus,
   WorkspaceRegistration,
 } from "./api-types.js";
+import { isChangeReviewDiff } from "./change-review.js";
 
 interface ErrorEnvelope {
   error: {
@@ -406,6 +407,9 @@ function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
       typeof value.response.outcome === "string" &&
       (REVIEW_OUTCOMES as readonly string[]).includes(value.response.outcome) &&
       typeof value.response.message === "string" &&
+      (value.response.items === undefined ||
+        (Array.isArray(value.response.items) &&
+          value.response.items.every(isReviewFeedbackItem))) &&
       typeof value.response.createdAt === "string");
   return (
     typeof value.id === "string" &&
@@ -424,11 +428,42 @@ function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
   );
 }
 
+function isReviewFeedbackItem(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.path !== "string" ||
+    typeof value.message !== "string"
+  ) {
+    return false;
+  }
+  const pathSegments = value.path.split("/");
+  const validPath =
+    value.path.length > 0 &&
+    value.path.length <= 1024 &&
+    !value.path.startsWith("/") &&
+    !value.path.includes("\\") &&
+    !/^[A-Za-z]:/.test(value.path) &&
+    !/[\u0000-\u001f\u007f]/.test(value.path) &&
+    pathSegments.every((segment) => segment !== "" && segment !== "." && segment !== "..");
+  const validMessage =
+    value.message.trim().length > 0 &&
+    value.message.length <= 512 &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.message);
+  if (!/^feedback-[a-f0-9]{20}$/.test(value.id) || !validPath || !validMessage) {
+    return false;
+  }
+  return value.kind === "feedback"
+    ? typeof value.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(value.hunkId)
+    : value.kind === "todo" && value.hunkId === undefined;
+}
+
 function isWebRender(value: unknown): value is WebRender {
   return (
     isRecord(value) &&
     value.target === "web" &&
     typeof value.content === "string" &&
+    (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
 }
@@ -441,6 +476,7 @@ function isTerminalRender(value: unknown): value is TerminalRender {
     typeof value.backend === "string" &&
     Array.isArray(value.warnings) &&
     value.warnings.every((warning) => typeof warning === "string") &&
+    (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
 }

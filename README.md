@@ -32,6 +32,8 @@ The repository contains the first usable shared-service vertical slice:
 - Server-Sent Event refreshes for both clients;
 - explicit revision-bound human review requests with durable request/response
   text and conditional web/TUI actions;
+- first-class change-review documents with a dedicated terminal Changes space
+  and revision-bound implementation decisions;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
 - memorable `http://mdmaid.desk.localhost:43127/` browser origin;
 - daemon-first CLI writes with daemonless SQLite fallback;
@@ -290,9 +292,46 @@ node dist/cli.js tui
 The TUI reuses the running web daemon when available, so both clients share
 catalog events and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
+The queue starts grouped by project; press `g` to cycle through project, tag,
+and one ordered-list view.
 Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for
 Approve, Request changes, or Reject. The response composer uses `Enter` for a
 newline, `Ctrl-D` to submit, and `Esc` to cancel.
+
+Press `c` from the terminal queue to enter the dedicated Change Reviews space.
+Producers publish an implementation review and its mandatory decision with:
+
+```bash
+mdmaid-desk register .agent-runs/change-reviews/current/review.md \
+  --workspace example \
+  --kind change-review \
+  --attention approval \
+  --expect change-decision \
+  --request-message "Review this exact implementation before publication."
+```
+
+The decision is bound to the registered document revision and content hash.
+Changing the review artifact makes the pending request stale.
+
+For a native terminal diff, include one or more standard Git patches in fenced
+`diff` blocks. The reader opens in Diff mode when it finds a valid patch and
+provides file (`[`/`]` or arrow keys), hunk (`p`/`n`), unified/side-by-side
+(`m`), and Markdown/diff (`d`) navigation. Changed spans inside paired removed
+and added lines are emphasized. Binary and mode-only files remain visible even
+when they have no text hunk.
+
+The browser and terminal diffs also apply local, path-aware syntax colors to
+common source formats. Patch text remains inert text; syntax highlighting does
+not inject it as HTML or fetch a remote grammar.
+
+Use `f` to attach feedback to the current hunk, `t` to add a file todo, and `z`
+to undo the most recent unsent note. Notes become durable structured response
+items when Request Changes is submitted; `review wait --json` returns their
+file paths, stable hunk IDs, kinds, and messages. Open notes prevent accidental
+Approve or Reject decisions. The review surface is intentionally read-only:
+staging, reverting, or editing would invalidate the frozen snapshot being
+approved. Change Reviews with no native diff or with parser safety warnings
+cannot be approved; the human can still Request Changes or Reject them.
 
 The default state directory is:
 

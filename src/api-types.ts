@@ -3,19 +3,23 @@ import type {
   DocumentKind,
   ReadingStatus,
   ReviewKind,
+  ReviewFeedbackItem,
   ReviewOutcome,
   ReviewRequest,
   ReviewStatus,
 } from "./domain.js";
+import type { ChangeReviewDiff } from "./change-review.js";
 
 export type {
   Attention,
   DocumentKind,
   ReadingStatus,
   ReviewKind,
+  ReviewFeedbackItem,
   ReviewOutcome,
   ReviewStatus,
 };
+export type { ChangeReviewDiff } from "./change-review.js";
 
 export interface PublicDocument {
   id: string;
@@ -83,6 +87,7 @@ export interface ReviewRequestRegistration {
 export interface ReviewRequestResponse {
   outcome: ReviewOutcome;
   message: string;
+  items?: ReviewFeedbackItem[];
 }
 
 export interface HealthData {
@@ -102,6 +107,7 @@ export interface WebRender {
   document: PublicDocument;
   target: "web";
   content: string;
+  changeReview?: ChangeReviewDiff;
 }
 
 export interface TerminalRender {
@@ -110,6 +116,7 @@ export interface TerminalRender {
   content: string;
   backend: string;
   warnings: string[];
+  changeReview?: ChangeReviewDiff;
 }
 
 export type DocumentRender = WebRender | TerminalRender;

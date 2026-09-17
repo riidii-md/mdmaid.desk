@@ -40,6 +40,10 @@ import {
 } from "./live-sources.js";
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import {
+  changeReviewNarrative,
+  parseChangeReviewDiffs,
+} from "./change-review.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
@@ -546,10 +550,16 @@ async function handleRequest(
       throw new HttpError(400, "invalid_target", "Unknown render target");
     }
     const { content, document } = await readDocument(catalog, id);
+    const changeReview = document.kind === "change-review"
+      ? parseChangeReviewDiffs(content)
+      : undefined;
+    const narrative = document.kind === "change-review"
+      ? changeReviewNarrative(content)
+      : content;
     if (target === "web") {
       const documentTargets = catalog.resolveDocumentSourceTargets(document.id);
       const rendered = sanitizeRenderedHtml(
-        await renderMarkdown(content, { sanitize: false }),
+        await renderMarkdown(narrative, { sanitize: false }),
         document,
         documentTargets,
       );
@@ -558,6 +568,7 @@ async function handleRequest(
           document: publicDocument(document),
           target,
           content: rendered,
+          ...(changeReview === undefined ? {} : { changeReview }),
         },
       });
       return;
@@ -569,7 +580,7 @@ async function handleRequest(
       "unicode",
       true,
     );
-    const rendered = await renderMarkdownToTui(content, {
+    const rendered = await renderMarkdownToTui(narrative, {
       backend: "beautiful-mermaid",
       color,
       unicode,
@@ -582,6 +593,7 @@ async function handleRequest(
         content: sanitizeTerminalText(rendered.output, { preserveSgr: true }),
         backend: rendered.backend,
         warnings: rendered.warnings.map((warning) => sanitizeTerminalText(warning)),
+        ...(changeReview === undefined ? {} : { changeReview }),
       },
     });
     return;
@@ -1150,9 +1162,10 @@ function isReviewRequestResponse(
 ): value is ReviewRequestResponse {
   return (
     isRecord(value) &&
-    hasOnlyKeys(value, ["outcome", "message"]) &&
+    hasOnlyKeys(value, ["outcome", "message", "items"]) &&
     typeof value.outcome === "string" &&
-    typeof value.message === "string"
+    typeof value.message === "string" &&
+    (value.items === undefined || Array.isArray(value.items))
   );
 }
 
@@ -1279,7 +1292,7 @@ function workspaceHtml(pathname: string): string {
     <header class="topbar">
       <div class="brand">
         <strong>mdmaid.desk</strong>
-        <span>document workspace</span>
+        <span>reading + change review workspace</span>
       </div>
       <div class="top-actions">
         <span id="live-status" class="live offline">○ connecting</span>
@@ -1290,6 +1303,12 @@ function workspaceHtml(pathname: string): string {
       <aside class="sidebar">
         <h2>projects</h2>
         <nav id="project-nav" class="project-nav" data-testid="project-nav"></nav>
+        <section class="actions-nav" aria-labelledby="spaces-title">
+          <h2 id="spaces-title">spaces</h2>
+          <button id="change-reviews-filter" class="project-button" type="button">
+            <span>change reviews</span><span id="change-reviews-count" class="count">0</span>
+          </button>
+        </section>
         <section class="actions-nav" aria-labelledby="actions-title">
           <h2 id="actions-title">actions</h2>
           <button id="actions-filter" class="project-button" type="button">
@@ -1313,8 +1332,8 @@ function workspaceHtml(pathname: string): string {
           <div class="queue-header">
             <div class="queue-title-row">
               <div>
-                <span class="eyebrow">persistent reading queue</span>
-                <h1>What needs your eyes?</h1>
+                <span id="queue-eyebrow" class="eyebrow">persistent reading queue</span>
+                <h1 id="queue-title">What needs your eyes?</h1>
               </div>
               <p>opening means reading · only you mark done</p>
             </div>
@@ -1352,10 +1371,33 @@ function workspaceHtml(pathname: string): string {
             </div>
           </div>
           <header class="reader-heading">
-            <span class="eyebrow">document</span>
+            <span id="reader-eyebrow" class="eyebrow">document</span>
             <h1 id="reader-title">Document</h1>
             <p id="reader-meta"></p>
           </header>
+          <div class="change-view-switcher" aria-label="Change review view">
+            <button id="change-view-diff" class="action active" type="button" hidden>native diff</button>
+            <button id="change-view-document" class="action" type="button" hidden>review document</button>
+          </div>
+          <section id="change-review-viewer" class="change-review-viewer" aria-label="Native change review" hidden>
+            <div class="change-review-toolbar">
+              <div class="change-review-navigation">
+                <button id="change-file-previous" class="action" type="button">← file</button>
+                <button id="change-file-next" class="action" type="button">file →</button>
+                <button id="change-hunk-previous" class="action" type="button">← hunk</button>
+                <button id="change-hunk-next" class="action" type="button">hunk →</button>
+              </div>
+              <span id="change-position" class="change-position"></span>
+              <button id="change-layout" class="action" type="button">side-by-side</button>
+            </div>
+            <div class="change-review-workspace">
+              <aside class="change-file-sidebar" aria-label="Changed files">
+                <strong>files</strong>
+                <nav id="change-file-list" class="change-file-list"></nav>
+              </aside>
+              <div id="change-diff-stage" class="change-diff-stage"></div>
+            </div>
+          </section>
           <div id="reader-content" class="reader-content"></div>
           <section id="review-panel" class="review-panel" aria-labelledby="review-title" hidden>
             <span class="eyebrow">action required</span>

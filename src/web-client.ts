@@ -1,12 +1,18 @@
 /* mdmaid.desk web client */
 
 import type {
+  ChangeReviewDiff,
   PublicDocument,
   PublicReviewRequest,
   PublicWorkspace,
   ReadingStatus,
   ReviewOutcome,
 } from "./api-types.js";
+import type {
+  ChangeLineKind,
+  ChangeReviewHunk,
+  ChangeReviewLine,
+} from "./change-review.js";
 
 export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
@@ -19,6 +25,37 @@ export interface WebFilters {
   status?: WebReadingStatus | "all" | undefined;
   search?: string | undefined;
   actionsOnly?: boolean | undefined;
+  changeReviewsOnly?: boolean | undefined;
+}
+
+export interface WebDiffCell {
+  kind: ChangeLineKind;
+  line: number | null;
+  prefix: string;
+  changed: string;
+  suffix: string;
+}
+
+export interface WebDiffRow {
+  old?: WebDiffCell;
+  new?: WebDiffCell;
+}
+
+export type WebSyntaxKind =
+  | "plain"
+  | "comment"
+  | "function"
+  | "keyword"
+  | "literal"
+  | "number"
+  | "operator"
+  | "property"
+  | "string"
+  | "type";
+
+export interface WebSyntaxToken {
+  kind: WebSyntaxKind;
+  text: string;
 }
 
 export interface DocumentOutlineItem {
@@ -60,10 +97,228 @@ interface PrintTarget {
   print(): void;
 }
 
+type SyntaxLanguage =
+  | "c-like"
+  | "css"
+  | "go"
+  | "javascript"
+  | "json"
+  | "markup"
+  | "markdown"
+  | "python"
+  | "ruby"
+  | "rust"
+  | "shell"
+  | "sql"
+  | "yaml";
+
+const SYNTAX_LANGUAGE_BY_EXTENSION: Readonly<Record<string, SyntaxLanguage>> = {
+  bash: "shell",
+  c: "c-like",
+  cc: "c-like",
+  cjs: "javascript",
+  cpp: "c-like",
+  cs: "c-like",
+  css: "css",
+  cts: "javascript",
+  go: "go",
+  h: "c-like",
+  hpp: "c-like",
+  htm: "markup",
+  html: "markup",
+  java: "c-like",
+  js: "javascript",
+  json: "json",
+  jsonc: "json",
+  jsx: "javascript",
+  kt: "c-like",
+  kts: "c-like",
+  less: "css",
+  md: "markdown",
+  markdown: "markdown",
+  mjs: "javascript",
+  mts: "javascript",
+  php: "c-like",
+  py: "python",
+  rb: "ruby",
+  rs: "rust",
+  scss: "css",
+  sh: "shell",
+  sql: "sql",
+  svg: "markup",
+  swift: "c-like",
+  ts: "javascript",
+  tsx: "javascript",
+  xml: "markup",
+  yaml: "yaml",
+  yml: "yaml",
+  zsh: "shell",
+};
+
+const SYNTAX_KEYWORDS: Readonly<Record<SyntaxLanguage, ReadonlySet<string>>> = {
+  "c-like": new Set([
+    "abstract", "as", "async", "await", "break", "case", "catch", "class",
+    "const", "continue", "default", "do", "else", "enum", "extends", "final",
+    "finally", "for", "foreach", "if", "implements", "import", "in", "interface",
+    "namespace", "new", "override", "package", "private", "protected", "public",
+    "return", "static", "struct", "switch", "throw", "throws", "try", "using",
+    "var", "while", "yield",
+  ]),
+  css: new Set(["@import", "@media", "from", "to"]),
+  go: new Set([
+    "break", "case", "chan", "const", "continue", "default", "defer", "else",
+    "fallthrough", "for", "func", "go", "goto", "if", "import", "interface",
+    "map", "package", "range", "return", "select", "struct", "switch", "type",
+    "var",
+  ]),
+  javascript: new Set([
+    "as", "async", "await", "break", "case", "catch", "class", "const",
+    "continue", "debugger", "default", "delete", "do", "else", "export",
+    "extends", "finally", "for", "from", "function", "get", "if", "implements",
+    "import", "in", "instanceof", "interface", "let", "new", "of", "private",
+    "protected", "public", "readonly", "return", "set", "static", "switch",
+    "throw", "try", "type", "typeof", "var", "void", "while", "with", "yield",
+  ]),
+  json: new Set(),
+  markdown: new Set(),
+  markup: new Set(),
+  python: new Set([
+    "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+    "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass",
+    "raise", "return", "try", "while", "with", "yield",
+  ]),
+  ruby: new Set([
+    "alias", "begin", "break", "case", "class", "def", "defined", "do", "else",
+    "elsif", "end", "ensure", "for", "if", "in", "module", "next", "redo",
+    "rescue", "retry", "return", "self", "super", "then", "undef", "unless",
+    "until", "when", "while", "yield",
+  ]),
+  rust: new Set([
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else",
+    "enum", "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match",
+    "mod", "move", "mut", "pub", "ref", "return", "self", "static", "struct",
+    "super", "trait", "type", "unsafe", "use", "where", "while",
+  ]),
+  shell: new Set([
+    "case", "do", "done", "elif", "else", "esac", "export", "fi", "for",
+    "function", "if", "in", "local", "readonly", "select", "then", "until",
+    "while",
+  ]),
+  sql: new Set([
+    "alter", "and", "as", "asc", "begin", "by", "case", "create", "delete",
+    "desc", "distinct", "drop", "else", "end", "from", "group", "having",
+    "in", "index", "inner", "insert", "into", "is", "join", "left", "limit",
+    "not", "null", "offset", "on", "or", "order", "outer", "returning", "right",
+    "select", "set", "table", "then", "union", "update", "values", "when", "where",
+  ]),
+  yaml: new Set(),
+};
+
+const SYNTAX_LITERALS = new Set([
+  "false", "nil", "none", "null", "true", "undefined",
+]);
+const SYNTAX_TYPES = new Set([
+  "any", "bool", "boolean", "byte", "char", "double", "error", "float",
+  "int", "integer", "never", "number", "object", "short", "string", "symbol",
+  "unknown", "void",
+]);
+
+export function highlightDiffLine(path: string, source: string): WebSyntaxToken[] {
+  const basename = path.split("/").at(-1)?.toLowerCase() ?? "";
+  const extension = basename.includes(".") ? basename.split(".").at(-1) ?? "" : "";
+  const language = basename === "dockerfile" || basename === "makefile"
+    ? "shell"
+    : SYNTAX_LANGUAGE_BY_EXTENSION[extension];
+  if (!language || source === "") {
+    return source === "" ? [] : [{ kind: "plain", text: source }];
+  }
+
+  const tokens: WebSyntaxToken[] = [];
+  const push = (kind: WebSyntaxKind, text: string): void => {
+    if (text === "") return;
+    const previous = tokens.at(-1);
+    if (previous?.kind === kind) previous.text += text;
+    else tokens.push({ kind, text });
+  };
+  const lineComment = language === "python" || language === "ruby" ||
+      language === "shell" || language === "yaml"
+    ? "#"
+    : language === "sql"
+      ? "--"
+      : language === "javascript" || language === "c-like" ||
+          language === "go" || language === "rust"
+        ? "//"
+        : undefined;
+  const keywords = SYNTAX_KEYWORDS[language];
+  let cursor = 0;
+  while (cursor < source.length) {
+    if (lineComment && source.startsWith(lineComment, cursor)) {
+      push("comment", source.slice(cursor));
+      break;
+    }
+    if (source.startsWith("/*", cursor)) {
+      const close = source.indexOf("*/", cursor + 2);
+      const end = close === -1 ? source.length : close + 2;
+      push("comment", source.slice(cursor, end));
+      cursor = end;
+      continue;
+    }
+
+    const character = source[cursor] ?? "";
+    if (character === '"' || character === "'" || character === "`") {
+      let end = cursor + 1;
+      while (end < source.length) {
+        if (source[end] === "\\") {
+          end += 2;
+          continue;
+        }
+        const candidate = source[end];
+        end += 1;
+        if (candidate === character) break;
+      }
+      push("string", source.slice(cursor, end));
+      cursor = end;
+      continue;
+    }
+
+    const tail = source.slice(cursor);
+    const number = tail.match(/^(?:0[xob][\da-f]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)/i)?.[0];
+    if (number) {
+      push("number", number);
+      cursor += number.length;
+      continue;
+    }
+    const identifier = tail.match(/^[A-Za-z_$][\w$]*/)?.[0];
+    if (identifier) {
+      const after = source.slice(cursor + identifier.length);
+      const normalized = language === "sql" ? identifier.toLowerCase() : identifier;
+      let kind: WebSyntaxKind = "plain";
+      if (keywords.has(normalized)) kind = "keyword";
+      else if (SYNTAX_LITERALS.has(normalized.toLowerCase())) kind = "literal";
+      else if (SYNTAX_TYPES.has(normalized.toLowerCase()) || /^[A-Z][\w$]*$/.test(identifier)) {
+        kind = "type";
+      } else if (/^\s*\(/.test(after)) kind = "function";
+      else if (/^\s*:/.test(after)) kind = "property";
+      push(kind, identifier);
+      cursor += identifier.length;
+      continue;
+    }
+    if (/[{}()[\],;:?=+\-*/%<>!&|^~@]/.test(character)) {
+      push("operator", character);
+    } else {
+      push("plain", character);
+    }
+    cursor += 1;
+  }
+  return tokens;
+}
+
 interface RenderedDocument {
   document: WebDocument;
   target: "web";
   content: string;
+  changeReview?: ChangeReviewDiff;
 }
 
 interface WebState {
@@ -103,6 +358,19 @@ export function filterQueue(
     .filter(Boolean);
   return documents.filter((document) => {
     if (
+      filters.changeReviewsOnly === true &&
+      document.kind !== "change-review"
+    ) {
+      return false;
+    }
+    if (
+      filters.changeReviewsOnly !== true &&
+      filters.actionsOnly !== true &&
+      document.kind === "change-review"
+    ) {
+      return false;
+    }
+    if (
       filters.actionsOnly === true &&
       pendingReviewForDocument(reviewRequests, document.id) === undefined
     ) {
@@ -138,6 +406,98 @@ export function filterQueue(
       .toLowerCase();
     return terms.every((term) => haystack.includes(term));
   });
+}
+
+export function webDiffRows(hunk: ChangeReviewHunk): WebDiffRow[] {
+  const rows: WebDiffRow[] = [];
+  for (let index = 0; index < hunk.lines.length; index += 1) {
+    const line = hunk.lines[index]!;
+    const next = hunk.lines[index + 1];
+    if (line.kind === "deletion" && next?.kind === "addition") {
+      const segments = webChangedSegments(line.text, next.text);
+      rows.push({
+        old: diffCell(line, segments.prefix, segments.oldChanged, segments.suffix),
+        new: diffCell(next, segments.prefix, segments.newChanged, segments.suffix),
+      });
+      index += 1;
+    } else if (line.kind === "context") {
+      rows.push({
+        old: diffCell(line, line.text, "", ""),
+        new: diffCell(line, line.text, "", ""),
+      });
+    } else if (line.kind === "deletion") {
+      rows.push({ old: diffCell(line, line.text, "", "") });
+    } else {
+      rows.push({ new: diffCell(line, line.text, "", "") });
+    }
+  }
+  return rows;
+}
+
+export function changeReviewApprovalError(
+  changeReview: ChangeReviewDiff | undefined,
+): string | undefined {
+  if (changeReview && changeReview.warnings.length > 0) {
+    return "This native diff is incomplete and cannot be approved.";
+  }
+  if (!changeReview || changeReview.files.length === 0) {
+    return "A complete native diff is required before approval.";
+  }
+  return undefined;
+}
+
+function diffCell(
+  line: ChangeReviewLine,
+  prefix: string,
+  changed: string,
+  suffix: string,
+): WebDiffCell {
+  return {
+    kind: line.kind,
+    line: line.kind === "addition" ? line.newLine : line.oldLine,
+    prefix,
+    changed,
+    suffix,
+  };
+}
+
+function webChangedSegments(oldText: string, newText: string): {
+  prefix: string;
+  oldChanged: string;
+  newChanged: string;
+  suffix: string;
+} {
+  const oldCharacters = Array.from(oldText);
+  const newCharacters = Array.from(newText);
+  let prefixLength = 0;
+  while (
+    prefixLength < oldCharacters.length &&
+    prefixLength < newCharacters.length &&
+    oldCharacters[prefixLength] === newCharacters[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+  let suffixLength = 0;
+  while (
+    suffixLength < oldCharacters.length - prefixLength &&
+    suffixLength < newCharacters.length - prefixLength &&
+    oldCharacters[oldCharacters.length - suffixLength - 1] ===
+      newCharacters[newCharacters.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
+  }
+  return {
+    prefix: oldCharacters.slice(0, prefixLength).join(""),
+    oldChanged: oldCharacters
+      .slice(prefixLength, oldCharacters.length - suffixLength)
+      .join(""),
+    newChanged: newCharacters
+      .slice(prefixLength, newCharacters.length - suffixLength)
+      .join(""),
+    suffix: suffixLength === 0
+      ? ""
+      : oldCharacters.slice(oldCharacters.length - suffixLength).join(""),
+  };
 }
 
 export function pendingReviewForDocument(
@@ -397,12 +757,28 @@ async function boot(): Promise<void> {
   };
 
   const projectNav = element("project-nav");
+  const changeReviewsFilter = element("change-reviews-filter") as HTMLButtonElement;
+  const changeReviewsCount = element("change-reviews-count");
   const actionsFilter = element("actions-filter") as HTMLButtonElement;
   const actionsCount = element("actions-count");
   const queue = element("document-queue");
+  const queueEyebrow = element("queue-eyebrow");
+  const queueTitle = element("queue-title");
   const queuePanel = element("queue-panel");
   const reader = element("document-reader");
   const readerContent = element("reader-content");
+  const readerEyebrow = element("reader-eyebrow");
+  const changeReviewViewer = element("change-review-viewer");
+  const changeFileList = element("change-file-list");
+  const changeDiffStage = element("change-diff-stage");
+  const changePosition = element("change-position");
+  const changeFilePrevious = element("change-file-previous") as HTMLButtonElement;
+  const changeFileNext = element("change-file-next") as HTMLButtonElement;
+  const changeHunkPrevious = element("change-hunk-previous") as HTMLButtonElement;
+  const changeHunkNext = element("change-hunk-next") as HTMLButtonElement;
+  const changeLayout = element("change-layout") as HTMLButtonElement;
+  const changeViewDiff = element("change-view-diff") as HTMLButtonElement;
+  const changeViewDocument = element("change-view-document") as HTMLButtonElement;
   const readerToc = element("reader-toc");
   const readerTocList = element("reader-toc-list");
   const readerTitle = element("reader-title");
@@ -429,6 +805,11 @@ async function boot(): Promise<void> {
     document.querySelectorAll<HTMLButtonElement>("[data-grouping]"),
   );
   let renderedRevision: number | undefined;
+  let renderedChangeReview: ChangeReviewDiff | undefined;
+  let changeFileIndex = 0;
+  let changeHunkIndex = 0;
+  let changeReviewLayout: "unified" | "side-by-side" = "side-by-side";
+  let changeReviewView: "diff" | "document" = "diff";
   let renderSequence = 0;
   let catalogRefresh = Promise.resolve();
 
@@ -454,14 +835,17 @@ async function boot(): Promise<void> {
 
   function renderProjects(): void {
     projectNav.replaceChildren();
-    const workspaces = visibleWorkspaces(state.documents, state.workspaces);
+    const ordinaryDocuments = state.documents.filter(
+      ({ kind }) => kind !== "change-review",
+    );
+    const workspaces = visibleWorkspaces(ordinaryDocuments, state.workspaces);
     if (
       state.filters.workspaceId !== undefined &&
       !workspaces.some(({ id }) => id === state.filters.workspaceId)
     ) {
       state.filters.workspaceId = undefined;
     }
-    const all = projectButton("all projects", state.documents.length, undefined);
+    const all = projectButton("all projects", ordinaryDocuments.length, undefined);
     projectNav.append(all);
     for (const workspace of workspaces) {
       projectNav.append(
@@ -477,6 +861,14 @@ async function boot(): Promise<void> {
     ).length;
     actionsCount.textContent = String(pendingCount);
     actionsFilter.classList.toggle("active", state.filters.actionsOnly === true);
+    const reviewCount = state.documents.filter(
+      ({ archivedAt, kind }) => archivedAt === null && kind === "change-review",
+    ).length;
+    changeReviewsCount.textContent = String(reviewCount);
+    changeReviewsFilter.classList.toggle(
+      "active",
+      state.filters.changeReviewsOnly === true,
+    );
   }
 
   function projectButton(
@@ -486,7 +878,11 @@ async function boot(): Promise<void> {
   ): HTMLButtonElement {
     const button = document.createElement("button");
     button.className = "project-button";
-    if (state.filters.workspaceId === workspaceId) {
+    if (
+      state.filters.workspaceId === workspaceId &&
+      state.filters.changeReviewsOnly !== true &&
+      state.filters.actionsOnly !== true
+    ) {
       button.classList.add("active");
     }
     button.type = "button";
@@ -499,18 +895,19 @@ async function boot(): Promise<void> {
     button.addEventListener("click", () => {
       state.filters.workspaceId = workspaceId;
       state.filters.actionsOnly = false;
+      state.filters.changeReviewsOnly = false;
       render();
     });
     return button;
   }
 
   function renderStatusCounts(): void {
-    const source =
-      state.filters.workspaceId === undefined
-        ? state.documents
-        : state.documents.filter(
-            ({ workspaceId }) => workspaceId === state.filters.workspaceId,
-          );
+    const source = filterQueue(state.documents, {
+      workspaceId: state.filters.workspaceId,
+      status: "all",
+      actionsOnly: state.filters.actionsOnly,
+      changeReviewsOnly: state.filters.changeReviewsOnly,
+    }, state.reviewRequests);
     const counts = queueCounts(source);
     for (const button of statusButtons) {
       const status = button.dataset.statusFilter as keyof typeof counts;
@@ -529,6 +926,11 @@ async function boot(): Promise<void> {
       state.filters,
       state.reviewRequests,
     );
+    const changes = state.filters.changeReviewsOnly === true;
+    queueEyebrow.textContent = changes
+      ? "implementation review workspace"
+      : "persistent reading queue";
+    queueTitle.textContent = changes ? "Change Reviews" : "What needs your eyes?";
     empty.toggleAttribute("hidden", documents.length !== 0);
     for (const group of groupQueue(documents, state.grouping, state.workspaces)) {
       const grid = document.createElement("div");
@@ -685,6 +1087,203 @@ async function boot(): Promise<void> {
           .filter(Boolean)
           .join(" / ")
       : "";
+    readerEyebrow.textContent = selected?.kind === "change-review"
+      ? "change review"
+      : "document";
+  }
+
+  function renderChangeReview(): void {
+    const review = renderedChangeReview;
+    const showDiff = Boolean(
+      review && review.files.length > 0 && changeReviewView === "diff",
+    );
+    changeReviewViewer.toggleAttribute("hidden", !showDiff);
+    readerContent.toggleAttribute("hidden", showDiff);
+    changeViewDiff.classList.toggle("active", showDiff);
+    changeViewDocument.classList.toggle("active", !showDiff);
+    changeViewDiff.toggleAttribute("hidden", !review);
+    changeViewDocument.toggleAttribute("hidden", !review);
+    if (showDiff) {
+      readerToc.setAttribute("hidden", "");
+    } else {
+      renderDocumentOutline();
+    }
+    if (!review || !showDiff) {
+      return;
+    }
+    changeFileIndex = clamp(changeFileIndex, 0, review.files.length - 1);
+    const file = review.files[changeFileIndex]!;
+    changeHunkIndex = clamp(
+      changeHunkIndex,
+      0,
+      Math.max(0, file.hunks.length - 1),
+    );
+    const hunk = file.hunks[changeHunkIndex];
+    changeFileList.replaceChildren();
+    review.files.forEach((candidate, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "change-file-button";
+      button.classList.toggle("active", index === changeFileIndex);
+      button.textContent = `${changeStatusSymbol(candidate.status)} ${candidate.path}`;
+      button.addEventListener("click", () => {
+        changeFileIndex = index;
+        changeHunkIndex = 0;
+        renderChangeReview();
+      });
+      changeFileList.append(button);
+    });
+    changeFilePrevious.disabled = changeFileIndex === 0;
+    changeFileNext.disabled = changeFileIndex === review.files.length - 1;
+    changeHunkPrevious.disabled = !hunk || changeHunkIndex === 0;
+    changeHunkNext.disabled = !hunk || changeHunkIndex === file.hunks.length - 1;
+    changeLayout.textContent = changeReviewLayout === "side-by-side"
+      ? "side-by-side"
+      : "unified";
+    changePosition.textContent = [
+      `file ${changeFileIndex + 1}/${review.files.length}`,
+      `hunk ${hunk ? changeHunkIndex + 1 : 0}/${file.hunks.length}`,
+    ].join(" · ");
+    changeDiffStage.replaceChildren();
+    for (const warning of review.warnings) {
+      const warningElement = document.createElement("p");
+      warningElement.className = "change-warning";
+      warningElement.textContent = `warning: ${warning}`;
+      changeDiffStage.append(warningElement);
+    }
+    const heading = document.createElement("header");
+    heading.className = "change-file-heading";
+    const path = document.createElement("strong");
+    path.textContent = `${changeStatusSymbol(file.status)} ${file.path}`;
+    const details = document.createElement("span");
+    details.textContent = file.previousPath
+      ? `renamed from ${file.previousPath}`
+      : file.status;
+    heading.append(path, details);
+    changeDiffStage.append(heading);
+    if (!hunk) {
+      const emptyHunk = document.createElement("p");
+      emptyHunk.className = "change-empty";
+      emptyHunk.textContent = "No text hunks. This is a binary or mode-only change.";
+      changeDiffStage.append(emptyHunk);
+      return;
+    }
+    const hunkHeader = document.createElement("div");
+    hunkHeader.className = "change-hunk-header";
+    hunkHeader.textContent = hunk.header;
+    changeDiffStage.append(hunkHeader);
+    const table = document.createElement("div");
+    table.className = `native-diff ${changeReviewLayout}`;
+    if (changeReviewLayout === "side-by-side") {
+      const labels = document.createElement("div");
+      labels.className = "diff-labels";
+      const oldLabel = document.createElement("span");
+      oldLabel.textContent = "old";
+      const newLabel = document.createElement("span");
+      newLabel.textContent = "new";
+      labels.append(oldLabel, newLabel);
+      table.append(labels);
+      for (const row of webDiffRows(hunk)) {
+        const rowElement = document.createElement("div");
+        rowElement.className = "diff-row";
+        rowElement.append(
+          renderDiffCell(row.old, file.path),
+          renderDiffCell(row.new, file.path),
+        );
+        table.append(rowElement);
+      }
+    } else {
+      for (const row of webDiffRows(hunk)) {
+        if (row.old?.kind === "context") {
+          table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path));
+        } else {
+          if (row.old) table.append(renderUnifiedCell(row.old, null, file.path));
+          if (row.new) table.append(renderUnifiedCell(row.new, row.new.line, file.path));
+        }
+      }
+    }
+    changeDiffStage.append(table);
+  }
+
+  function renderDiffCell(cell: WebDiffCell | undefined, path: string): HTMLElement {
+    const value = document.createElement("div");
+    value.className = `diff-cell${cell ? ` ${cell.kind}` : " empty-cell"}`;
+    if (!cell) return value;
+    const line = document.createElement("span");
+    line.className = "diff-line-number";
+    line.textContent = cell.line === null ? "" : String(cell.line);
+    value.append(line, diffText(cell, path));
+    return value;
+  }
+
+  function renderUnifiedCell(
+    cell: WebDiffCell,
+    newLine: number | null,
+    path: string,
+  ): HTMLElement {
+    const value = document.createElement("div");
+    value.className = `diff-unified-line ${cell.kind}`;
+    const oldNumber = document.createElement("span");
+    oldNumber.className = "diff-line-number";
+    oldNumber.textContent = cell.kind === "addition" || cell.line === null
+      ? ""
+      : String(cell.line);
+    const newNumber = document.createElement("span");
+    newNumber.className = "diff-line-number";
+    newNumber.textContent = newLine === null ? "" : String(newLine);
+    value.append(oldNumber, newNumber, diffText(cell, path));
+    return value;
+  }
+
+  function diffText(cell: WebDiffCell, path: string): HTMLElement {
+    const code = document.createElement("code");
+    const marker = cell.kind === "addition" ? "+" : cell.kind === "deletion" ? "−" : " ";
+    code.append(document.createTextNode(marker));
+    const source = `${cell.prefix}${cell.changed}${cell.suffix}`;
+    const changedStart = cell.prefix.length;
+    const changedEnd = changedStart + cell.changed.length;
+    let emphasis: HTMLElement | undefined;
+    let offset = 0;
+    for (const token of highlightDiffLine(path, source)) {
+      const boundaries = [0, token.text.length];
+      for (const boundary of [changedStart - offset, changedEnd - offset]) {
+        if (boundary > 0 && boundary < token.text.length) boundaries.push(boundary);
+      }
+      boundaries.sort((left, right) => left - right);
+      for (let index = 0; index < boundaries.length - 1; index += 1) {
+        const start = boundaries[index] ?? 0;
+        const end = boundaries[index + 1] ?? token.text.length;
+        const absoluteStart = offset + start;
+        const withinChange = cell.changed !== "" &&
+          absoluteStart >= changedStart && absoluteStart < changedEnd;
+        let target: HTMLElement = code;
+        if (withinChange) {
+          if (!emphasis) {
+            emphasis = document.createElement("mark");
+            code.append(emphasis);
+          }
+          target = emphasis;
+        }
+        appendSyntaxToken(target, token.kind, token.text.slice(start, end));
+      }
+      offset += token.text.length;
+    }
+    return code;
+  }
+
+  function appendSyntaxToken(
+    parent: HTMLElement,
+    kind: WebSyntaxKind,
+    text: string,
+  ): void {
+    if (kind === "plain") {
+      parent.append(document.createTextNode(text));
+      return;
+    }
+    const span = document.createElement("span");
+    span.className = `syntax-${kind}`;
+    span.textContent = text;
+    parent.append(span);
   }
 
   function captureHeadingPosition(): HeadingPosition | undefined {
@@ -743,8 +1342,12 @@ async function boot(): Promise<void> {
         return;
       }
       setMissingReader(false);
+      renderedChangeReview = rendered.changeReview;
+      changeFileIndex = 0;
+      changeHunkIndex = 0;
+      changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
-      renderDocumentOutline();
+      renderChangeReview();
       if (window.mermaid) {
         window.mermaid.initialize({
           startOnLoad: false,
@@ -884,7 +1487,12 @@ async function boot(): Promise<void> {
       return;
     }
     const message = reviewResponse.value;
-    const validation = reviewResponseError(outcome, message);
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    const validation =
+      selected?.kind === "change-review" && outcome === "approved"
+        ? changeReviewApprovalError(renderedChangeReview) ??
+          reviewResponseError(outcome, message)
+        : reviewResponseError(outcome, message);
     if (validation) {
       reviewError.textContent = validation;
       reviewResponse.focus();
@@ -920,6 +1528,8 @@ async function boot(): Promise<void> {
 
   function showMissingSource(item: WebDocument): void {
     setMissingReader(true);
+    renderedChangeReview = undefined;
+    renderChangeReview();
     readerTitle.textContent = item.title;
     readerContent.replaceChildren();
     const title = document.createElement("strong");
@@ -944,6 +1554,7 @@ async function boot(): Promise<void> {
   function closeReader(pushHistory = true): void {
     renderSequence += 1;
     renderedRevision = undefined;
+    renderedChangeReview = undefined;
     state.selectedId = undefined;
     reader.setAttribute("hidden", "");
     readerToc.setAttribute("hidden", "");
@@ -987,7 +1598,44 @@ async function boot(): Promise<void> {
   });
   actionsFilter.addEventListener("click", () => {
     state.filters.actionsOnly = state.filters.actionsOnly !== true;
+    state.filters.changeReviewsOnly = false;
     render();
+  });
+  changeReviewsFilter.addEventListener("click", () => {
+    state.filters.changeReviewsOnly = true;
+    state.filters.actionsOnly = false;
+    state.filters.workspaceId = undefined;
+    render();
+  });
+  changeFilePrevious.addEventListener("click", () => {
+    changeFileIndex -= 1;
+    changeHunkIndex = 0;
+    renderChangeReview();
+  });
+  changeFileNext.addEventListener("click", () => {
+    changeFileIndex += 1;
+    changeHunkIndex = 0;
+    renderChangeReview();
+  });
+  changeHunkPrevious.addEventListener("click", () => {
+    changeHunkIndex -= 1;
+    renderChangeReview();
+  });
+  changeHunkNext.addEventListener("click", () => {
+    changeHunkIndex += 1;
+    renderChangeReview();
+  });
+  changeLayout.addEventListener("click", () => {
+    changeReviewLayout = changeReviewLayout === "unified" ? "side-by-side" : "unified";
+    renderChangeReview();
+  });
+  changeViewDiff.addEventListener("click", () => {
+    changeReviewView = "diff";
+    renderChangeReview();
+  });
+  changeViewDocument.addEventListener("click", () => {
+    changeReviewView = "document";
+    renderChangeReview();
   });
   for (const button of statusButtons) {
     button.addEventListener("click", () => {
@@ -1109,6 +1757,20 @@ function element(id: string): HTMLElement {
     throw new Error(`Missing web element #${id}`);
   }
   return value;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(value, minimum), maximum);
+}
+
+function changeStatusSymbol(status: ChangeReviewDiff["files"][number]["status"]): string {
+  return status === "added"
+    ? "A"
+    : status === "deleted"
+      ? "D"
+      : status === "renamed"
+        ? "R"
+        : "M";
 }
 
 function showBootFailure(error: unknown): void {

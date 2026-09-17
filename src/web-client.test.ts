@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  changeReviewApprovalError,
   documentFragmentId,
   documentOutline,
   filterQueue,
   groupQueue,
+  highlightDiffLine,
   isSourceMissing,
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
@@ -16,11 +18,13 @@ import {
   reviewResponseError,
   shouldRefreshWebReader,
   sourceModeLabel,
+  webDiffRows,
   webLoadFailure,
   visibleWorkspaces,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
+import { parseChangeReviewDiffs } from "./change-review.js";
 import type { PublicReviewRequest, PublicWorkspace } from "./api-types.js";
 
 const documents: WebDocument[] = [
@@ -80,6 +84,24 @@ const documents: WebDocument[] = [
     updatedAt: "2026-08-08T12:00:00.000Z",
     route: "/d/doc-33333333333333333333",
   },
+  {
+    id: "doc-44444444444444444444",
+    workspaceId: "alpha",
+    kind: "change-review",
+    storage: "reference",
+    title: "Authentication refactor",
+    attention: "approval",
+    tags: ["review"],
+    revision: 1,
+    openedRevision: null,
+    completedRevision: null,
+    status: "unread",
+    archivedAt: null,
+    missingAt: null,
+    createdAt: "2026-08-08T13:00:00.000Z",
+    updatedAt: "2026-08-08T13:00:00.000Z",
+    route: "/d/doc-44444444444444444444",
+  },
 ];
 
 const pendingReview: PublicReviewRequest = {
@@ -112,10 +134,95 @@ test("filters the browser queue by workspace, status, and search", () => {
   ]);
 });
 
+test("provides a dedicated browser Change Reviews space", () => {
+  assert.deepEqual(
+    filterQueue(documents, { status: "all", changeReviewsOnly: true }).map(
+      ({ id }) => id,
+    ),
+    ["doc-44444444444444444444"],
+  );
+});
+
+test("builds native unified and side-by-side rows with intra-line changes", () => {
+  const parsed = parseChangeReviewDiffs([
+    "```diff",
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -1 +1 @@",
+    "-return token == expected;",
+    "+return token === expected;",
+    "```",
+  ].join("\n"));
+  const rows = webDiffRows(parsed.files[0]!.hunks[0]!);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.old?.line, 1);
+  assert.equal(rows[0]?.new?.line, 1);
+  assert.equal(rows[0]?.old?.changed, "");
+  assert.equal(rows[0]?.new?.changed, "=");
+  assert.equal(rows[0]?.old?.suffix, " expected;");
+});
+
+test("syntax-highlights code diff lines without changing their text", () => {
+  const source =
+    'const request = await catalog.createReviewRequest({ kind: "change-decision", revision: 3 }); // durable';
+  const tokens = highlightDiffLine("src/catalog.test.ts", source);
+
+  assert.equal(tokens.map(({ text }) => text).join(""), source);
+  assert.deepEqual(
+    tokens
+      .filter(({ kind }) => kind !== "plain")
+      .map(({ kind, text }) => [kind, text]),
+    [
+      ["keyword", "const"],
+      ["operator", "="],
+      ["keyword", "await"],
+      ["function", "createReviewRequest"],
+      ["operator", "({"],
+      ["property", "kind"],
+      ["operator", ":"],
+      ["string", '"change-decision"'],
+      ["operator", ","],
+      ["property", "revision"],
+      ["operator", ":"],
+      ["number", "3"],
+      ["operator", "});"],
+      ["comment", "// durable"],
+    ],
+  );
+});
+
+test("keeps unsupported and hostile diff text as inert plain text", () => {
+  const source = '<script>alert("diff")</script>';
+  assert.deepEqual(highlightDiffLine("fixture.unknown", source), [
+    { kind: "plain", text: source },
+  ]);
+});
+
+test("fails change-review approval closed when the native diff is incomplete", () => {
+  assert.match(changeReviewApprovalError(undefined) ?? "", /native diff/i);
+  assert.match(
+    changeReviewApprovalError({
+      schemaVersion: 1,
+      files: [],
+      warnings: ["A diff hunk was omitted."],
+    }) ?? "",
+    /incomplete/i,
+  );
+  assert.equal(
+    changeReviewApprovalError({
+      schemaVersion: 1,
+      files: [{ path: "README.md", status: "modified", hunks: [] }],
+      warnings: [],
+    }),
+    undefined,
+  );
+});
+
 test("counts reading states for the browser navigation", () => {
   assert.deepEqual(queueCounts(documents), {
-    all: 3,
-    unread: 1,
+    all: 4,
+    unread: 2,
     reading: 1,
     done: 1,
   });
@@ -136,7 +243,7 @@ test("groups the queue by project without changing document order", () => {
     {
       key: "project:alpha",
       label: "Alpha project",
-      documents: [documents[0], documents[2]],
+      documents: [documents[0], documents[2], documents[3]],
     },
     {
       key: "project:beta",

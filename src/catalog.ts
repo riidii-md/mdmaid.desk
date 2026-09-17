@@ -38,9 +38,11 @@ import {
   type DocumentSourceLink,
   type DocumentStorage,
   type ReviewKind,
+  type ReviewFeedbackItem,
   type ReviewOutcome,
   type ReviewRequest,
   type ReviewRequestFilters,
+  type ReviewResponse,
   type StoredReviewRequest,
   type StoredDocument,
   type Workspace,
@@ -63,6 +65,7 @@ export type {
   DocumentStorage,
   ReadingStatus,
   ReviewKind,
+  ReviewFeedbackItem,
   ReviewOutcome,
   ReviewRequest,
   ReviewRequestFilters,
@@ -78,6 +81,9 @@ const MAX_TITLE_LENGTH = 512;
 const MAX_CONTEXT_LENGTH = 256;
 const MAX_LINKED_SOURCE_LINES = 50_000;
 const MAX_REVIEW_MESSAGE_LENGTH = 16 * 1024;
+const MAX_REVIEW_FEEDBACK_ITEMS = 32;
+const MAX_REVIEW_FEEDBACK_MESSAGE_LENGTH = 512;
+const MAX_REVIEW_FEEDBACK_PATH_LENGTH = 1_024;
 const TAG_PATTERN = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
 const WORKSPACE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -134,6 +140,7 @@ export interface CreateReviewRequestInput {
 export interface RespondToReviewRequestInput {
   outcome: ReviewOutcome;
   message: string;
+  items?: ReviewFeedbackItem[];
 }
 
 export interface DocumentSource {
@@ -324,6 +331,22 @@ export class Catalog {
       throw new ReviewConflictError("document is archived");
     }
     if (
+      validated.kind === "change-decision" &&
+      initialDocument.kind !== "change-review"
+    ) {
+      throw new ReviewConflictError(
+        "change-decision requires a change-review document",
+      );
+    }
+    if (
+      initialDocument.kind === "change-review" &&
+      validated.kind !== "change-decision"
+    ) {
+      throw new ReviewConflictError(
+        "change-review documents require a change-decision",
+      );
+    }
+    if (
       validated.documentRevision !== undefined &&
       validated.documentRevision !== initialDocument.revision
     ) {
@@ -410,7 +433,7 @@ export class Catalog {
     if (initial.response !== null) {
       if (
         initial.response.outcome === validated.outcome &&
-        initial.response.message === validated.message
+        sameReviewResponse(initial.response, validated)
       ) {
         return presentReviewRequest(initial);
       }
@@ -453,7 +476,7 @@ export class Catalog {
       if (request.response !== null) {
         if (
           request.response.outcome === validated.outcome &&
-          request.response.message === validated.message
+          sameReviewResponse(request.response, validated)
         ) {
           return presentReviewRequest(request);
         }
@@ -480,6 +503,7 @@ export class Catalog {
         response: {
           outcome: validated.outcome,
           message: validated.message,
+          ...(validated.items === undefined ? {} : { items: validated.items }),
           createdAt: new Date().toISOString(),
         },
       };
@@ -489,7 +513,7 @@ export class Catalog {
       const winner = this.#storage.getReviewRequest(id);
       if (
         winner?.response?.outcome === validated.outcome &&
-        winner.response.message === validated.message
+        sameReviewResponse(winner.response, validated)
       ) {
         return presentReviewRequest(winner);
       }
@@ -1360,7 +1384,7 @@ function validateRespondToReviewRequestInput(
 ): RespondToReviewRequestInput {
   if (
     !isRecord(input) ||
-    !hasOnlyKeys(input, ["outcome", "message"]) ||
+    !hasOnlyKeys(input, ["outcome", "message", "items"]) ||
     typeof input.outcome !== "string" ||
     !isReviewOutcome(input.outcome) ||
     typeof input.message !== "string"
@@ -1371,7 +1395,79 @@ function validateRespondToReviewRequestInput(
   if (input.outcome === "changes_requested" && message.trim() === "") {
     throw new Error("response message is required for requested changes");
   }
-  return { outcome: input.outcome, message };
+  const items = validateReviewFeedbackItems(input.items);
+  if (items.length > 0 && input.outcome !== "changes_requested") {
+    throw new Error("feedback items require a changes_requested outcome");
+  }
+  return {
+    outcome: input.outcome,
+    message,
+    ...(items.length === 0 ? {} : { items }),
+  };
+}
+
+function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > MAX_REVIEW_FEEDBACK_ITEMS) {
+    throw new Error("invalid review feedback items");
+  }
+  return value.map((item) => {
+    if (
+      !isRecord(item) ||
+      !hasOnlyKeys(item, ["id", "kind", "path", "hunkId", "message"]) ||
+      typeof item.id !== "string" ||
+      !/^feedback-[a-f0-9]{20}$/.test(item.id) ||
+      (item.kind !== "feedback" && item.kind !== "todo") ||
+      typeof item.path !== "string" ||
+      !isSafeReviewPath(item.path) ||
+      typeof item.message !== "string" ||
+      item.message.trim() === "" ||
+      item.message.length > MAX_REVIEW_FEEDBACK_MESSAGE_LENGTH ||
+      (item.kind === "feedback" &&
+        (typeof item.hunkId !== "string" ||
+          !/^hunk-[a-f0-9]{20}$/.test(item.hunkId))) ||
+      (item.kind === "todo" && item.hunkId !== undefined)
+    ) {
+      throw new Error("invalid review feedback item");
+    }
+    const message = normalizeReviewMessage(item.message);
+    const hunkId = item.hunkId;
+    return {
+      id: item.id,
+      kind: item.kind,
+      path: item.path,
+      ...(typeof hunkId === "string" ? { hunkId } : {}),
+      message,
+    };
+  });
+}
+
+function isSafeReviewPath(value: string): boolean {
+  if (
+    value === "" ||
+    value.length > MAX_REVIEW_FEEDBACK_PATH_LENGTH ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .replaceAll("\\", "/")
+    .split("/")
+    .every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+function sameReviewResponse(
+  response: ReviewResponse,
+  input: RespondToReviewRequestInput,
+): boolean {
+  return response.outcome === input.outcome &&
+    response.message === input.message &&
+    JSON.stringify(response.items ?? []) === JSON.stringify(input.items ?? []);
 }
 
 function normalizeReviewMessage(value: string): string {

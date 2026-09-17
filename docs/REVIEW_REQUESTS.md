@@ -19,9 +19,12 @@ metadata-only registration and all reading-state changes leave it pending.
 Only one request may be pending for a document, while resolved history remains
 durable.
 
-The initial request kind is `plan-decision`. Human outcomes are `approved`,
-`changes_requested`, and `rejected`. Request and response messages are stored as
-plain text. Requested changes require a non-empty explanation; the other
+Request kinds are `plan-decision` for plans and `change-decision` for
+first-class `change-review` documents. A change decision is rejected when its
+document is not a change review, and a change review rejects any other decision
+kind. Human outcomes are `approved`,
+`changes_requested`, and `rejected`. Request and response messages are stored
+as plain text. Requested changes require a non-empty explanation; the other
 outcomes may also carry useful context.
 
 ## Producer CLI
@@ -41,6 +44,20 @@ mdmaid-desk register docs/plan.md \
 
 The same review flags work with `import`. Without `--expect`, registration and
 import remain passive and show no decision controls.
+
+Publish a mandatory implementation review with:
+
+```bash
+mdmaid-desk register .agent-runs/change-reviews/current/review.md \
+  --workspace project \
+  --producer codex \
+  --kind change-review \
+  --attention approval \
+  --expect change-decision \
+  --request-message "Review this exact implementation before publication." \
+  --wait \
+  --json
+```
 
 Composable operations:
 
@@ -78,21 +95,66 @@ List filters:
 ```
 
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
-`requestMessage`. Response accepts `outcome` and `message`. Unknown fields,
-unknown enum values, unsafe control data, and oversized messages are rejected.
-The first valid response wins atomically. An identical retry returns the stored
-result, while a different retry receives a conflict.
+`requestMessage`. Response accepts `outcome`, `message`, and optional `items`.
+Items are available only for `changes_requested`: a `feedback` item identifies
+a safe relative `path` and stable `hunkId`, while a file-level `todo` identifies
+only its `path`. Both carry an ID and bounded plain-text message. Unknown
+fields, unknown enum values, unsafe paths or control data, malformed anchors,
+and oversized messages are rejected. The first valid response wins atomically.
+An identical retry returns the stored result, while a different retry receives
+a conflict.
+
+```json
+{
+  "outcome": "changes_requested",
+  "message": "Address the anchored feedback.",
+  "items": [
+    {
+      "id": "feedback-33333333333333333333",
+      "kind": "feedback",
+      "path": "src/auth.ts",
+      "hunkId": "hunk-44444444444444444444",
+      "message": "Use a constant-time comparison."
+    },
+    {
+      "id": "feedback-55555555555555555555",
+      "kind": "todo",
+      "path": "test/auth.test.ts",
+      "message": "Cover expired tokens."
+    }
+  ]
+}
+```
 
 ## Web and TUI
 
-Both clients expose an Actions filter and pending count. A document reader
-shows the producer's request message and decision controls only for an explicit
-pending request. After a response, the controls disappear and the stored result
-is read-only.
+Both clients expose an Actions filter and pending count. The TUI additionally
+exposes a dedicated Change Reviews space through `c`; it contains only
+`change-review` documents and labels their reader as Change Review. A document
+reader shows the producer's request message and decision controls only for an
+explicit pending request. After a response, the controls disappear and the
+stored result is read-only.
+
+The TUI queue groups documents by project by default. Press `g` to cycle to
+tag groups and then to one ordered list. Wide layouts show section headings;
+narrow layouts retain the same grouped navigation order without spending rows
+on headings.
 
 The browser always provides a response text area. In the TUI, use `r` for the
 Actions view, `y` to approve, `c` to request changes, or `x` to reject. The TUI
 composer uses `Enter` for a newline, `Ctrl-D` to submit, and `Esc` to cancel.
+
+A Change Review containing fenced Git patches opens in a native read-only diff
+view. Use `[`/`]` or arrow keys for files, `p`/`n` for hunks, `m` for
+unified/side-by-side layout, and `d` for the complete Markdown explanation.
+Both native viewers color common keywords, strings, comments, numbers,
+properties, types, and function calls according to the changed file extension
+while preserving the red/green line backgrounds and intra-line emphasis.
+Use `f` for current-hunk feedback, `t` for a file todo, and `z` to undo the
+latest unsent note. Request Changes stores all notes as response `items`; open
+notes block Approve and Reject so they cannot be discarded accidentally. A
+Change Review with no parsed files or any parser warning also blocks Approve,
+because the displayed native diff may not contain the exact requested scope.
 
 ## Waiting and Recovery
 

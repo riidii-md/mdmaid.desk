@@ -82,6 +82,27 @@ decisions with optional text, except that requested changes require an
 explanation. Request and response text are plain text and are never interpreted
 as HTML, terminal control data, callback configuration, or executable commands.
 
+Change reviews reuse this revision-safe lifecycle without overloading a
+workspace. A workspace remains the repository and filesystem authorization
+boundary; a `change-review` document represents one implementation snapshot,
+and its `change-decision` request represents the human gate for that exact
+content. The TUI presents those documents in a dedicated filtered space while
+the catalog and API retain one generic document lifecycle.
+
+Standard Git patches inside fenced `diff` blocks are parsed into a bounded,
+path-safe Change Review model. The parser supplies file status, line numbers,
+stable content-derived hunk IDs, and text lines to the TUI; it never reads a
+path named by the patch. Limits on files, hunks, lines, line length, and path
+length keep rendering bounded. Unsupported or unsafe entries produce warnings.
+The Markdown remains the source artifact, while the parsed model is a derived
+render response and is not stored as a second approval identity.
+
+Requested-change responses may include bounded structured feedback items.
+`feedback` items require a safe relative file path and stable hunk ID; `todo`
+items require a file path and deliberately have no hunk ID. Items are stored
+atomically with the immutable response. Draft TUI notes stay in the current
+reader session until the human submits Request Changes.
+
 Registration and import parse Markdown links on every ingress. Relative local
 links and image references are resolved from the original Markdown path,
 authorized against the canonical workspace root, and persisted only as

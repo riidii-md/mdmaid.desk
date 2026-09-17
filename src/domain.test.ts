@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveReadingStatus } from "./domain.js";
+import {
+  deriveReadingStatus,
+  isDocumentKind,
+  isReviewKind,
+} from "./domain.js";
 
 test("derives reading status from progress on the current revision", () => {
   assert.equal(
@@ -23,4 +27,9 @@ test("a new revision is unread when progress belongs to older content", () => {
     deriveReadingStatus({ revision: 4, openedRevision: 3, completedRevision: 3 }),
     "unread",
   );
+});
+
+test("recognizes first-class change review documents and decisions", () => {
+  assert.equal(isDocumentKind("change-review"), true);
+  assert.equal(isReviewKind("change-decision"), true);
 });

@@ -7,6 +7,7 @@ test("preserves only safe renderer-owned SGR styling", () => {
   const value = [
     "\u001b[1mBold\u001b[22m",
     "\u001b[38;2;255;119;88mAccent\u001b[39m",
+    "\u001b[48;2;30;82;57mAdded line\u001b[49m",
     "\u001b[2Jcleared",
     "\u001b]52;c;clipboard\u0007safe",
     "\u001b]8;;https://example.com\u001b\\link\u001b]8;;\u001b\\",
@@ -16,6 +17,7 @@ test("preserves only safe renderer-owned SGR styling", () => {
   const safe = sanitizeTerminalText(value, { preserveSgr: true });
   assert.match(safe, /\u001b\[1mBold\u001b\[22m/);
   assert.match(safe, /\u001b\[38;2;255;119;88mAccent\u001b\[39m/);
+  assert.match(safe, /\u001b\[48;2;30;82;57mAdded line\u001b\[49m/);
   assert.match(safe, /cleared/);
   assert.match(safe, /safe/);
   assert.match(safe, /link/);
