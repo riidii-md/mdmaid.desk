@@ -1327,6 +1327,12 @@ function workspaceHtml(pathname: string): string {
                 <button class="status-filter" type="button" data-status-filter="done">done <span class="count">0</span></button>
               </div>
             </div>
+            <div class="grouping-switch" role="group" aria-label="Group documents">
+              <span class="grouping-label">view</span>
+              <button class="grouping-button active" type="button" data-grouping="project" aria-pressed="true">projects</button>
+              <button class="grouping-button" type="button" data-grouping="tag" aria-pressed="false">tags</button>
+              <button class="grouping-button" type="button" data-grouping="all" aria-pressed="false">all in order</button>
+            </div>
           </div>
           <div id="document-queue" class="document-queue" data-testid="document-queue"></div>
           <div id="queue-empty" class="empty" hidden>No documents match this view.</div>
