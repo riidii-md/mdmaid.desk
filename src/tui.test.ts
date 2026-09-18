@@ -358,6 +358,7 @@ test("filters explicit actions and composes a review response", () => {
   assert.match(readerFrame, /y approve/);
   assert.match(readerFrame, /c changes/);
   assert.match(readerFrame, /x reject/);
+  assert.match(readerFrame, /o supersede/);
   assert.ok(
     readerFrame.indexOf("Rendered plan.") <
       readerFrame.indexOf("ACTION REQUIRED"),
@@ -383,6 +384,9 @@ test("filters explicit actions and composes a review response", () => {
   const invalid = handleTuiKey(changes, "ctrl-d");
   assert.deepEqual(invalid.effects, []);
   assert.match(invalid.state.message ?? "", /Explain what needs to change/);
+
+  const superseding = handleTuiKey(reader, "o").state;
+  assert.equal(superseding.reviewComposer?.outcome, "superseded");
 });
 
 test("provides a dedicated Change Reviews space", () => {

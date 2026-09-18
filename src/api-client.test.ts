@@ -326,11 +326,14 @@ test("validates review requests and receives their live events", async () => {
     );
 
     const responded = await client.respondToReviewRequest(request.id, {
-      outcome: "approved",
-      message: "Proceed after the backup check.",
+      outcome: "superseded",
+      message: "A newer review replaces this one.",
     });
-    assert.equal(responded.status, "approved");
-    assert.equal(responded.response?.message, "Proceed after the backup check.");
+    assert.equal(responded.status, "superseded");
+    assert.equal(
+      responded.response?.message,
+      "A newer review replaces this one.",
+    );
     controller.abort();
     await subscription;
   } finally {

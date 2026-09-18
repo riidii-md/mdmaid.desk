@@ -875,6 +875,7 @@ async function boot(): Promise<void> {
   const reviewApprove = element("review-approve") as HTMLButtonElement;
   const reviewChanges = element("review-changes") as HTMLButtonElement;
   const reviewReject = element("review-reject") as HTMLButtonElement;
+  const reviewSupersede = element("review-supersede") as HTMLButtonElement;
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
   const copyLink = element("copy-link") as HTMLButtonElement;
@@ -1768,7 +1769,12 @@ async function boot(): Promise<void> {
       return;
     }
     reviewError.textContent = "";
-    for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+    for (const button of [
+      reviewApprove,
+      reviewChanges,
+      reviewReject,
+      reviewSupersede,
+    ]) {
       button.disabled = true;
     }
     try {
@@ -1797,7 +1803,12 @@ async function boot(): Promise<void> {
       reviewError.textContent =
         error instanceof Error ? error.message : "Could not submit response";
     } finally {
-      for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+      for (const button of [
+        reviewApprove,
+        reviewChanges,
+        reviewReject,
+        reviewSupersede,
+      ]) {
         button.disabled = false;
       }
     }
@@ -1960,6 +1971,9 @@ async function boot(): Promise<void> {
   );
   reviewReject.addEventListener("click", () =>
     void respondToReview("rejected"),
+  );
+  reviewSupersede.addEventListener("click", () =>
+    void respondToReview("superseded"),
   );
   reviewFeedbackSave.addEventListener("click", saveFeedback);
   reviewFeedbackCancel.addEventListener("click", closeFeedbackComposer);

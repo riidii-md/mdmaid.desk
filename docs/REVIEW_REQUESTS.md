@@ -10,6 +10,7 @@ Opening, registering, importing, or marking a document done never approves it.
 pending -> approved
         -> changes_requested
         -> rejected
+        -> superseded
         -> stale
 ```
 
@@ -22,10 +23,11 @@ durable.
 Request kinds are `plan-decision` for plans and `change-decision` for
 first-class `change-review` documents. A change decision is rejected when its
 document is not a change review, and a change review rejects any other decision
-kind. Human outcomes are `approved`,
-`changes_requested`, and `rejected`. Request and response messages are stored
-as plain text. Requested changes require a non-empty explanation; the other
-outcomes may also carry useful context.
+kind. Review outcomes are `approved`, `changes_requested`, `rejected`, and
+`superseded`. Superseded closes an old request without approving or rejecting
+it, so a waiting producer can ignore that version. Request and response
+messages are stored as plain text. Requested changes require a non-empty
+explanation; the other outcomes may also carry useful context.
 
 ## Producer CLI
 
@@ -70,6 +72,11 @@ mdmaid-desk review wait <review-id> --json
 mdmaid-desk review respond <review-id> \
   --outcome approved \
   --message "Proceed after the backup check."
+
+# Close an older request after publishing a replacement:
+mdmaid-desk review respond <old-review-id> \
+  --outcome superseded \
+  --message "Replaced by the newer change review."
 ```
 
 JSON output is versioned and contains the public document identity, complete
@@ -95,7 +102,8 @@ List filters:
 ```
 
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
-`requestMessage`. Response accepts `outcome`, `message`, and optional `items`.
+`requestMessage`. Response accepts `outcome` (`approved`, `changes_requested`,
+`rejected`, or `superseded`), `message`, and optional `items`.
 Items are available only for `changes_requested`: a `feedback` item identifies
 a safe relative `path`, optionally a stable `hunkId`, and optionally a paired
 `line` plus `side` (`old` or `new`). A path-only feedback item is file-level;
@@ -144,9 +152,10 @@ tag groups and then to one ordered list. Wide layouts show section headings;
 narrow layouts retain the same grouped navigation order without spending rows
 on headings.
 
-The browser always provides a separate general-note text area. In the TUI, use `r` for the
-Actions view, `y` to approve, `c` to request changes, or `x` to reject. The TUI
-composer uses `Enter` for a newline, `Ctrl-D` to submit, and `Esc` to cancel.
+The browser always provides a separate general-note text area. In the TUI, use
+`r` for the Actions view, `y` to approve, `c` to request changes, `x` to reject,
+or `o` to supersede an obsolete request. The TUI composer uses `Enter` for a
+newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
 A Change Review containing fenced Git patches opens in a native read-only diff
 view. Use `p`/`n` for files (`[`/`]` remain aliases), `j`/`k`
@@ -158,9 +167,9 @@ while preserving the red/green line backgrounds and intra-line emphasis.
 Use `f` for feedback on the selected line, `t` for feedback on the current
 file, and `z` to undo the latest unsent note. The browser exposes equivalent
 controls: click the visible `+` beside a line number or **feedback on file**.
-Request Changes stores all anchored notes as
-response `items` and keeps the general note separate; open
-notes block Approve and Reject so they cannot be discarded accidentally. A
+Request Changes stores all anchored notes as response `items` and keeps the
+general note separate; open notes block Approve, Reject, and Supersede so they
+cannot be discarded accidentally. A
 Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
 
@@ -184,6 +193,10 @@ The command waits without using model turns. If the waiting process exits, the
 request and response remain recoverable with `review show` or another
 `review wait`. Mdmaid.desk does not execute callbacks or relaunch a dead agent
 session; that requires a separate supervisor.
+
+`superseded` is terminal just like the decision outcomes, so `review wait`
+returns immediately and the producer can ignore the obsolete review rather
+than treating it as approval, requested changes, or rejection.
 
 ## Security Boundaries
 

@@ -1081,6 +1081,7 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(pageContent, /id="review-approve"/);
     assert.match(pageContent, /id="review-changes"/);
     assert.match(pageContent, /id="review-reject"/);
+    assert.match(pageContent, /id="review-supersede"/);
     assert.ok(
       pageContent.indexOf('id="reader-content"') <
         pageContent.indexOf('id="review-panel"'),

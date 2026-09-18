@@ -5,6 +5,8 @@ import {
   deriveReadingStatus,
   isDocumentKind,
   isReviewKind,
+  isReviewOutcome,
+  isReviewStatus,
   projectDisplayName,
 } from "./domain.js";
 
@@ -33,6 +35,11 @@ test("a new revision is unread when progress belongs to older content", () => {
 test("recognizes first-class change review documents and decisions", () => {
   assert.equal(isDocumentKind("change-review"), true);
   assert.equal(isReviewKind("change-decision"), true);
+});
+
+test("recognizes superseded as a terminal non-approval review result", () => {
+  assert.equal(isReviewOutcome("superseded"), true);
+  assert.equal(isReviewStatus("superseded"), true);
 });
 
 test("assembles project names from grounded identity and AI feature text", () => {

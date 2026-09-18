@@ -37,6 +37,7 @@ export const REVIEW_STATUSES = [
   "approved",
   "changes_requested",
   "rejected",
+  "superseded",
   "stale",
 ] as const;
 export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
@@ -45,6 +46,7 @@ export const REVIEW_OUTCOMES = [
   "approved",
   "changes_requested",
   "rejected",
+  "superseded",
 ] as const;
 export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 
