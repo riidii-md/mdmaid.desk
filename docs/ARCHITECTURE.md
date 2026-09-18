@@ -51,7 +51,11 @@ on the document or its reading progress.
 ## Current Foundation
 
 The catalog uses a versioned SQLite database behind a storage interface.
-Workspaces authorize canonical artifact roots. Documents retain stable IDs,
+Workspaces authorize canonical artifact roots. Logical projects are separate
+presentation records keyed by normalized repository identity and task ID.
+Their visible labels combine the grounded repository/task values with the
+first concise feature name supplied by the producing agent. Project membership
+never expands workspace filesystem authority. Documents retain stable IDs,
 content hashes, revisions, reading progress, tags, archive state, missing
 state, a storage mode (`reference` or `managed`), and private local-source link
 mappings. Reading status is

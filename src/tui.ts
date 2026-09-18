@@ -1377,9 +1377,12 @@ export function groupTuiQueue(
   if (grouping === "project") {
     const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
     for (const document of documents) {
+      const projectId = document.projectId ?? document.workspaceId;
       add(
-        `project:${document.workspaceId}`,
-        workspaceNames.get(document.workspaceId) ?? document.workspaceId,
+        `project:${projectId}`,
+        document.projectName ??
+          workspaceNames.get(document.workspaceId) ??
+          document.workspaceId,
         document,
       );
     }
@@ -1409,12 +1412,14 @@ function applyFilters(state: TuiState): TuiState {
     }
     if (
       state.workspaceFilter !== undefined &&
+      (document.projectId ?? document.workspaceId) !== state.workspaceFilter &&
       document.workspaceId !== state.workspaceFilter
     ) {
       return false;
     }
     const searchable = [
       document.title,
+      document.projectName ?? "",
       document.workspaceId,
       document.taskId ?? "",
       document.producer ?? "",
@@ -1458,16 +1463,29 @@ function workspacesForDocuments(
   workspaces: PublicWorkspace[],
 ): PublicWorkspace[] {
   const counts = new Map<string, number>();
+  const labels = new Map<string, string>();
+  const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
   for (const document of documents) {
+    const projectId = document.projectId ?? document.workspaceId;
     counts.set(
-      document.workspaceId,
-      (counts.get(document.workspaceId) ?? 0) + 1,
+      projectId,
+      (counts.get(projectId) ?? 0) + 1,
+    );
+    labels.set(
+      projectId,
+      document.projectName ??
+        workspaceNames.get(document.workspaceId) ??
+        document.workspaceId,
     );
   }
-  return workspaces.flatMap((workspace) => {
-    const documentCount = counts.get(workspace.id) ?? 0;
-    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
-  });
+  return [...counts].map(([id, documentCount]) => ({
+    id,
+    name: labels.get(id) ?? id,
+    documentCount,
+    route: documents.some(({ projectId }) => projectId === id)
+      ? `/p/${id}`
+      : `/w/${id}`,
+  }));
 }
 
 interface TuiBorders {
@@ -1759,7 +1777,7 @@ function sidebarLines(
     lines.push(
       navigationLine(
         workspace.name,
-        workspace.documentCount,
+        `${workspace.documentCount} ${workspace.documentCount === 1 ? "doc" : "docs"}`,
         state.workspaceFilter === workspace.id,
         width,
         theme,
@@ -1809,7 +1827,7 @@ function sidebarLines(
 
 function navigationLine(
   label: string,
-  count: number,
+  count: number | string,
   selected: boolean,
   width: number,
   theme: TuiTheme,

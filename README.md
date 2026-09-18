@@ -123,7 +123,9 @@ Register a workspace:
 ```bash
 node dist/cli.js workspace add /path/to/repository \
   --id example \
-  --name "Example"
+  --name "Example worktree" \
+  --repository github.com/example/example \
+  --repository-name "Example"
 ```
 
 Register a document:
@@ -133,11 +135,19 @@ node dist/cli.js register /path/to/repository/docs/plan.md \
   --workspace example \
   --live \
   --task PROJECT-123 \
+  --feature-name "Durable Project Naming" \
   --producer codex \
   --kind plan \
   --attention approval \
   --tag architecture
 ```
+
+`--repository` and `--task` form the stable logical project identity.
+The producing AI supplies only the concise `--feature-name`; mdmaid.desk stores
+the first accepted value and assembles the visible label as
+`Repository / PROJECT-123 (Durable Project Naming)`. Documents from multiple
+workspaces with the same repository/task identity appear under that one
+project. Branch names are not used as display names.
 
 Registration remains passive even when attention is `approval`. To ask for a
 human decision and keep the current agent command waiting, declare the review

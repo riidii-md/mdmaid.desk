@@ -1,6 +1,8 @@
 import type {
   DocumentFilters,
   ReviewRequestFilters,
+  Project,
+  RepositoryIdentity,
   StoredDocument,
   StoredReviewRequest,
   Workspace,
@@ -12,7 +14,9 @@ export interface CatalogStorage {
   transaction<T>(operation: () => T): T;
   listWorkspaces(): Workspace[];
   getWorkspace(id: string): Workspace | undefined;
-  saveWorkspace(workspace: Workspace): void;
+  getWorkspaceRepository(id: string): RepositoryIdentity | undefined;
+  saveWorkspace(workspace: Workspace, repository: RepositoryIdentity): void;
+  saveProject(project: Project): Project;
   listDocuments(filters?: DocumentFilters): StoredDocument[];
   getDocument(id: string): StoredDocument | undefined;
   getReferenceDocumentIdByPath(

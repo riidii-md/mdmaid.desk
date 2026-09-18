@@ -80,7 +80,8 @@ const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
 
 const registerUsage = `Usage:
   mdmaid-desk register <file.md> --workspace <id>
-      [--live] [--task <id>] [--producer <name>] [--kind <kind>]
+      [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>]
       [--title <title>] [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision] [--request-message <text>] [--wait] [--json]
 
@@ -95,15 +96,18 @@ const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 Usage:
   mdmaid-desk --version
   mdmaid-desk workspace add <root> --id <id> [--name <name>]
+      [--repository <identity>] [--repository-name <name>]
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
   mdmaid-desk register <file.md> --workspace <id>
-      [--live] [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision|change-decision] [--request-message <text>]
       [--wait] [--json]
   mdmaid-desk import <file.md> --workspace <id>
-      [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision|change-decision] [--request-message <text>]
       [--wait] [--json]
@@ -533,13 +537,26 @@ async function runWorkspaceAdd(
   const id = requiredOption(parsed, "id");
   const name = firstOption(parsed, "name") ?? id;
   const artifactRoots = parsed.options.get("artifact-root") ?? [root];
-  rejectUnknownOptions(parsed, new Set(["id", "name", "artifact-root"]));
+  const repository = firstOption(parsed, "repository");
+  const repositoryName = firstOption(parsed, "repository-name");
+  rejectUnknownOptions(
+    parsed,
+    new Set([
+      "id",
+      "name",
+      "artifact-root",
+      "repository",
+      "repository-name",
+    ]),
+  );
 
   const input: AddWorkspaceInput = {
     id,
     name,
     root,
     artifactRoots,
+    ...(repository === undefined ? {} : { repository }),
+    ...(repositoryName === undefined ? {} : { repositoryName }),
   };
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
   if (client) {
@@ -575,6 +592,7 @@ async function runRegister(
     new Set([
       "workspace",
       "task",
+      "feature-name",
       "producer",
       "kind",
       "title",
@@ -599,6 +617,7 @@ async function runRegister(
   }
 
   const taskId = firstOption(parsed, "task");
+  const featureName = firstOption(parsed, "feature-name");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
   const review = parseReviewPublicationOptions(parsed);
@@ -607,6 +626,7 @@ async function runRegister(
   const input: RegisterDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
+    ...(featureName ? { featureName } : {}),
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
@@ -615,7 +635,13 @@ async function runRegister(
     ...(tags === undefined ? {} : { tags }),
   };
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let document: { id: string; revision: number; route?: string };
+  let document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  };
   let reviewRequest: ReviewRequest | undefined;
   if (client) {
     document = await client.registerDocument(input);
@@ -669,7 +695,13 @@ async function runImport(
 ): Promise<number> {
   const { input, review } = parseImport(args);
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let document: { id: string; revision: number; route?: string };
+  let document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  };
   let reviewRequest: ReviewRequest | undefined;
   if (client) {
     document = await client.importDocument(input);
@@ -732,6 +764,7 @@ function parseImport(args: string[]): {
     new Set([
       "workspace",
       "task",
+      "feature-name",
       "producer",
       "kind",
       "title",
@@ -752,11 +785,13 @@ function parseImport(args: string[]): {
     throw new UsageError(`unknown attention state ${attention}`);
   }
   const taskId = firstOption(parsed, "task");
+  const featureName = firstOption(parsed, "feature-name");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
   const input: ImportDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
+    ...(featureName ? { featureName } : {}),
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
@@ -804,7 +839,13 @@ function writePublicationResult(
   stdout: Writer,
   action: "registered" | "imported",
   path: string,
-  document: { id: string; revision: number; route?: string },
+  document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  },
   reviewRequest: ReviewRequest | undefined,
   json: boolean,
 ): void {
@@ -816,6 +857,15 @@ function writePublicationResult(
           id: document.id,
           revision: document.revision,
           route: document.route ?? `/d/${document.id}`,
+          ...(document.projectId === undefined
+            ? {}
+            : {
+                project: {
+                  id: document.projectId,
+                  name: document.projectName,
+                  route: `/p/${document.projectId}`,
+                },
+              }),
         },
         ...(reviewRequest === undefined ? {} : { reviewRequest }),
       })}\n`,
@@ -823,6 +873,9 @@ function writePublicationResult(
     return;
   }
   stdout.write(`${action} ${document.id}: ${path}\n`);
+  if (document.projectName) {
+    stdout.write(`project ${document.projectName}\n`);
+  }
   if (reviewRequest) {
     stdout.write(
       `review ${reviewRequest.id}: ${reviewRequest.status}${

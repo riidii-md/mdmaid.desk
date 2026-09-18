@@ -5,6 +5,7 @@ import {
   deriveReadingStatus,
   isDocumentKind,
   isReviewKind,
+  projectDisplayName,
 } from "./domain.js";
 
 test("derives reading status from progress on the current revision", () => {
@@ -32,4 +33,27 @@ test("a new revision is unread when progress belongs to older content", () => {
 test("recognizes first-class change review documents and decisions", () => {
   assert.equal(isDocumentKind("change-review"), true);
   assert.equal(isReviewKind("change-decision"), true);
+});
+
+test("assembles project names from grounded identity and AI feature text", () => {
+  assert.equal(
+    projectDisplayName({
+      repositoryName: "EyWizards",
+      taskKey: "SA-2913",
+      featureName: "COA Worker Continuity",
+    }),
+    "EyWizards / SA-2913 (COA Worker Continuity)",
+  );
+  assert.equal(
+    projectDisplayName({ repositoryName: "EyWizards", taskKey: "SA-2913" }),
+    "EyWizards / SA-2913",
+  );
+  assert.equal(
+    projectDisplayName({
+      repositoryName: "EyWizards",
+      taskKey: "",
+      featureName: "Worker Continuity",
+    }),
+    "EyWizards (Worker Continuity)",
+  );
 });

@@ -143,6 +143,39 @@ test("groups the TUI queue by project, tag, or one ordered list", () => {
   ]);
 });
 
+test("groups TUI documents from different workspaces under one logical project", () => {
+  const projectName = "EyWizards / SA-2913 (COA Worker Continuity)";
+  const shared = documents.map((document) => ({
+    ...document,
+    projectId: "project-11111111111111111111",
+    projectName,
+  }));
+  assert.deepEqual(
+    groupTuiQueue(shared, "project", workspaces).map(
+      ({ key, label, documents: grouped }) => ({
+        key,
+        label,
+        ids: grouped.map(({ id }) => id),
+      }),
+    ),
+    [
+      {
+        key: "project:project-11111111111111111111",
+        label: projectName,
+        ids: shared.map(({ id }) => id),
+      },
+    ],
+  );
+  assert.deepEqual(createTuiState(shared, workspaces).workspaces, [
+    {
+      id: "project-11111111111111111111",
+      name: projectName,
+      documentCount: 2,
+      route: "/p/project-11111111111111111111",
+    },
+  ]);
+});
+
 test("renders TUI group sections and cycles the grouping mode", () => {
   let state = createTuiState(documents, workspaces);
   assert.equal(state.grouping, "project");
