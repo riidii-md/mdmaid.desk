@@ -889,6 +889,16 @@ test("returns an actionable Mermaid diagnostic to document producers", async () 
       "stateDiagram-v2",
       "  [*] -->",
       "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "  Valid --> Diagram",
+      "```",
+      "",
+      "```mermaid",
+      "stateDiagram-v2",
+      "  Ready -->",
+      "```",
     ].join("\n"), "utf8");
 
     const response = await authorized(value, "/api/v1/documents", {
@@ -904,10 +914,34 @@ test("returns an actionable Mermaid diagnostic to document producers", async () 
     });
     assert.equal(response.status, 422);
     const body = (await response.json()) as {
-      error: { code: string; message: string };
+      error: {
+        code: string;
+        message: string;
+        validation: {
+          kind: string;
+          valid: boolean;
+          diagramCount: number;
+          issues: Array<{ block: number; line: number; message: string }>;
+        };
+      };
     };
     assert.equal(body.error.code, "invalid_mermaid");
     assert.match(body.error.message, /Mermaid diagram 1.*line 2.*parse error/is);
+    assert.equal(body.error.validation.kind, "mermaid");
+    assert.equal(body.error.validation.valid, false);
+    assert.equal(body.error.validation.diagramCount, 3);
+    assert.deepEqual(
+      body.error.validation.issues.map(({ block, line }) => ({ block, line })),
+      [
+        { block: 1, line: 2 },
+        { block: 3, line: 12 },
+      ],
+    );
+    assert.ok(
+      body.error.validation.issues.every(({ message }) =>
+        /parse error/i.test(message)
+      ),
+    );
   } finally {
     await closeFixture(value);
   }

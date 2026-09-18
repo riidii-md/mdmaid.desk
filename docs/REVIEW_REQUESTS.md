@@ -165,11 +165,13 @@ Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
 
 Every Mermaid fence is parsed during registration and import. Invalid diagrams
-reject ingress with the diagram number, Markdown start line, and Mermaid parser
-diagnostic so the producer can correct the artifact. Live reference changes are
-validated by the same gate. The browser still isolates runtime failures per
-diagram so an older document or client-only renderer problem cannot hide the
-rest of the review.
+reject ingress with a complete structured report containing the diagram count
+and every failing block's number, Markdown start line, and Mermaid parser
+diagnostic. The API returns it as `error.validation`; JSON CLI callers receive
+the same data, and `mdmaid-desk validate <file.md> --json` can run it before
+publication. Live reference changes are validated by the same gate. The browser
+still isolates runtime failures per diagram so an older document or client-only
+renderer problem cannot hide the rest of the review.
 
 ## Waiting and Recovery
 

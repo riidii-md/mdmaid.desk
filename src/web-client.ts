@@ -567,13 +567,58 @@ export async function renderMermaidNodes(
   renderer: WebMermaidRenderer,
   nodes: Element[],
   onError: (node: Element, error: unknown) => void,
+  fontsReady: PromiseLike<unknown> = Promise.resolve(),
 ): Promise<void> {
+  await fontsReady;
   for (const node of nodes) {
     try {
       await renderer.run({ nodes: [node] });
     } catch (error) {
       onError(node, error);
     }
+  }
+}
+
+export function mermaidErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null) {
+    if (
+      "message" in error &&
+      typeof error.message === "string" &&
+      error.message.trim() !== ""
+    ) {
+      return error.message;
+    }
+    if (
+      "str" in error &&
+      typeof error.str === "string" &&
+      error.str.trim() !== ""
+    ) {
+      return error.str;
+    }
+  }
+  return String(error);
+}
+
+export async function withVisibleMermaidLayout(
+  container: HTMLElement,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const wasHidden = container.hasAttribute("hidden");
+  if (!wasHidden) {
+    await operation();
+    return;
+  }
+  const previousVisibility = container.style.visibility;
+  container.style.visibility = "hidden";
+  container.removeAttribute("hidden");
+  try {
+    await operation();
+  } finally {
+    container.setAttribute("hidden", "");
+    container.style.visibility = previousVisibility;
   }
 }
 
@@ -1599,8 +1644,9 @@ async function boot(): Promise<void> {
           rendered.document.route,
         );
       }
-      if (window.mermaid) {
-        window.mermaid.initialize({
+      const mermaid = window.mermaid;
+      if (mermaid) {
+        mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
           theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
@@ -1610,18 +1656,18 @@ async function boot(): Promise<void> {
           readerContent.querySelectorAll<HTMLElement>(".mermaid"),
         );
         const sources = new Map(nodes.map((node) => [node, node.textContent ?? ""]));
-        await renderMermaidNodes(window.mermaid, nodes, (node, error) => {
-          const element = node as HTMLElement;
-          const diagnostic = error instanceof Error
-            ? error.message
-            : String(error);
-          element.classList.add("mermaid-error");
-          element.removeAttribute("data-processed");
-          element.textContent = [
-            `Diagram could not render: ${diagnostic}`,
-            "",
-            sources.get(element) ?? "",
-          ].join("\n");
+        await withVisibleMermaidLayout(readerContent, async () => {
+          await renderMermaidNodes(mermaid, nodes, (node, error) => {
+            const element = node as HTMLElement;
+            const diagnostic = mermaidErrorMessage(error);
+            element.classList.add("mermaid-error");
+            element.removeAttribute("data-processed");
+            element.textContent = [
+              `Diagram could not render: ${diagnostic}`,
+              "",
+              sources.get(element) ?? "",
+            ].join("\n");
+          }, document.fonts.ready);
         });
       }
       if (sequence !== renderSequence || state.selectedId !== id) {

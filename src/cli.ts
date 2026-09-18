@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { realpathSync } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -47,6 +48,13 @@ import {
   installUserService as installLoginService,
   uninstallUserService as uninstallLoginService,
 } from "./user-service.js";
+import {
+  MermaidValidationError,
+  type MermaidValidationReport,
+  validateMermaidMarkdown,
+} from "./mermaid-validation.js";
+
+const MAX_VALIDATION_BYTES = 2 * 1024 * 1024;
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
   "definition",
@@ -103,6 +111,7 @@ Usage:
       [--repository <identity>] [--repository-name <name>]
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
+  mdmaid-desk validate <file.md> [--json]
   mdmaid-desk register <file.md> --workspace <id>
       [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
       [--kind <kind>] [--title <title>]
@@ -229,6 +238,9 @@ export async function run(
     if (args[0] === "daemon") {
       return await runDaemon(statePath, args.slice(1), stdout, options);
     }
+    if (args[0] === "validate") {
+      return await runValidate(args.slice(1), stdout);
+    }
     if (args[0] === "web") {
       const web = parseWebConfiguration(args.slice(1));
       const running = await (
@@ -281,13 +293,100 @@ export async function run(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    stderr.write(`error: ${message}\n`);
+    const validation = validationReportFromError(error);
+    if (args.includes("--json") && validation !== undefined) {
+      stderr.write(`${JSON.stringify({
+        schemaVersion: 1,
+        error: {
+          code: "invalid_mermaid",
+          message,
+          validation,
+        },
+      })}\n`);
+    } else {
+      stderr.write(`error: ${message}\n`);
+    }
     if (error instanceof UsageError) {
       stderr.write(usage);
       return 2;
     }
     return 1;
   }
+}
+
+async function runValidate(
+  args: string[],
+  stdout: Writer,
+): Promise<number> {
+  const parsed = parseArguments(args, new Set(["json"]));
+  rejectUnknownOptions(parsed, new Set(["json"]));
+  const path = parsed.positionals[0];
+  if (!path) {
+    throw new UsageError("validation path is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("validate accepts one document path");
+  }
+  const markdown = await readValidationTarget(path);
+  const validation = await validateMermaidMarkdown(markdown);
+  if (hasFlag(parsed, "json")) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, validation })}\n`);
+  } else if (validation.valid) {
+    stdout.write(
+      `valid: ${validation.diagramCount} Mermaid diagram${
+        validation.diagramCount === 1 ? "" : "s"
+      }\n`,
+    );
+  } else {
+    stdout.write(`${new MermaidValidationError(validation).message}\n`);
+  }
+  return validation.valid ? 0 : 1;
+}
+
+async function readValidationTarget(path: string): Promise<string> {
+  const requestedPath = resolve(path);
+  if (extname(requestedPath).toLowerCase() !== ".md") {
+    throw new Error("only Markdown files can be validated");
+  }
+  const requestedInfo = await lstat(requestedPath);
+  if (requestedInfo.isSymbolicLink()) {
+    throw new Error("validation path must not be a symlink");
+  }
+  // The explicit CLI path is the authorization boundary for this read. Resolve
+  // it before opening and refuse link traversal at the final component.
+  const canonicalPath = await realpath(requestedPath);
+  const handle = await open(
+    canonicalPath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error("validation target must be a regular file");
+    }
+    if (info.size > MAX_VALIDATION_BYTES) {
+      throw new Error(`document exceeds ${MAX_VALIDATION_BYTES} bytes`);
+    }
+    const content = await handle.readFile();
+    if (content.length > MAX_VALIDATION_BYTES) {
+      throw new Error(`document exceeds ${MAX_VALIDATION_BYTES} bytes`);
+    }
+    return content.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function validationReportFromError(
+  error: unknown,
+): MermaidValidationReport | undefined {
+  if (error instanceof MermaidValidationError) {
+    return error.report;
+  }
+  if (error instanceof DeskApiError) {
+    return error.validation;
+  }
+  return undefined;
 }
 
 async function runWeb(

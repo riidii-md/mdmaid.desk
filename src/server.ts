@@ -44,7 +44,10 @@ import {
   changeReviewNarrative,
   parseChangeReviewDiffs,
 } from "./change-review.js";
-import { MermaidValidationError } from "./mermaid-validation.js";
+import {
+  MermaidValidationError,
+  type MermaidValidationReport,
+} from "./mermaid-validation.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
@@ -96,6 +99,7 @@ interface ApiErrorBody {
   error: {
     code: string;
     message: string;
+    validation?: MermaidValidationReport;
   };
 }
 
@@ -104,6 +108,7 @@ class HttpError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly validation?: MermaidValidationReport,
   ) {
     super(message);
   }
@@ -186,7 +191,13 @@ export async function startDeskServer(
           ? error
           : new HttpError(500, "internal_error", "Internal server error");
       sendJson(response, normalized.status, {
-        error: { code: normalized.code, message: normalized.message },
+        error: {
+          code: normalized.code,
+          message: normalized.message,
+          ...(normalized.validation === undefined
+            ? {}
+            : { validation: normalized.validation }),
+        },
       });
     });
   });
@@ -427,7 +438,12 @@ async function handleRequest(
       events.publish("catalog", { action: "registered", documentId: document.id });
     } catch (error) {
       if (error instanceof MermaidValidationError) {
-        throw new HttpError(422, "invalid_mermaid", error.message);
+        throw new HttpError(
+          422,
+          "invalid_mermaid",
+          error.message,
+          error.report,
+        );
       }
       if (error instanceof Error) {
         throw new HttpError(
@@ -457,7 +473,12 @@ async function handleRequest(
       events.publish("catalog", { action: "imported", documentId: document.id });
     } catch (error) {
       if (error instanceof MermaidValidationError) {
-        throw new HttpError(422, "invalid_mermaid", error.message);
+        throw new HttpError(
+          422,
+          "invalid_mermaid",
+          error.message,
+          error.report,
+        );
       }
       if (error instanceof Error) {
         throw new HttpError(
@@ -887,6 +908,14 @@ async function readDocument(
 }
 
 function mapCatalogError(error: unknown): HttpError {
+  if (error instanceof MermaidValidationError) {
+    return new HttpError(
+      422,
+      "invalid_mermaid",
+      error.message,
+      error.report,
+    );
+  }
   if (error instanceof ReviewConflictError) {
     return new HttpError(409, "review_conflict", error.message);
   }

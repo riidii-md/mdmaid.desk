@@ -5,6 +5,7 @@ import {
   MermaidValidationError,
   assertValidMermaidMarkdown,
   mermaidBlocks,
+  validateMermaidMarkdown,
 } from "./mermaid-validation.js";
 
 test("finds Mermaid blocks with stable document locations", () => {
@@ -60,4 +61,35 @@ test("accepts valid diagrams and reports the exact invalid block", async () => {
       return true;
     },
   );
+});
+
+test("returns a complete structured report for every Mermaid block", async () => {
+  const report = await validateMermaidMarkdown([
+    "```mermaid",
+    "flowchart LR",
+    "  A --> B",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"));
+
+  assert.equal(report.kind, "mermaid");
+  assert.equal(report.valid, false);
+  assert.equal(report.diagramCount, 3);
+  assert.deepEqual(
+    report.issues.map(({ block, line }) => ({ block, line })),
+    [
+      { block: 2, line: 6 },
+      { block: 3, line: 11 },
+    ],
+  );
+  assert.ok(report.issues.every(({ message }) => /parse error/i.test(message)));
 });

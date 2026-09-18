@@ -24,11 +24,13 @@ import type {
   WorkspaceRegistration,
 } from "./api-types.js";
 import { isChangeReviewDiff } from "./change-review.js";
+import type { MermaidValidationReport } from "./mermaid-validation.js";
 
 interface ErrorEnvelope {
   error: {
     code: string;
     message: string;
+    validation?: MermaidValidationReport;
   };
 }
 
@@ -37,6 +39,7 @@ export class DeskApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly validation?: MermaidValidationReport,
   ) {
     super(message);
     this.name = "DeskApiError";
@@ -345,6 +348,7 @@ export class DeskApiClient {
           response.status,
           body.error.code,
           body.error.message,
+          body.error.validation,
         );
       }
       throw new Error(`Daemon request failed (${response.status})`);
@@ -510,7 +514,40 @@ function isErrorEnvelope(value: unknown): value is ErrorEnvelope {
     isRecord(value) &&
     isRecord(value.error) &&
     typeof value.error.code === "string" &&
-    typeof value.error.message === "string"
+    typeof value.error.message === "string" &&
+    (value.error.validation === undefined ||
+      isMermaidValidationReport(value.error.validation))
+  );
+}
+
+function isMermaidValidationReport(
+  value: unknown,
+): value is MermaidValidationReport {
+  if (
+    !isRecord(value) ||
+    value.kind !== "mermaid" ||
+    typeof value.valid !== "boolean" ||
+    !isInteger(value.diagramCount) ||
+    value.diagramCount < 0 ||
+    !Array.isArray(value.issues)
+  ) {
+    return false;
+  }
+  const issuesValid = value.issues.every((issue) =>
+    isRecord(issue) &&
+    isInteger(issue.block) &&
+    issue.block >= 1 &&
+    issue.block <= (value.diagramCount as number) &&
+    isInteger(issue.line) &&
+    issue.line >= 1 &&
+    typeof issue.message === "string" &&
+    issue.message.length > 0 &&
+    issue.message.length <= 2_000
+  );
+  return (
+    issuesValid &&
+    value.issues.length <= value.diagramCount &&
+    value.valid === (value.issues.length === 0)
   );
 }
 
@@ -605,7 +642,7 @@ function nullableString(value: unknown): boolean {
   return value === null || typeof value === "string";
 }
 
-function isInteger(value: unknown): boolean {
+function isInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value);
 }
 

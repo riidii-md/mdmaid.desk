@@ -173,6 +173,69 @@ test("preserves typed source-missing errors for client recovery", async () => {
   }
 });
 
+test("preserves complete Mermaid validation reports from the daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-mermaid-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "broken.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, [
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"), "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "mermaid-token",
+  });
+
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    await assert.rejects(
+      client.registerDocument({
+        workspaceId: "example",
+        kind: "review",
+        title: "Broken",
+        path: documentPath,
+        attention: "review",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof DeskApiError);
+        assert.equal(error.status, 422);
+        assert.equal(error.code, "invalid_mermaid");
+        assert.equal(error.validation?.diagramCount, 2);
+        assert.deepEqual(
+          error.validation?.issues.map(({ block, line }) => ({ block, line })),
+          [
+            { block: 1, line: 1 },
+            { block: 2, line: 6 },
+          ],
+        );
+        return true;
+      },
+    );
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
 test("receives validated path-free live source events with revisions", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-live-source-"));
   const workspace = join(root, "workspace");

@@ -39,8 +39,8 @@ The repository contains the first usable shared-service vertical slice:
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
 - stable port-80 default with explicit alternate ports for isolated testing;
-- `workspace`, `register`, `import`, `review`, `list`, `web`, `tui`, and `daemon`
-  commands.
+- `workspace`, `validate`, `register`, `import`, `review`, `list`, `web`, `tui`,
+  and `daemon` commands.
 
 Stdin import, comments, and editing remain planned milestones. Document
 registration works without a daemon, but automatically
@@ -148,6 +148,16 @@ the first accepted value and assembles the visible label as
 `Repository / PROJECT-123 (Durable Project Naming)`. Documents from multiple
 workspaces with the same repository/task identity appear under that one
 project. Branch names are not used as display names.
+
+Preflight every Mermaid fence without changing the catalog:
+
+```bash
+mdmaid-desk validate /path/to/repository/docs/plan.md --json
+```
+
+The command exits `0` when every diagram parses and `1` when any diagram is
+invalid. Its versioned JSON report includes the total diagram count and every
+issue with its block number, Markdown start line, and parser diagnostic.
 
 Registration remains passive even when attention is `approval`. To ask for a
 human decision and keep the current agent command waiting, declare the review
@@ -360,9 +370,12 @@ cannot be approved; the human can still Request Changes or Reject them.
 
 Registration, import, and live-reference reconciliation validate every
 Mermaid fence with Mermaid's parser. A bad diagram rejects the update with its
-block number, Markdown start line, and parser diagnostic. Browser rendering is
-also isolated per diagram so a runtime failure remains visible without hiding
-the document or its stable `/d/<document-id>` URL.
+block number, Markdown start line, and parser diagnostic. API errors include
+the same complete report under `error.validation`; `register --json` and
+`import --json` preserve it so a producer can patch every reported block before
+retrying. Browser rendering is also isolated per diagram so a runtime failure
+remains visible without hiding the document or its stable
+`/d/<document-id>` URL.
 
 The default state directory is:
 

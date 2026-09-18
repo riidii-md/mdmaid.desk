@@ -17,6 +17,8 @@ import {
   requestDocumentPrint,
   reviewResponseError,
   renderMermaidNodes,
+  mermaidErrorMessage,
+  withVisibleMermaidLayout,
   shouldRefreshWebReader,
   sourceModeLabel,
   WEB_LINE_FEEDBACK_HINT,
@@ -423,6 +425,63 @@ test("isolates Mermaid failures so one diagram cannot hide the document", async 
   assert.equal(failed.length, 1);
   assert.equal(failed[0]?.node, first);
   assert.match(String(failed[0]?.error), /invalid state diagram/);
+});
+
+test("waits for browser fonts before laying out Mermaid diagrams", async () => {
+  const node = {} as Element;
+  const rendered: Element[] = [];
+  let releaseFonts!: () => void;
+  const fontsReady = new Promise<void>((resolve) => {
+    releaseFonts = resolve;
+  });
+
+  const rendering = renderMermaidNodes(
+    {
+      async run({ nodes }) {
+        rendered.push(nodes[0]!);
+      },
+    },
+    [node],
+    () => undefined,
+    fontsReady,
+  );
+  await Promise.resolve();
+  assert.deepEqual(rendered, []);
+  releaseFonts();
+  await rendering;
+  assert.deepEqual(rendered, [node]);
+});
+
+test("extracts Mermaid diagnostics thrown as parser objects", () => {
+  assert.equal(
+    mermaidErrorMessage({
+      str: "Could not find a suitable point for the given distance",
+      hash: "Error",
+    }),
+    "Could not find a suitable point for the given distance",
+  );
+  assert.equal(mermaidErrorMessage(new Error("parse failed")), "parse failed");
+});
+
+test("temporarily reveals hidden Mermaid layout without flashing content", async () => {
+  const attributes = new Set(["hidden"]);
+  const style = { visibility: "collapse" };
+  const container = {
+    hasAttribute: (name: string) => attributes.has(name),
+    removeAttribute: (name: string) => attributes.delete(name),
+    setAttribute: (name: string) => attributes.add(name),
+    style,
+  } as unknown as HTMLElement;
+  let visibleDuringLayout = false;
+
+  await withVisibleMermaidLayout(container, async () => {
+    visibleDuringLayout = !attributes.has("hidden") &&
+      style.visibility === "hidden";
+  });
+
+  assert.equal(visibleDuringLayout, true);
+  assert.equal(attributes.has("hidden"), true);
+  assert.equal(style.visibility, "collapse");
 });
 
 test("hides projects without visible documents from browser navigation", () => {

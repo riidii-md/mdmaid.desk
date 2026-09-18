@@ -15,10 +15,20 @@ export interface MermaidValidationIssue {
   message: string;
 }
 
+export interface MermaidValidationReport {
+  kind: "mermaid";
+  valid: boolean;
+  diagramCount: number;
+  issues: MermaidValidationIssue[];
+}
+
 export class MermaidValidationError extends Error {
-  constructor(readonly issues: MermaidValidationIssue[]) {
-    super(issues.map(formatIssue).join("\n"));
+  readonly issues: MermaidValidationIssue[];
+
+  constructor(readonly report: MermaidValidationReport) {
+    super(report.issues.map(formatIssue).join("\n"));
     this.name = "MermaidValidationError";
+    this.issues = report.issues;
   }
 }
 
@@ -72,9 +82,23 @@ export function mermaidBlocks(markdown: string): MermaidBlock[] {
 export async function assertValidMermaidMarkdown(
   markdown: string,
 ): Promise<void> {
+  const report = await validateMermaidMarkdown(markdown);
+  if (!report.valid) {
+    throw new MermaidValidationError(report);
+  }
+}
+
+export async function validateMermaidMarkdown(
+  markdown: string,
+): Promise<MermaidValidationReport> {
   const blocks = mermaidBlocks(markdown);
   if (blocks.length === 0) {
-    return;
+    return {
+      kind: "mermaid",
+      valid: true,
+      diagramCount: 0,
+      issues: [],
+    };
   }
   const parser = await mermaidParser();
   const issues: MermaidValidationIssue[] = [];
@@ -89,9 +113,12 @@ export async function assertValidMermaidMarkdown(
       });
     }
   }
-  if (issues.length > 0) {
-    throw new MermaidValidationError(issues);
-  }
+  return {
+    kind: "mermaid",
+    valid: issues.length === 0,
+    diagramCount: blocks.length,
+    issues,
+  };
 }
 
 async function mermaidParser(): Promise<MermaidParser> {
