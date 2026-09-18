@@ -44,6 +44,7 @@ import {
   changeReviewNarrative,
   parseChangeReviewDiffs,
 } from "./change-review.js";
+import { MermaidValidationError } from "./mermaid-validation.js";
 
 const API_VERSION = 1;
 const MAX_JSON_BYTES = 64 * 1024;
@@ -401,6 +402,9 @@ async function handleRequest(
       sendJson(response, 201, { data: publicDocument(document) });
       events.publish("catalog", { action: "registered", documentId: document.id });
     } catch (error) {
+      if (error instanceof MermaidValidationError) {
+        throw new HttpError(422, "invalid_mermaid", error.message);
+      }
       if (error instanceof Error) {
         throw new HttpError(
           422,
@@ -428,6 +432,9 @@ async function handleRequest(
       sendJson(response, 201, { data: publicDocument(document) });
       events.publish("catalog", { action: "imported", documentId: document.id });
     } catch (error) {
+      if (error instanceof MermaidValidationError) {
+        throw new HttpError(422, "invalid_mermaid", error.message);
+      }
       if (error instanceof Error) {
         throw new HttpError(
           422,
@@ -1366,6 +1373,7 @@ function workspaceHtml(pathname: string): string {
             <div class="reader-actions">
               <button id="mark-read" class="action" type="button">✓ mark read</button>
               <button id="mark-unread" class="action" type="button">○ unread</button>
+              <button id="copy-link" class="action" type="button">copy link</button>
               <button id="print" class="action" type="button">print</button>
               <button id="archive" class="action" type="button">archive</button>
             </div>
@@ -1404,8 +1412,23 @@ function workspaceHtml(pathname: string): string {
             <h2 id="review-title">Human decision</h2>
             <p id="review-request-message" class="review-message"></p>
             <p id="review-status" class="review-status"></p>
-            <label for="review-response">Your response</label>
-            <textarea id="review-response" rows="5" maxlength="16384" placeholder="Add context for the agent…"></textarea>
+            <div id="review-feedback-section" class="review-feedback-section" hidden>
+              <div class="review-feedback-heading">
+                <strong>Anchored feedback</strong>
+                <span>Use a file or line control in the native diff.</span>
+              </div>
+              <div id="review-feedback-list" class="review-feedback-list"></div>
+              <div id="review-feedback-composer" class="review-feedback-composer" hidden>
+                <label id="review-feedback-anchor" for="review-feedback-message"></label>
+                <textarea id="review-feedback-message" rows="3" maxlength="512" placeholder="Describe the specific issue…"></textarea>
+                <div class="review-feedback-actions">
+                  <button id="review-feedback-save" class="action" type="button">save feedback</button>
+                  <button id="review-feedback-cancel" class="action" type="button">cancel</button>
+                </div>
+              </div>
+            </div>
+            <label for="review-response">General note</label>
+            <textarea id="review-response" rows="5" maxlength="16384" placeholder="Add overall context for the agent…"></textarea>
             <p id="review-error" class="review-error" role="alert"></p>
             <div id="review-actions" class="review-actions">
               <button id="review-approve" class="action" type="button">approve</button>

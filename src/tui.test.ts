@@ -452,7 +452,7 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   assert.match(plainFrame, /src\/auth\.ts/);
   assert.match(plainFrame, /UNIFIED/);
   assert.match(plainFrame, /token === expected/);
-  assert.match(plainFrame, /f feedback/);
+  assert.match(plainFrame, /f line feedback/);
   assert.match(frame, /\u001b\[[0-9;]*4m/);
   assert.match(frame, /\u001b\[48;2;/);
   assert.match(
@@ -481,13 +481,13 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   state = handleTuiKey(state, "]").state;
   assert.equal(state.reader?.changeFileIndex, 1);
   assert.match(renderTui(state, 130, 32), /test\/auth\.test\.ts/);
-  state = handleTuiKey(state, "k").state;
+  state = handleTuiKey(state, "[").state;
   assert.equal(state.reader?.changeFileIndex, 0);
   state = handleTuiKey(state, "j").state;
-  assert.equal(state.reader?.changeFileIndex, 1);
-  state = handleTuiKey(state, "up").state;
-  assert.equal(state.reader?.changeFileIndex, 0);
-  assert.match(renderTui(state, 130, 32), /j \/ k file/);
+  assert.equal(state.reader?.changeLineIndex, 1);
+  state = handleTuiKey(state, "k").state;
+  assert.equal(state.reader?.changeLineIndex, 0);
+  assert.match(renderTui(state, 130, 32), /j\/k line/);
   state = handleTuiKey(state, "m").state;
   assert.equal(state.reader?.changeLayout, "side-by-side");
   frame = renderTui(state, 130, 32);
@@ -502,6 +502,8 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   assert.equal(state.reader?.feedbackItems.length, 1);
   assert.equal(state.reader?.feedbackItems[0]?.path, "src/auth.ts");
   assert.match(state.reader?.feedbackItems[0]?.hunkId ?? "", /^hunk-/);
+  assert.equal(state.reader?.feedbackItems[0]?.line, 1);
+  assert.equal(state.reader?.feedbackItems[0]?.side, "old");
 
   state = handleTuiKey(state, "t").state;
   for (const key of "Add an expired-token test.") {
@@ -509,7 +511,8 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   }
   state = handleTuiKey(state, "ctrl-d").state;
   assert.equal(state.reader?.feedbackItems.length, 2);
-  assert.equal(state.reader?.feedbackItems[1]?.kind, "todo");
+  assert.equal(state.reader?.feedbackItems[1]?.kind, "feedback");
+  assert.equal(state.reader?.feedbackItems[1]?.hunkId, undefined);
 
   state = handleTuiKey(state, "y").state;
   assert.equal(state.reviewComposer, undefined);
@@ -527,7 +530,10 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   state = handleTuiKey(state, "c").state;
   assert.equal(state.reviewComposer?.outcome, "changes_requested");
   assert.equal(state.reviewComposer?.items.length, 2);
-  assert.match(state.reviewComposer?.message ?? "", /Use constant-time comparison/);
+  assert.equal(state.reviewComposer?.message, "");
+  for (const key of "Also simplify the retry branch.") {
+    state = handleTuiKey(state, key).state;
+  }
   const submitted = handleTuiKey(state, "ctrl-d");
   assert.equal(submitted.effects[0]?.type, "review-response");
   assert.deepEqual(
@@ -535,6 +541,12 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
       ? submitted.effects[0].items
       : undefined,
     state.reader?.feedbackItems,
+  );
+  assert.equal(
+    submitted.effects[0]?.type === "review-response"
+      ? submitted.effects[0].message
+      : undefined,
+    "Also simplify the retry branch.",
   );
 });
 

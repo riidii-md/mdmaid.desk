@@ -315,8 +315,8 @@ Changing the review artifact makes the pending request stale.
 
 For a native terminal diff, include one or more standard Git patches in fenced
 `diff` blocks. The reader opens in Diff mode when it finds a valid patch and
-provides file (`[`/`]` or arrow keys), hunk (`p`/`n`), unified/side-by-side
-(`m`), and Markdown/diff (`d`) navigation. Changed spans inside paired removed
+provides file (`[`/`]` or arrow keys), hunk (`p`/`n`), line (`j`/`k`),
+unified/side-by-side (`m`), and Markdown/diff (`d`) navigation. Changed spans inside paired removed
 and added lines are emphasized. Binary and mode-only files remain visible even
 when they have no text hunk.
 
@@ -324,14 +324,22 @@ The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
 not inject it as HTML or fetch a remote grammar.
 
-Use `f` to attach feedback to the current hunk, `t` to add a file todo, and `z`
-to undo the most recent unsent note. Notes become durable structured response
-items when Request Changes is submitted; `review wait --json` returns their
-file paths, stable hunk IDs, kinds, and messages. Open notes prevent accidental
+Use `f` to attach feedback to the selected line, `t` to add file feedback, and
+`z` to undo the most recent unsent note. The browser exposes matching file and
+line controls. Anchored notes become durable structured response items when
+Request Changes is submitted, alongside a separate general note;
+`review wait --json` returns their file paths, stable hunk IDs, optional line
+and side, kinds, and messages. Open notes prevent accidental
 Approve or Reject decisions. The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings
 cannot be approved; the human can still Request Changes or Reject them.
+
+Registration, import, and live-reference reconciliation validate every
+Mermaid fence with Mermaid's parser. A bad diagram rejects the update with its
+block number, Markdown start line, and parser diagnostic. Browser rendering is
+also isolated per diagram so a runtime failure remains visible without hiding
+the document or its stable `/d/<document-id>` URL.
 
 The default state directory is:
 

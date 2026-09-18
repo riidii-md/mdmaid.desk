@@ -71,6 +71,32 @@ test("registers documents idempotently and persists the catalog", async () => {
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
 });
 
+test("rejects registration when a Mermaid block is invalid", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "broken-diagram.md");
+  await writeFile(documentPath, [
+    "# Broken diagram",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+  ].join("\n"), "utf8");
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "review",
+      title: "Broken diagram",
+      path: documentPath,
+      attention: "review",
+    }),
+    /Mermaid diagram 1.*line 3.*parse error/is,
+  );
+  assert.equal(catalog.listDocuments().length, 0);
+  catalog.close();
+});
+
 test("registers workspace-local source links and persists their safe mappings", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const sourceDirectory = join(workspace, "Backend", "Features");
@@ -1000,7 +1026,7 @@ test("records one durable human response and requires reasons for changes", asyn
       outcome: "changes_requested",
       message: "   ",
     }),
-    /response message is required/,
+    /response message or anchored feedback is required/,
   );
   const responded = await catalog.respondToReviewRequest(request.id, {
     outcome: "changes_requested",
@@ -1031,7 +1057,7 @@ test("records one durable human response and requires reasons for changes", asyn
   catalog.close();
 });
 
-test("persists structured file, hunk, and todo feedback", async () => {
+test("persists structured file, hunk, line, and todo feedback", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "change-feedback.md");
   await writeFile(documentPath, "# Change feedback\n", "utf8");
@@ -1053,7 +1079,15 @@ test("persists structured file, hunk, and todo feedback", async () => {
       kind: "feedback" as const,
       path: "src/auth.ts",
       hunkId: "hunk-11111111111111111111",
+      line: 14,
+      side: "new" as const,
       message: "Use constant-time comparison here.",
+    },
+    {
+      id: "feedback-33333333333333333333",
+      kind: "feedback" as const,
+      path: "src/auth.ts",
+      message: "Keep the public contract stable.",
     },
     {
       id: "feedback-22222222222222222222",
@@ -1080,12 +1114,13 @@ test("persists structured file, hunk, and todo feedback", async () => {
     /invalid review feedback item/,
   );
 
-  const responded = await catalog.respondToReviewRequest(request.id, {
+  const anchoredOnly = await catalog.respondToReviewRequest(request.id, {
     outcome: "changes_requested",
-    message: "Address the anchored feedback.",
+    message: "",
     items,
   });
-  assert.deepEqual(responded.response?.items, items);
+  assert.deepEqual(anchoredOnly.response?.items, items);
+  assert.equal(anchoredOnly.response?.message, "");
   catalog.close();
 
   const restored = await Catalog.open(statePath, { legacyStatePath: false });

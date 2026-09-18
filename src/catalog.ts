@@ -50,6 +50,7 @@ import {
 import { SqliteCatalogStorage } from "./sqlite-storage.js";
 import type { CatalogStorage } from "./storage.js";
 import { syncDirectory } from "./fs-durability.js";
+import { assertValidMermaidMarkdown } from "./mermaid-validation.js";
 import {
   discoverDocumentSourceLinks,
   isSafeWorkspacePath,
@@ -644,6 +645,7 @@ export class Catalog {
         throw error;
       }
 
+      await assertValidMermaidMarkdown(inspected.content.toString("utf8"));
       const sourceLinks = await discoverDocumentSourceLinks({
         content: inspected.content,
         documentId: initial.id,
@@ -853,6 +855,7 @@ export class Catalog {
       workspace,
       this.#maxDocumentBytes,
     );
+    await assertValidMermaidMarkdown(inspected.content.toString("utf8"));
     const id = documentId(validated.workspaceId, inspected.path);
     const sourceLinks = await discoverDocumentSourceLinks({
       content: inspected.content,
@@ -913,6 +916,7 @@ export class Catalog {
       validated.path,
       this.#maxDocumentBytes,
     );
+    await assertValidMermaidMarkdown(inspected.content.toString("utf8"));
     const id = documentId(
       validated.workspaceId,
       `managed\0${inspected.path}`,
@@ -1392,10 +1396,16 @@ function validateRespondToReviewRequestInput(
     throw new Error("invalid review response input");
   }
   const message = normalizeReviewMessage(input.message);
-  if (input.outcome === "changes_requested" && message.trim() === "") {
-    throw new Error("response message is required for requested changes");
-  }
   const items = validateReviewFeedbackItems(input.items);
+  if (
+    input.outcome === "changes_requested" &&
+    message.trim() === "" &&
+    items.length === 0
+  ) {
+    throw new Error(
+      "response message or anchored feedback is required for requested changes",
+    );
+  }
   if (items.length > 0 && input.outcome !== "changes_requested") {
     throw new Error("feedback items require a changes_requested outcome");
   }
@@ -1416,7 +1426,15 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
   return value.map((item) => {
     if (
       !isRecord(item) ||
-      !hasOnlyKeys(item, ["id", "kind", "path", "hunkId", "message"]) ||
+      !hasOnlyKeys(item, [
+        "id",
+        "kind",
+        "path",
+        "hunkId",
+        "line",
+        "side",
+        "message",
+      ]) ||
       typeof item.id !== "string" ||
       !/^feedback-[a-f0-9]{20}$/.test(item.id) ||
       (item.kind !== "feedback" && item.kind !== "todo") ||
@@ -1425,20 +1443,34 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
       typeof item.message !== "string" ||
       item.message.trim() === "" ||
       item.message.length > MAX_REVIEW_FEEDBACK_MESSAGE_LENGTH ||
-      (item.kind === "feedback" &&
+      (item.hunkId !== undefined &&
         (typeof item.hunkId !== "string" ||
           !/^hunk-[a-f0-9]{20}$/.test(item.hunkId))) ||
-      (item.kind === "todo" && item.hunkId !== undefined)
+      (item.line !== undefined &&
+        (typeof item.line !== "number" ||
+          !Number.isSafeInteger(item.line) ||
+          item.line <= 0)) ||
+      (item.side !== undefined && item.side !== "old" && item.side !== "new") ||
+      ((item.line === undefined) !== (item.side === undefined)) ||
+      (item.line !== undefined && item.hunkId === undefined) ||
+      (item.kind === "todo" &&
+        (item.hunkId !== undefined ||
+          item.line !== undefined ||
+          item.side !== undefined))
     ) {
       throw new Error("invalid review feedback item");
     }
     const message = normalizeReviewMessage(item.message);
     const hunkId = item.hunkId;
+    const line = item.line;
+    const side = item.side;
     return {
       id: item.id,
       kind: item.kind,
       path: item.path,
       ...(typeof hunkId === "string" ? { hunkId } : {}),
+      ...(typeof line === "number" ? { line } : {}),
+      ...(side === "old" || side === "new" ? { side } : {}),
       message,
     };
   });

@@ -16,6 +16,7 @@ import {
   queueCounts,
   requestDocumentPrint,
   reviewResponseError,
+  renderMermaidNodes,
   shouldRefreshWebReader,
   sourceModeLabel,
   webDiffRows,
@@ -329,11 +330,48 @@ test("requires explanatory text only when changes are requested", () => {
     "Explain what needs to change.",
   );
   assert.equal(
-    reviewResponseError("changes_requested", "Add rollback proof."),
+    reviewResponseError("changes_requested", "Add rollback proof.", []),
+    undefined,
+  );
+  assert.equal(
+    reviewResponseError("changes_requested", "", [{
+      id: "feedback-11111111111111111111",
+      kind: "feedback",
+      path: "src/auth.ts",
+      line: 14,
+      side: "new",
+      message: "Handle the expired token here.",
+    }]),
     undefined,
   );
   assert.equal(reviewResponseError("approved", ""), undefined);
   assert.equal(reviewResponseError("rejected", ""), undefined);
+});
+
+test("isolates Mermaid failures so one diagram cannot hide the document", async () => {
+  const first = {} as Element;
+  const second = {} as Element;
+  const rendered: Element[] = [];
+  const failed: Array<{ node: Element; error: unknown }> = [];
+
+  await renderMermaidNodes(
+    {
+      async run({ nodes }) {
+        const node = nodes[0]!;
+        rendered.push(node);
+        if (node === first) {
+          throw new Error("invalid state diagram");
+        }
+      },
+    },
+    [first, second],
+    (node, error) => failed.push({ node, error }),
+  );
+
+  assert.deepEqual(rendered, [first, second]);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]?.node, first);
+  assert.match(String(failed[0]?.error), /invalid state diagram/);
 });
 
 test("hides projects without visible documents from browser navigation", () => {

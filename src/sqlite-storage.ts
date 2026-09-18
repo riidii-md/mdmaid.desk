@@ -882,7 +882,15 @@ function isValidReviewFeedbackItem(value: unknown): value is ReviewFeedbackItem 
     return false;
   }
   const item = value as Record<string, unknown>;
-  const allowed = new Set(["id", "kind", "path", "hunkId", "message"]);
+  const allowed = new Set([
+    "id",
+    "kind",
+    "path",
+    "hunkId",
+    "line",
+    "side",
+    "message",
+  ]);
   return Object.keys(item).every((key) => allowed.has(key)) &&
     typeof item.id === "string" &&
     /^feedback-[a-f0-9]{20}$/.test(item.id) &&
@@ -894,9 +902,17 @@ function isValidReviewFeedbackItem(value: unknown): value is ReviewFeedbackItem 
     item.message.trim() !== "" &&
     item.message.length <= 512 &&
     !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.message) &&
-    (item.kind === "feedback"
-      ? typeof item.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(item.hunkId)
-      : item.hunkId === undefined);
+    (item.hunkId === undefined ||
+      (typeof item.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(item.hunkId))) &&
+    (item.line === undefined ||
+      (typeof item.line === "number" &&
+        Number.isSafeInteger(item.line) &&
+        item.line > 0)) &&
+    (item.side === undefined || item.side === "old" || item.side === "new") &&
+    ((item.line === undefined) === (item.side === undefined)) &&
+    (item.line === undefined || item.hunkId !== undefined) &&
+    (item.kind !== "todo" ||
+      (item.hunkId === undefined && item.line === undefined && item.side === undefined));
 }
 
 function isSafeFeedbackPath(value: string): boolean {
