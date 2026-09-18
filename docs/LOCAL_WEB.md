@@ -3,7 +3,7 @@
 The canonical browser origin is:
 
 ```text
-http://mdmaid.desk.localhost:43127/
+http://mdmaid.desk.localhost/
 ```
 
 It is served directly by mdmaid.desk. The application remains bound to
@@ -25,7 +25,8 @@ browsers share cookies across ports: token-scoped names let multiple local
 mdmaid.desk daemons coexist on the same `.localhost` hostname without signing
 each other out.
 
-The default backend port is stable at `43127`. To choose a different one:
+The default backend port is the standard HTTP port `80`, so the browser URL
+does not need a port suffix. To choose a different port for isolated testing:
 
 ```bash
 node dist/cli.js web --port 43128
@@ -33,6 +34,19 @@ node dist/cli.js web --port 43128
 
 The public origin then becomes
 `http://mdmaid.desk.localhost:43128/` automatically.
+
+For a persistent login service, install the existing daemon integration once:
+
+```bash
+mdmaid-desk daemon install
+```
+
+After that, `web`, `tui`, `daemon start`, and daemon-aware CLI mutations reuse
+the healthy running service. They do not need to start another server. The
+daemon does not silently fall back to a random port when port 80 is occupied;
+free that port or install it with an explicit alternate `--port`.
+If the healthy shared daemon is already running, `web` reuses it when the
+requested port matches and rejects a conflicting second server.
 
 ## Live source refresh
 

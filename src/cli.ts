@@ -38,6 +38,10 @@ import {
 } from "./server.js";
 import { readOrCreateAuthToken } from "./auth-state.js";
 import { readPackageVersion } from "./package-info.js";
+import {
+  DEFAULT_DESK_ORIGIN,
+  DEFAULT_DESK_PORT,
+} from "./service-config.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
 import {
   installUserService as installLoginService,
@@ -136,6 +140,13 @@ interface Writer {
   write(value: string): unknown;
 }
 
+interface WebConfiguration {
+  explicitPort: boolean;
+  explicitPublicUrl: boolean;
+  port: number;
+  publicUrl: string | undefined;
+}
+
 export interface RunOptions {
   statePath?: string;
   connectDaemon?: (statePath: string) => Promise<DeskApiClient | undefined>;
@@ -154,7 +165,6 @@ export interface RunOptions {
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
   signal?: AbortSignal;
   reviewPollIntervalMs?: number;
-  allowPortFallback?: boolean;
 }
 
 class UsageError extends Error {}
@@ -205,12 +215,10 @@ export async function run(
       statePath = firstOption(internal, "state-path") ?? statePath;
       const port = firstOption(internal, "port");
       const webArgs = port === undefined ? [] : ["--port", port];
+      const web = parseWebConfiguration(webArgs);
       const catalog = await Catalog.open(statePath);
       try {
-        return await runWeb(catalog, statePath, webArgs, silentWriter, {
-          ...options,
-          allowPortFallback: port === undefined,
-        });
+        return await runWeb(catalog, statePath, web, silentWriter, options);
       } finally {
         catalog.close();
       }
@@ -222,18 +230,25 @@ export async function run(
       return await runDaemon(statePath, args.slice(1), stdout, options);
     }
     if (args[0] === "web") {
-      if (args.length === 1) {
-        const running = await (
-          options.connectDaemonInfo ?? connectToDaemonInfo
-        )(statePath);
-        if (running) {
-          stdout.write(`mdmaid.desk web: ${daemonWebUrl(running)}\n`);
-          return 0;
+      const web = parseWebConfiguration(args.slice(1));
+      const running = await (
+        options.connectDaemonInfo ?? connectToDaemonInfo
+      )(statePath);
+      if (running) {
+        if (
+          web.explicitPublicUrl ||
+          (web.explicitPort && web.port !== running.descriptor.port)
+        ) {
+          throw new Error(
+            `daemon is already running on port ${running.descriptor.port}`,
+          );
         }
+        stdout.write(`mdmaid.desk web: ${daemonWebUrl(running)}\n`);
+        return 0;
       }
       const catalog = await Catalog.open(statePath);
       try {
-        return await runWeb(catalog, statePath, args.slice(1), stdout, options);
+        return await runWeb(catalog, statePath, web, stdout, options);
       } finally {
         catalog.close();
       }
@@ -278,50 +293,20 @@ export async function run(
 async function runWeb(
   catalog: Catalog,
   statePath: string,
-  args: string[],
+  configuration: WebConfiguration,
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
-  const parsed = parseArguments(args);
-  if (parsed.positionals.length > 0) {
-    throw new UsageError("web accepts options only");
-  }
-  rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
-  const configuredPublicUrl = parsePublicUrl(
-    firstOption(parsed, "public-url"),
-  );
-  const configuredPort = firstOption(parsed, "port");
-  const port = parsePort(
-    configuredPort ?? inferDirectHttpPort(configuredPublicUrl) ?? "43127",
-  );
-  const publicUrl =
-    configuredPublicUrl ??
-    (port === 0 ? undefined : `http://mdmaid.desk.localhost:${port}`);
-  if (publicUrl !== undefined) {
-    validateDirectHttpPort(publicUrl, port);
-  }
+  const { port, publicUrl } = configuration;
   const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
-  let server: RunningDeskServer;
-  try {
-    server = await startServer({
-      catalog,
-      host: "127.0.0.1",
-      port,
-      token,
-      ...(publicUrl ? { publicUrl } : {}),
-    });
-  } catch (error) {
-    if (!options.allowPortFallback || !isAddressInUse(error)) {
-      throw error;
-    }
-    server = await startServer({
-      catalog,
-      host: "127.0.0.1",
-      port: 0,
-      token,
-    });
-  }
+  const server = await startServer({
+    catalog,
+    host: "127.0.0.1",
+    port,
+    token,
+    ...(publicUrl ? { publicUrl } : {}),
+  });
   const descriptor = descriptorForServer(server);
   const descriptorPath = daemonDescriptorPath(statePath);
   try {
@@ -340,6 +325,35 @@ async function runWeb(
     }
   }
   return 0;
+}
+
+function parseWebConfiguration(args: string[]): WebConfiguration {
+  const parsed = parseArguments(args);
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("web accepts options only");
+  }
+  rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
+  const configuredPublicUrl = parsePublicUrl(
+    firstOption(parsed, "public-url"),
+  );
+  const configuredPort = firstOption(parsed, "port");
+  const port = parsePort(
+    configuredPort ??
+      inferDirectHttpPort(configuredPublicUrl) ??
+      String(DEFAULT_DESK_PORT),
+  );
+  const publicUrl =
+    configuredPublicUrl ??
+    (port === 0 ? undefined : directPublicUrl(port));
+  if (publicUrl !== undefined) {
+    validateDirectHttpPort(publicUrl, port);
+  }
+  return {
+    explicitPort: configuredPort !== undefined,
+    explicitPublicUrl: configuredPublicUrl !== undefined,
+    port,
+    publicUrl,
+  };
 }
 
 async function runTerminal(
@@ -449,7 +463,13 @@ async function runDaemon(
 }
 
 function daemonWebUrl(connection: DaemonConnection): string {
-  return `http://mdmaid.desk.localhost:${connection.descriptor.port}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+  return `${directPublicUrl(connection.descriptor.port)}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+}
+
+function directPublicUrl(port: number): string {
+  return port === DEFAULT_DESK_PORT
+    ? DEFAULT_DESK_ORIGIN
+    : `http://mdmaid.desk.localhost:${port}`;
 }
 
 function parsePort(value: string): number {
@@ -1275,14 +1295,6 @@ function rejectUnknownOptions(
       throw new UsageError(`option --${name} may be used only once`);
     }
   }
-}
-
-function isAddressInUse(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "EADDRINUSE"
-  );
 }
 
 function defaultStatePath(): string {

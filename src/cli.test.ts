@@ -736,6 +736,69 @@ test("reuses a running daemon when opening the web workspace", async () => {
   assert.equal(stderr.text(), "");
 });
 
+test("prints the portless canonical URL when reusing the default daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-default-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("reuses the default daemon when its port is selected explicitly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-selected-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web", "--port", "80"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("rejects a second web server on a different port for the same state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-conflict-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web", "--port", "43128"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(stdout.text(), "");
+  assert.match(stderr.text(), /daemon is already running on port 80/);
+});
+
 test("exposes explicit daemon lifecycle and user-service commands", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-daemon-"));
   const statePath = join(root, "catalog.sqlite3");
@@ -808,20 +871,20 @@ test("uses the canonical direct localhost HTTP origin by default", async () => {
 
   assert.equal(exit, 0);
   assert.equal(started?.host, "127.0.0.1");
-  assert.equal(started?.port, 43127);
+  assert.equal(started?.port, 80);
   assert.equal(
     started?.publicUrl,
-    "http://mdmaid.desk.localhost:43127",
+    "http://mdmaid.desk.localhost",
   );
   assert.match(
     stdout.text(),
-    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost\/\?token=/,
   );
   assert.doesNotMatch(stdout.text(), /proxy target/);
   assert.equal(stderr.text(), "");
 });
 
-test("lets the daemon choose an available port when the default is occupied", async () => {
+test("does not move the daemon to a random port when the default is occupied", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-open-port-"));
   const statePath = join(root, "catalog.sqlite3");
   const stdout = output();
@@ -835,30 +898,17 @@ test("lets the daemon choose an available port when the default is occupied", as
     {
       startServer: async (options) => {
         attempted.push(options.port ?? -1);
-        if (attempted.length === 1) {
-          const error = new Error("address in use") as NodeJS.ErrnoException;
-          error.code = "EADDRINUSE";
-          throw error;
-        }
-        return fakeServer(() => undefined, {
-          port: 49876,
-          url: "http://127.0.0.1:49876",
-          webUrl: "http://127.0.0.1:49876/?token=test-token",
-        });
-      },
-      waitForShutdown: async () => {
-        const descriptor = await readDaemonDescriptor(
-          daemonDescriptorPath(statePath),
-        );
-        assert.equal(descriptor?.port, 49876);
+        const error = new Error("address in use") as NodeJS.ErrnoException;
+        error.code = "EADDRINUSE";
+        throw error;
       },
     },
   );
 
-  assert.equal(exit, 0);
-  assert.deepEqual(attempted, [43127, 0]);
+  assert.equal(exit, 1);
+  assert.deepEqual(attempted, [80]);
   assert.equal(stdout.text(), "");
-  assert.equal(stderr.text(), "");
+  assert.match(stderr.text(), /address in use/);
 });
 
 test("runs the terminal workspace through the same daemon API", async () => {
@@ -1037,17 +1087,17 @@ function fakeServer(
   };
 }
 
-function fakeConnection(): DaemonConnection {
+function fakeConnection(port = 43121): DaemonConnection {
   return {
-    client: new DeskApiClient("http://127.0.0.1:43121", "test-token"),
+    client: new DeskApiClient(`http://127.0.0.1:${port}`, "test-token"),
     descriptor: {
       protocolVersion: 1,
       pid: process.pid,
       host: "127.0.0.1",
-      port: 43121,
+      port,
       token: "test-token",
       startedAt: "2026-08-12T00:00:00.000Z",
     },
-    url: "http://127.0.0.1:43121",
+    url: `http://127.0.0.1:${port}`,
   };
 }

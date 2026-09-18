@@ -35,10 +35,10 @@ The repository contains the first usable shared-service vertical slice:
 - first-class change-review documents with a dedicated terminal Changes space
   and revision-bound implementation decisions;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
-- memorable `http://mdmaid.desk.localhost:43127/` browser origin;
+- memorable `http://mdmaid.desk.localhost/` browser origin;
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
-- selectable ports with automatic available-port fallback;
+- stable port-80 default with explicit alternate ports for isolated testing;
 - `workspace`, `register`, `import`, `review`, `list`, `web`, `tui`, and `daemon`
   commands.
 
@@ -243,11 +243,11 @@ Run the browser workspace as a foreground local service:
 node dist/cli.js web
 ```
 
-The command binds only to loopback on the stable port `43127` and prints an
+The command binds only to loopback on the standard HTTP port `80` and prints an
 authenticated URL such as:
 
 ```text
-http://mdmaid.desk.localhost:43127/?token=...
+http://mdmaid.desk.localhost/?token=...
 ```
 
 No proxy, certificate, DNS, or `/etc/hosts` setup is required. After the first
@@ -259,7 +259,8 @@ names are scoped to that token, allowing independent mdmaid.desk daemons on
 different ports to remain signed in at the same time. Stop the foreground
 service with `Ctrl-C`.
 
-Use `--port` to select another loopback port. An advanced `--public-url` option
+Use `--port` to select another loopback port for intentional isolated testing.
+An advanced `--public-url` option
 accepts HTTP or HTTPS `.localhost` origins; a direct HTTP origin must use the
 same port as the service.
 
@@ -274,13 +275,18 @@ mdmaid-desk web
 mdmaid-desk daemon stop
 ```
 
-The default port is `43127`. If it is occupied, an unpinned daemon selects an
-available loopback port; `daemon start` and `daemon status` print the actual
-port and authenticated web URL. Pin one when desired:
+The default port is `80`. Mdmaid.desk does not silently move a daemon to a
+random port when it is occupied. A default `web`, `tui`, `daemon start`, or CLI
+mutation attaches to the healthy daemon recorded in the user-only descriptor.
+Select a different port only when deliberately running an isolated instance:
 
 ```bash
 mdmaid-desk daemon start --port 43210
 ```
+
+If a healthy daemon already exists, the same-port `web` command reuses it and
+a conflicting port is rejected. Stop the shared daemon before starting an
+isolated instance against the same state directory.
 
 To start mdmaid.desk automatically at login, explicitly install its user
 service (LaunchAgent on macOS, systemd user service on Linux):
@@ -290,6 +296,11 @@ mdmaid-desk daemon install
 # or: mdmaid-desk daemon install --port 43210
 mdmaid-desk daemon uninstall
 ```
+
+Agents and scripts should use the ordinary CLI commands without starting their
+own server. When the installed service is healthy, the CLI reuses it; document
+registration still falls back to a bounded direct catalog transaction when no
+daemon is running.
 
 Registration never installs or permanently starts the daemon.
 

@@ -37,10 +37,10 @@ test("reuses an authenticated daemon and rejects a conflicting selected port", a
   assert.equal(await stopDaemon(statePath), false);
 });
 
-test("starts on an available port, reports it, and stops cleanly", async () => {
+test("starts on an explicitly selected available port, reports it, and stops cleanly", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-lifecycle-spawn-"));
   const statePath = join(root, "catalog.sqlite3");
-  const connection = await startDaemon(statePath);
+  const connection = await startDaemon(statePath, 0);
   try {
     assert.ok(connection.descriptor.port > 0);
     assert.equal(
@@ -65,7 +65,7 @@ test("reclaims a user-owned start lock left by a dead process", async () => {
     { mode: 0o600 },
   );
 
-  const connection = await startDaemon(statePath);
+  const connection = await startDaemon(statePath, 0);
   try {
     assert.ok(connection.descriptor.port > 0);
   } finally {

@@ -43,6 +43,7 @@ test("renders a Linux systemd user service that restarts at login", () => {
   );
   assert.match(definition.content, /ExecStart="\/usr\/bin\/node"/);
   assert.match(definition.content, /__daemon-serve/);
+  assert.match(definition.content, /"--port" "80"/);
   assert.match(definition.content, /Restart=on-failure/);
   assert.match(definition.content, /WantedBy=default.target/);
 });
