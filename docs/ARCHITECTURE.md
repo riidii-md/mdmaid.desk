@@ -209,8 +209,9 @@ service on Linux; a future Homebrew service uses the same lifecycle contract.
 Both foreground `mdmaid-desk web` and the background daemon atomically publish
 a mode-`0600` descriptor. CLI writes, web, and TUI health-check and reuse it.
 The TUI starts a session-scoped embedded loopback server when no daemon exists.
-A user can select a port, while an unpinned daemon falls back from `43127` to an
-available loopback port and reports the actual value through `daemon status`.
+A user can select a port for an isolated instance. The default daemon stays on
+port `80` and fails rather than silently moving to a random port. A
+healthy descriptor remains the attach-first authority for CLI and TUI clients.
 
 `web` should attach to and open an existing healthy daemon when one exists. If
 none exists, it starts the service in the foreground until interrupted. The
@@ -218,7 +219,7 @@ TUI follows the same attach-first policy without leaving its fallback server
 running after the terminal session ends.
 
 The foreground browser service uses the stable direct origin
-`http://mdmaid.desk.localhost:43127/`. The special-use `.localhost` name maps
+`http://mdmaid.desk.localhost/`. The special-use `.localhost` name maps
 back to loopback, so it needs no DNS, hosts-file, proxy, or certificate setup.
 Browser origin checks use that explicit origin rather than forwarding headers.
 The daemon keeps a stable random mode-`0600` authentication token so browser
