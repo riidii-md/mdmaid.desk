@@ -31,12 +31,15 @@ import {
   isReviewStatus,
   presentDocument,
   presentReviewRequest,
+  projectDisplayName,
   type Attention,
   type Document,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type Project,
+  type RepositoryIdentity,
   type ReviewKind,
   type ReviewFeedbackItem,
   type ReviewOutcome,
@@ -73,6 +76,7 @@ export type {
   ReviewResponse,
   ReviewStatus,
   Workspace,
+  Project,
 } from "./domain.js";
 
 export const CATALOG_SCHEMA_VERSION = 1;
@@ -80,6 +84,8 @@ const DEFAULT_MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_LEGACY_CATALOG_BYTES = 4 * 1024 * 1024;
 const MAX_TITLE_LENGTH = 512;
 const MAX_CONTEXT_LENGTH = 256;
+const MAX_FEATURE_NAME_LENGTH = 96;
+const MAX_REPOSITORY_LENGTH = 512;
 const MAX_LINKED_SOURCE_LINES = 50_000;
 const MAX_REVIEW_MESSAGE_LENGTH = 16 * 1024;
 const MAX_REVIEW_FEEDBACK_ITEMS = 32;
@@ -116,11 +122,14 @@ export interface AddWorkspaceInput {
   name: string;
   root: string;
   artifactRoots: string[];
+  repository?: string;
+  repositoryName?: string;
 }
 
 export interface RegisterDocumentInput {
   workspaceId: string;
   taskId?: string;
+  featureName?: string;
   producer?: string;
   kind: DocumentKind;
   title: string;
@@ -839,7 +848,12 @@ export class Catalog {
       );
     }
 
-    this.#storage.saveWorkspace(workspace);
+    const existingRepository = this.#storage.getWorkspaceRepository(workspace.id);
+    const repository = input.repository === undefined &&
+        input.repositoryName === undefined && existingRepository
+      ? existingRepository
+      : repositoryIdentity(input, root);
+    this.#storage.saveWorkspace(workspace, repository);
     return structuredClone(workspace);
   }
 
@@ -865,6 +879,13 @@ export class Catalog {
     });
     const existing = this.#storage.getDocument(id);
     const now = new Date().toISOString();
+    const taskId = validated.taskId ?? existing?.taskId;
+    const project = this.#projectForDocument(
+      validated.workspaceId,
+      taskId,
+      validated.featureName,
+      now,
+    );
     const contentChanged =
       existing !== undefined && existing.contentHash !== inspected.contentHash;
     const tags =
@@ -874,11 +895,9 @@ export class Catalog {
     const document: StoredDocument = {
       id,
       workspaceId: validated.workspaceId,
-      ...(validated.taskId === undefined
-        ? existing?.taskId === undefined
-          ? {}
-          : { taskId: existing.taskId }
-        : { taskId: validated.taskId }),
+      projectId: project.id,
+      projectName: projectDisplayName(project),
+      ...(taskId === undefined ? {} : { taskId }),
       ...(validated.producer === undefined
         ? existing?.producer === undefined
           ? {}
@@ -938,6 +957,13 @@ export class Catalog {
       inspected,
     );
     const now = new Date().toISOString();
+    const taskId = validated.taskId ?? existing?.taskId;
+    const project = this.#projectForDocument(
+      validated.workspaceId,
+      taskId,
+      validated.featureName,
+      now,
+    );
     const contentChanged =
       existing !== undefined && existing.contentHash !== inspected.contentHash;
     const tags =
@@ -947,11 +973,9 @@ export class Catalog {
     const document: StoredDocument = {
       id,
       workspaceId: validated.workspaceId,
-      ...(validated.taskId === undefined
-        ? existing?.taskId === undefined
-          ? {}
-          : { taskId: existing.taskId }
-        : { taskId: validated.taskId }),
+      projectId: project.id,
+      projectName: projectDisplayName(project),
+      ...(taskId === undefined ? {} : { taskId }),
       ...(validated.producer === undefined
         ? existing?.producer === undefined
           ? {}
@@ -977,6 +1001,28 @@ export class Catalog {
 
     this.#storage.saveDocument(document);
     return presentDocument(document);
+  }
+
+  #projectForDocument(
+    workspaceId: string,
+    taskId: string | undefined,
+    featureName: string | undefined,
+    now: string,
+  ): Project {
+    const repository = this.#storage.getWorkspaceRepository(workspaceId);
+    if (!repository) {
+      throw new Error(`workspace ${workspaceId} has no repository identity`);
+    }
+    const taskKey = taskId ?? "";
+    return this.#storage.saveProject({
+      id: projectId(repository.key, taskKey),
+      repositoryKey: repository.key,
+      repositoryName: repository.name,
+      taskKey,
+      ...(featureName === undefined ? {} : { featureName }),
+      createdAt: now,
+      updatedAt: now,
+    });
   }
 
   async markDocumentOpened(id: string): Promise<Document> {
@@ -1079,6 +1125,7 @@ export class Catalog {
     }
 
     const workspaces: Workspace[] = [];
+    const repositories = new Map<string, RepositoryIdentity>();
     for (const legacyWorkspace of state.workspaces) {
       const root = await canonicalDirectory(
         legacyWorkspace.root,
@@ -1103,9 +1150,14 @@ export class Catalog {
         root,
         artifactRoots,
       });
+      repositories.set(legacyWorkspace.id, {
+        key: `local:${createHash("sha256").update(root).digest("hex")}`,
+        name: legacyWorkspace.name,
+      });
     }
 
     const documents: StoredDocument[] = [];
+    const projects = new Map<string, Project>();
     for (const legacyDocument of state.documents) {
       const workspace = workspaces.find(
         ({ id }) => id === legacyDocument.workspaceId,
@@ -1120,12 +1172,29 @@ export class Catalog {
         workspace,
         this.#maxDocumentBytes,
       );
+      const repository = repositories.get(legacyDocument.workspaceId);
+      if (!repository) {
+        throw new Error(
+          `workspace ${legacyDocument.workspaceId} has no repository identity`,
+        );
+      }
+      const taskId = legacyDocument.taskId?.trim().toUpperCase();
+      const taskKey = taskId ?? "";
+      const resolvedProject: Project = {
+        id: projectId(repository.key, taskKey),
+        repositoryKey: repository.key,
+        repositoryName: repository.name,
+        taskKey,
+        createdAt: legacyDocument.createdAt,
+        updatedAt: legacyDocument.updatedAt,
+      };
+      projects.set(resolvedProject.id, resolvedProject);
       documents.push({
         id: legacyDocument.id,
         workspaceId: legacyDocument.workspaceId,
-        ...(legacyDocument.taskId === undefined
-          ? {}
-          : { taskId: legacyDocument.taskId }),
+        projectId: resolvedProject.id,
+        projectName: projectDisplayName(resolvedProject),
+        ...(taskId === undefined ? {} : { taskId }),
         kind: legacyDocument.kind,
         title: legacyDocument.title,
         storage: "reference",
@@ -1151,7 +1220,14 @@ export class Catalog {
 
     this.#storage.transaction(() => {
       for (const workspace of workspaces) {
-        this.#storage.saveWorkspace(workspace);
+        const repository = repositories.get(workspace.id);
+        if (!repository) {
+          throw new Error(`workspace ${workspace.id} has no repository identity`);
+        }
+        this.#storage.saveWorkspace(workspace, repository);
+      }
+      for (const project of projects.values()) {
+        this.#storage.saveProject(project);
       }
       for (const document of documents) {
         this.#storage.saveDocument(document);
@@ -1190,7 +1266,14 @@ function validateCatalogOptions(options: CatalogOptions): void {
 function validateAddWorkspaceInput(input: AddWorkspaceInput): void {
   if (
     !isRecord(input) ||
-    !hasOnlyKeys(input, ["id", "name", "root", "artifactRoots"]) ||
+    !hasOnlyKeys(input, [
+      "id",
+      "name",
+      "root",
+      "artifactRoots",
+      "repository",
+      "repositoryName",
+    ]) ||
     typeof input.id !== "string" ||
     !WORKSPACE_ID_PATTERN.test(input.id) ||
     typeof input.name !== "string" ||
@@ -1200,7 +1283,15 @@ function validateAddWorkspaceInput(input: AddWorkspaceInput): void {
     input.root.trim() === "" ||
     !isStringArray(input.artifactRoots) ||
     input.artifactRoots.length === 0 ||
-    input.artifactRoots.some((path) => path.trim() === "")
+    input.artifactRoots.some((path) => path.trim() === "") ||
+    (input.repository !== undefined &&
+      (typeof input.repository !== "string" ||
+        input.repository.trim() === "" ||
+        input.repository.length > MAX_REPOSITORY_LENGTH)) ||
+    (input.repositoryName !== undefined &&
+      (typeof input.repositoryName !== "string" ||
+        input.repositoryName.trim() === "" ||
+        input.repositoryName.length > MAX_CONTEXT_LENGTH))
   ) {
     throw new Error("invalid workspace input");
   }
@@ -1215,6 +1306,7 @@ function validateRegisterDocumentInput(
     !hasOnlyKeys(input, [
       "workspaceId",
       "taskId",
+      "featureName",
       "producer",
       "kind",
       "title",
@@ -1228,6 +1320,11 @@ function validateRegisterDocumentInput(
       (typeof input.taskId !== "string" ||
         input.taskId.trim() === "" ||
         input.taskId.length > MAX_CONTEXT_LENGTH)) ||
+    (input.featureName !== undefined &&
+      (typeof input.featureName !== "string" ||
+        input.featureName.trim() === "" ||
+        input.featureName.length > MAX_FEATURE_NAME_LENGTH ||
+        /[\u0000-\u001f\u007f]/.test(input.featureName))) ||
     (input.producer !== undefined &&
       (typeof input.producer !== "string" ||
         input.producer.trim() === "" ||
@@ -1250,7 +1347,12 @@ function validateRegisterDocumentInput(
   }
   return {
     workspaceId: input.workspaceId,
-    ...(input.taskId === undefined ? {} : { taskId: input.taskId.trim() }),
+    ...(input.taskId === undefined
+      ? {}
+      : { taskId: input.taskId.trim().toUpperCase() }),
+    ...(input.featureName === undefined
+      ? {}
+      : { featureName: input.featureName.trim() }),
     ...(input.producer === undefined
       ? {}
       : { producer: input.producer.trim() }),
@@ -1853,6 +1955,85 @@ function documentId(workspaceId: string, path: string): string {
     .digest("hex")
     .slice(0, 20);
   return `doc-${hash}`;
+}
+
+function projectId(repositoryKey: string, taskKey: string): string {
+  const hash = createHash("sha256")
+    .update(repositoryKey)
+    .update("\0")
+    .update(taskKey)
+    .digest("hex")
+    .slice(0, 20);
+  return `project-${hash}`;
+}
+
+function repositoryIdentity(
+  input: AddWorkspaceInput,
+  canonicalRoot: string,
+): RepositoryIdentity {
+  const key = input.repository === undefined
+    ? `local:${createHash("sha256").update(canonicalRoot).digest("hex")}`
+    : normalizeRepositoryKey(input.repository);
+  const name = input.repositoryName?.trim() ??
+    (input.repository === undefined
+      ? input.name.trim()
+      : repositoryNameFromKey(key));
+  if (
+    name === "" ||
+    name.length > MAX_CONTEXT_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(name)
+  ) {
+    throw new Error("invalid repository name");
+  }
+  return { key, name };
+}
+
+function normalizeRepositoryKey(input: string): string {
+  const trimmed = input.trim();
+  if (
+    trimmed === "" ||
+    trimmed.length > MAX_REPOSITORY_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(trimmed)
+  ) {
+    throw new Error("invalid repository identity");
+  }
+
+  let value = trimmed;
+  const scp = value.match(/^(?:[^@/]+@)?([^:/]+):(.+)$/);
+  if (scp && !value.includes("://")) {
+    value = `${scp[1]}/${scp[2]}`;
+  } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      throw new Error("invalid repository identity");
+    }
+    if (parsed.hostname === "" || parsed.pathname === "") {
+      throw new Error("invalid repository identity");
+    }
+    value = `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}${parsed.pathname}`;
+  }
+
+  value = value.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  if (
+    value === "" ||
+    value.includes("@") ||
+    value.includes("?") ||
+    value.includes("#") ||
+    !/^[A-Za-z0-9._:/-]+$/.test(value)
+  ) {
+    throw new Error("invalid repository identity");
+  }
+  return value.toLowerCase();
+}
+
+function repositoryNameFromKey(key: string): string {
+  const name = key.split("/").at(-1)?.replace(/\.git$/i, "").trim();
+  if (!name) {
+    throw new Error("repository identity has no name");
+  }
+  return name;
 }
 
 function validateDocumentId(id: string): void {

@@ -13,6 +13,30 @@ import { Catalog } from "./catalog.js";
 import { startLiveSourceCoordinator } from "./live-sources.js";
 import { startDeskServer } from "./server.js";
 
+test("rejects unsafe daemon client configuration", async () => {
+  assert.throws(
+    () => new DeskApiClient("file:///tmp/mdmaid.sock", "long-enough-token"),
+    /HTTP or HTTPS/,
+  );
+  assert.throws(
+    () => new DeskApiClient("http://user:secret@127.0.0.1", "long-enough-token"),
+    /must not contain credentials/,
+  );
+  assert.throws(
+    () => new DeskApiClient("http://127.0.0.1", "short"),
+    /at least 8 characters/,
+  );
+  const client = new DeskApiClient("http://127.0.0.1:1", "long-enough-token");
+  await assert.rejects(
+    client.renderDocument(
+      "doc-11111111111111111111",
+      "terminal",
+      10,
+    ),
+    /render width must be an integer between 20 and 1000/,
+  );
+});
+
 test("uses the versioned daemon API for terminal client operations", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-client-"));
   const workspace = join(root, "workspace");
@@ -54,6 +78,14 @@ test("uses the versioned daemon API for terminal client operations", async () =>
       (await client.listWorkspaces()).map(({ id }) => id),
       ["example"],
     );
+    assert.deepEqual(await client.listProjects(), [
+      {
+        id: document.projectId,
+        name: document.projectName,
+        documentCount: 1,
+        route: `/p/${document.projectId}`,
+      },
+    ]);
     const rendered = await client.renderDocument(document.id, "terminal", 78, {
       color: true,
       unicode: false,

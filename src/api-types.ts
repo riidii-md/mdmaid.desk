@@ -24,6 +24,8 @@ export type { ChangeReviewDiff } from "./change-review.js";
 export interface PublicDocument {
   id: string;
   workspaceId: string;
+  projectId?: string;
+  projectName?: string;
   taskId?: string;
   producer?: string;
   kind: DocumentKind;
@@ -55,16 +57,26 @@ export interface PublicWorkspace {
   route: string;
 }
 
+export interface PublicProject {
+  id: string;
+  name: string;
+  documentCount: number;
+  route: string;
+}
+
 export interface WorkspaceRegistration {
   id: string;
   name: string;
   root: string;
   artifactRoots: string[];
+  repository?: string;
+  repositoryName?: string;
 }
 
 export interface DocumentRegistration {
   workspaceId: string;
   taskId?: string;
+  featureName?: string;
   producer?: string;
   kind: DocumentKind;
   title: string;

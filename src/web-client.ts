@@ -390,6 +390,7 @@ export function filterQueue(
     }
     if (
       filters.workspaceId !== undefined &&
+      (document.projectId ?? document.workspaceId) !== filters.workspaceId &&
       document.workspaceId !== filters.workspaceId
     ) {
       return false;
@@ -406,6 +407,7 @@ export function filterQueue(
     }
     const haystack = [
       document.title,
+      document.projectName ?? "",
       document.workspaceId,
       document.taskId ?? "",
       document.producer ?? "",
@@ -582,14 +584,17 @@ export function groupQueue(
     const names = new Map(workspaces.map(({ id, name }) => [id, name]));
     const groups = new Map<string, WebDocumentGroup>();
     for (const document of documents) {
-      let group = groups.get(document.workspaceId);
+      const projectId = document.projectId ?? document.workspaceId;
+      let group = groups.get(projectId);
       if (!group) {
         group = {
-          key: `project:${document.workspaceId}`,
-          label: names.get(document.workspaceId) ?? document.workspaceId,
+          key: `project:${projectId}`,
+          label: document.projectName ??
+            names.get(document.workspaceId) ??
+            document.workspaceId,
           documents: [],
         };
-        groups.set(document.workspaceId, group);
+        groups.set(projectId, group);
       }
       group.documents.push(document);
     }
@@ -631,18 +636,31 @@ export function visibleWorkspaces(
   workspaces: WebWorkspace[],
 ): WebWorkspace[] {
   const counts = new Map<string, number>();
+  const labels = new Map<string, string>();
+  const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
   for (const document of documents) {
     if (document.archivedAt === null) {
+      const projectId = document.projectId ?? document.workspaceId;
       counts.set(
-        document.workspaceId,
-        (counts.get(document.workspaceId) ?? 0) + 1,
+        projectId,
+        (counts.get(projectId) ?? 0) + 1,
+      );
+      labels.set(
+        projectId,
+        document.projectName ??
+          workspaceNames.get(document.workspaceId) ??
+          document.workspaceId,
       );
     }
   }
-  return workspaces.flatMap((workspace) => {
-    const documentCount = counts.get(workspace.id) ?? 0;
-    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
-  });
+  return [...counts].map(([id, documentCount]) => ({
+    id,
+    name: labels.get(id) ?? id,
+    documentCount,
+    route: documents.some(({ projectId }) => projectId === id)
+      ? `/p/${id}`
+      : `/w/${id}`,
+  }));
 }
 
 export function isSourceMissing(document: WebDocument): boolean {
@@ -770,9 +788,11 @@ async function boot(): Promise<void> {
     filters: {
       status: "all",
       workspaceId:
-        document.body.dataset.workspaceId === ""
-          ? undefined
-          : document.body.dataset.workspaceId,
+        document.body.dataset.projectId !== ""
+          ? document.body.dataset.projectId
+          : document.body.dataset.workspaceId === ""
+            ? undefined
+            : document.body.dataset.workspaceId,
       search: "",
     },
     grouping: queueGroupingPreference(
@@ -929,7 +949,7 @@ async function boot(): Promise<void> {
     label.textContent = name;
     const badge = document.createElement("span");
     badge.className = "count";
-    badge.textContent = String(count);
+    badge.textContent = `${count} ${count === 1 ? "doc" : "docs"}`;
     button.append(label, badge);
     button.addEventListener("click", () => {
       state.filters.workspaceId = workspaceId;
@@ -1011,7 +1031,7 @@ async function boot(): Promise<void> {
     const context = document.createElement("span");
     context.className = "card-context";
     context.textContent = [
-      item.workspaceId,
+      item.projectName ?? item.workspaceId,
       item.taskId,
       item.kind,
       sourceModeLabel(item.storage),
@@ -1118,7 +1138,7 @@ async function boot(): Promise<void> {
     readerTitle.textContent = selected?.title ?? "Document";
     readerMeta.textContent = selected
       ? [
-          selected.workspaceId,
+          selected.projectName ?? selected.workspaceId,
           selected.taskId,
           selected.kind,
           sourceModeLabel(selected.storage),

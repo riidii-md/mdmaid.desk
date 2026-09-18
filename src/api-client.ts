@@ -11,6 +11,7 @@ import type {
   DocumentRegistration,
   HealthData,
   PublicDocument,
+  PublicProject,
   PublicReviewRequest,
   PublicWorkspace,
   RenderTarget,
@@ -97,6 +98,14 @@ export class DeskApiClient {
     const value = await this.#request("/api/v1/workspaces");
     if (!Array.isArray(value) || !value.every(isPublicWorkspace)) {
       throw new Error("Daemon returned an invalid workspace list");
+    }
+    return value;
+  }
+
+  async listProjects(): Promise<PublicProject[]> {
+    const value = await this.#request("/api/v1/projects");
+    if (!Array.isArray(value) || !value.every(isPublicProject)) {
+      throw new Error("Daemon returned an invalid project list");
     }
     return value;
   }
@@ -366,6 +375,19 @@ function isPublicWorkspace(value: unknown): value is PublicWorkspace {
   );
 }
 
+function isPublicProject(value: unknown): value is PublicProject {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    /^project-[a-f0-9]{20}$/.test(value.id) &&
+    typeof value.name === "string" &&
+    typeof value.documentCount === "number" &&
+    Number.isSafeInteger(value.documentCount) &&
+    value.documentCount >= 0 &&
+    typeof value.route === "string"
+  );
+}
+
 function isPublicDocument(value: unknown): value is PublicDocument {
   if (!isRecord(value)) {
     return false;
@@ -373,6 +395,8 @@ function isPublicDocument(value: unknown): value is PublicDocument {
   return (
     typeof value.id === "string" &&
     typeof value.workspaceId === "string" &&
+    optionalString(value.projectId) &&
+    optionalString(value.projectName) &&
     optionalString(value.taskId) &&
     optionalString(value.producer) &&
     typeof value.kind === "string" &&

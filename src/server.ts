@@ -254,7 +254,8 @@ async function handleRequest(
     request.method === "GET" &&
     (url.pathname === "/" ||
       /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
-      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname)) &&
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
+      /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname)) &&
     url.searchParams.has("token")
   ) {
     const candidate = url.searchParams.get("token") ?? "";
@@ -317,7 +318,8 @@ async function handleRequest(
     request.method === "GET" &&
     (url.pathname === "/" ||
       /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
-      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname))
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
+      /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname))
   ) {
     sendHtml(response, 200, workspaceHtml(url.pathname));
     return;
@@ -345,6 +347,28 @@ async function handleRequest(
           : [publicWorkspace(workspace, documentCount)];
       }),
     });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/projects") {
+    const projects = new Map<
+      string,
+      { id: string; name: string; documentCount: number; route: string }
+    >();
+    for (const document of catalog.listDocuments()) {
+      const current = projects.get(document.projectId);
+      if (current) {
+        current.documentCount += 1;
+      } else {
+        projects.set(document.projectId, {
+          id: document.projectId,
+          name: document.projectName,
+          documentCount: 1,
+          route: `/p/${document.projectId}`,
+        });
+      }
+    }
+    sendJson(response, 200, { data: [...projects.values()] });
     return;
   }
 
@@ -905,6 +929,8 @@ function publicDocument(document: Document): Record<string, unknown> {
   return {
     id: document.id,
     workspaceId: document.workspaceId,
+    projectId: document.projectId,
+    projectName: document.projectName,
     ...(document.taskId === undefined ? {} : { taskId: document.taskId }),
     ...(document.producer === undefined ? {} : { producer: document.producer }),
     kind: document.kind,
@@ -1120,9 +1146,17 @@ function isDocumentRegistration(value: unknown): value is RegisterDocumentInput 
     "attention",
   ];
   return (
-    hasOnlyKeys(value, [...required, "taskId", "producer", "tags"]) &&
+    hasOnlyKeys(value, [
+      ...required,
+      "taskId",
+      "featureName",
+      "producer",
+      "tags",
+    ]) &&
     required.every((key) => typeof value[key] === "string") &&
     (value.taskId === undefined || typeof value.taskId === "string") &&
+    (value.featureName === undefined ||
+      typeof value.featureName === "string") &&
     (value.producer === undefined || typeof value.producer === "string") &&
     (value.tags === undefined ||
       (Array.isArray(value.tags) &&
@@ -1135,10 +1169,20 @@ function isWorkspaceRegistration(value: unknown): value is AddWorkspaceInput {
     return false;
   }
   return (
-    hasOnlyKeys(value, ["id", "name", "root", "artifactRoots"]) &&
+    hasOnlyKeys(value, [
+      "id",
+      "name",
+      "root",
+      "artifactRoots",
+      "repository",
+      "repositoryName",
+    ]) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     typeof value.root === "string" &&
+    (value.repository === undefined || typeof value.repository === "string") &&
+    (value.repositoryName === undefined ||
+      typeof value.repositoryName === "string") &&
     Array.isArray(value.artifactRoots) &&
     value.artifactRoots.every((root) => typeof root === "string")
   );
@@ -1283,6 +1327,7 @@ function sendDocumentMedia(
 function workspaceHtml(pathname: string): string {
   const documentId = pathname.startsWith("/d/") ? pathname.slice(3) : "";
   const workspaceId = pathname.startsWith("/w/") ? pathname.slice(3) : "";
+  const projectId = pathname.startsWith("/p/") ? pathname.slice(3) : "";
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -1295,7 +1340,7 @@ function workspaceHtml(pathname: string): string {
     <script defer src="/assets/mermaid.min.js"></script>
     <script type="module" src="/assets/app.js"></script>
   </head>
-  <body data-document-id="${documentId}" data-workspace-id="${workspaceId}">
+  <body data-document-id="${documentId}" data-workspace-id="${workspaceId}" data-project-id="${projectId}">
     <header class="topbar">
       <div class="brand">
         <strong>mdmaid.desk</strong>
