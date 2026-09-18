@@ -97,6 +97,206 @@ test("rejects registration when a Mermaid block is invalid", async () => {
   catalog.close();
 });
 
+test("reuses one AI-named project across workspaces for the same repository task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-projects-"));
+  const firstWorkspace = join(root, "first");
+  const secondWorkspace = join(root, "second");
+  const statePath = join(root, "catalog.sqlite3");
+  await mkdir(firstWorkspace);
+  await mkdir(secondWorkspace);
+  const firstPath = join(firstWorkspace, "plan.md");
+  const secondPath = join(secondWorkspace, "review.md");
+  await writeFile(firstPath, "# Plan\n", "utf8");
+  await writeFile(secondPath, "# Review\n", "utf8");
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  for (const [id, workspace] of [
+    ["first", firstWorkspace],
+    ["second", secondWorkspace],
+  ] as const) {
+    await catalog.addWorkspace({
+      id,
+      name: id,
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/riidii-md/eywizards",
+      repositoryName: "EyWizards",
+    });
+  }
+
+  const first = await catalog.registerDocument({
+    workspaceId: "first",
+    taskId: "sa-2913",
+    featureName: "COA Worker Continuity",
+    kind: "plan",
+    title: "Plan",
+    path: firstPath,
+    attention: "none",
+  });
+  const second = await catalog.registerDocument({
+    workspaceId: "second",
+    taskId: "SA-2913",
+    featureName: "Different AI wording",
+    kind: "review",
+    title: "Review",
+    path: secondPath,
+    attention: "none",
+  });
+
+  assert.equal(second.projectId, first.projectId);
+  assert.equal(first.projectName, "EyWizards / SA-2913 (COA Worker Continuity)");
+  assert.equal(second.projectName, first.projectName);
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(
+    restored.listDocuments().map(({ projectId, projectName }) => ({
+      projectId,
+      projectName,
+    })),
+    [
+      { projectId: first.projectId, projectName: first.projectName },
+      { projectId: first.projectId, projectName: first.projectName },
+    ],
+  );
+  restored.close();
+});
+
+test("normalizes repository URLs without persisting credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-repository-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  await mkdir(workspace);
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "https://private-user:private-token@GitHub.com/Riidii-MD/EyWizards.git",
+    repositoryName: "EyWizards",
+  });
+  catalog.close();
+
+  const database = new Database(statePath, { readonly: true });
+  const repository = database
+    .prepare<[], { repository_key: string }>(
+      "SELECT repository_key FROM workspace_repositories",
+    )
+    .get();
+  assert.equal(repository?.repository_key, "github.com/riidii-md/eywizards");
+  assert.doesNotMatch(JSON.stringify(repository), /private-user|private-token/);
+  database.close();
+});
+
+test("supports SSH repository identity, ticketless projects, and late AI naming", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-ticketless-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "brief.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Brief\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Temporary workspace name",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "git@GitHub.com:Riidii-MD/EyWizards.git",
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Renamed workspace",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+
+  const unnamed = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  assert.equal(unnamed.projectName, "eywizards");
+
+  const named = await catalog.registerDocument({
+    workspaceId: "example",
+    featureName: "Ticketless Work",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  assert.equal(named.projectId, unnamed.projectId);
+  assert.equal(named.projectName, "eywizards (Ticketless Work)");
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      featureName: "Unsafe\nName",
+      kind: "brief",
+      title: "Brief",
+      path: documentPath,
+      attention: "none",
+    }),
+    /invalid document registration input/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid",
+      name: "Invalid",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "not a repository?secret=yes",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "missing-host",
+      name: "Missing host",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "file:///repository",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "missing-name",
+      name: "Missing name",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "https://github.com/.git",
+    }),
+    /repository identity has no name/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid-url",
+      name: "Invalid URL",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "https://[",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid-name",
+      name: "Invalid name",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/example/repository",
+      repositoryName: "Unsafe\nRepository",
+    }),
+    /invalid repository name/,
+  );
+  catalog.close();
+});
+
 test("registers workspace-local source links and persists their safe mappings", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const sourceDirectory = join(workspace, "Backend", "Features");
@@ -1463,7 +1663,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 6);
+  assert.equal(database.pragma("user_version", { simple: true }), 7);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -1480,13 +1680,16 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       .all()
       .map(({ name }) => name),
     [
+      "document_projects",
       "document_source_links",
       "document_tags",
       "documents",
+      "projects",
       "review_requests",
       "review_responses",
       "tags",
       "workspace_artifact_roots",
+      "workspace_repositories",
       "workspaces",
     ],
   );
@@ -1537,7 +1740,7 @@ test("migrates version four review requests without losing decisions", async () 
   migrated.close();
 
   const database = new Database(statePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 6);
+  assert.equal(database.pragma("user_version", { simple: true }), 7);
   const schema = database
     .prepare<[], { sql: string }>(
       "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",

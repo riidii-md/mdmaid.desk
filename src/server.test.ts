@@ -69,10 +69,13 @@ async function fixture(
     name: "Example",
     root: workspace,
     artifactRoots: [workspace],
+    repository: "github.com/riidii-md/eywizards",
+    repositoryName: "EyWizards",
   });
   const document = await catalog.registerDocument({
     workspaceId: "example",
     taskId: "DESK-4",
+    featureName: "Visible Planning",
     producer: "codex",
     kind: "plan",
     title: "Visible plan",
@@ -145,6 +148,11 @@ test("lists public document metadata without leaking filesystem paths", async ()
     assert.equal(body.data[0]?.id, value.document.id);
     assert.equal(body.data[0]?.status, "unread");
     assert.equal(body.data[0]?.route, `/d/${value.document.id}`);
+    assert.equal(body.data[0]?.projectId, value.document.projectId);
+    assert.equal(
+      body.data[0]?.projectName,
+      "EyWizards / DESK-4 (Visible Planning)",
+    );
     assert.equal("path" in (body.data[0] ?? {}), false);
     assert.equal("sourceLinks" in (body.data[0] ?? {}), false);
     assert.equal("contentHash" in (body.data[0] ?? {}), false);
@@ -153,6 +161,29 @@ test("lists public document metadata without leaking filesystem paths", async ()
     const workspaces = await authorized(value, "/api/v1/workspaces");
     assert.equal(workspaces.status, 200);
     assert.doesNotMatch(await workspaces.text(), new RegExp(value.root));
+
+    const secondPath = join(value.workspace, "second.md");
+    await writeFile(secondPath, "# Second\n", "utf8");
+    await value.catalog.registerDocument({
+      workspaceId: "example",
+      taskId: "DESK-4",
+      featureName: "Different wording is ignored",
+      kind: "brief",
+      title: "Second",
+      path: secondPath,
+      attention: "none",
+    });
+    const projects = await authorized(value, "/api/v1/projects");
+    assert.deepEqual(await projects.json(), {
+      data: [
+        {
+          id: value.document.projectId,
+          name: "EyWizards / DESK-4 (Visible Planning)",
+          documentCount: 2,
+          route: `/p/${value.document.projectId}`,
+        },
+      ],
+    });
   } finally {
     await closeFixture(value);
   }
@@ -1326,6 +1357,16 @@ test("serves the browser workspace and local visual assets", async () => {
     });
     assert.equal(workspacePage.status, 200);
     assert.match(await workspacePage.text(), /data-workspace-id="example"/);
+
+    const projectPage = await fetch(
+      new URL(`/p/${value.document.projectId}`, value.server.url),
+      { headers },
+    );
+    assert.equal(projectPage.status, 200);
+    assert.match(
+      await projectPage.text(),
+      new RegExp(`data-project-id="${value.document.projectId}"`),
+    );
 
     const css = await fetch(new URL("/assets/app.css", value.server.url), {
       headers,

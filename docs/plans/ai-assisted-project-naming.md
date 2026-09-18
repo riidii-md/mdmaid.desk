@@ -2,8 +2,11 @@
 
 ## Status
 
-Draft design for review. This document does not approve implementation or live
-catalog migration.
+Core runtime implementation is included with this proposal. It adds schema
+version 7, repository/task project identity, first-feature-name-wins behavior,
+CLI/API fields, project routes, and browser/TUI grouping. Explicit legacy
+reconciliation and the dependent Maisternia publisher contract remain follow-up
+work requiring separate review before live configuration changes.
 
 ## Goal
 
@@ -162,11 +165,15 @@ No fallback exposes a branch name.
 
 ## Repository Identity
 
-Workspace registration stores a repository identity using this order:
+The implemented workspace registration stores a repository identity using this
+order:
 
 1. explicit `--repository <canonical-id>`;
-2. normalized local Git `remote.origin.url` for the canonical workspace root;
-3. deterministic local identity derived from the canonical root.
+2. deterministic local identity derived from the canonical root.
+
+Automatic local Git `remote.origin.url` discovery remains a follow-up. Agents
+that need cross-worktree grouping must provide the same explicit repository
+identity; mdmaid.desk does not guess from a branch name.
 
 Discovery is local and never contacts the remote. Normalization must:
 
@@ -253,13 +260,15 @@ registrations while preserving their workspace authorization records.
 
 ## CLI And API Contract
 
-Add project endpoints and routes:
+The core implementation adds:
 
 ```text
 GET    /api/v1/projects
-POST   /api/v1/projects/:id/rename
 GET    /p/<project-id>
 ```
+
+An authenticated `POST /api/v1/projects/:id/rename` operation remains part of
+the reviewed follow-up rather than this implementation slice.
 
 Extend workspace registration with optional repository identity. Extend
 document registration and import with optional `featureName`, while continuing
@@ -423,16 +432,15 @@ The design is implemented when observable evidence proves:
 8. Preview the `software-engineer` collection and explicitly resolve all
    conflicts before apply.
 
-## Open Decisions
+## Follow-up Decisions
 
-- Confirm first-feature-name-wins with explicit rename instead of automatic AI
-  renaming.
-- Confirm ticketless format as `Repository (AI Feature Text)`.
-- Confirm repository identity precedence: explicit override, normalized Git
-  origin, canonical-root fallback.
-- Confirm legacy cleanup remains a separate plan/apply operation.
-- Decide whether the currently pending `software-engineer` collection update is
-  deferred until the dependent Maisternia PR lands.
+- Design an authenticated explicit rename operation; automatic AI renaming is
+  already excluded by the implemented first-feature-name-wins rule.
+- Decide whether automatic local Git-origin discovery should supplement the
+  implemented explicit-identity and canonical-root paths.
+- Finalize legacy cleanup as a separate plan/apply operation.
+- Apply the pending `software-engineer` collection only after the dependent
+  Maisternia publisher contract lands.
 
-Implementation should not begin until this plan is reviewed and these decisions
-are explicitly accepted.
+The core implementation follows the fixed naming decision in this document.
+The remaining open decisions apply to reconciliation and later workflow rollout.

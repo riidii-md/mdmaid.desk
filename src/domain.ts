@@ -111,6 +111,21 @@ export interface Workspace {
   artifactRoots: string[];
 }
 
+export interface RepositoryIdentity {
+  key: string;
+  name: string;
+}
+
+export interface Project {
+  id: string;
+  repositoryKey: string;
+  repositoryName: string;
+  taskKey: string;
+  featureName?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DocumentSourceLink {
   id: string;
   href: string;
@@ -120,6 +135,8 @@ export interface DocumentSourceLink {
 export interface StoredDocument extends ReadingProgress {
   id: string;
   workspaceId: string;
+  projectId: string;
+  projectName: string;
   taskId?: string;
   producer?: string;
   kind: DocumentKind;
@@ -135,6 +152,16 @@ export interface StoredDocument extends ReadingProgress {
   missingAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export function projectDisplayName(
+  project: Pick<Project, "repositoryName" | "taskKey" | "featureName">,
+): string {
+  const task = project.taskKey === "" ? "" : ` / ${project.taskKey}`;
+  const feature = project.featureName === undefined
+    ? ""
+    : ` (${project.featureName})`;
+  return `${project.repositoryName}${task}${feature}`;
 }
 
 export interface Document extends StoredDocument {

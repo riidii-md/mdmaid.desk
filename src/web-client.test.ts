@@ -254,6 +254,37 @@ test("groups the queue by project without changing document order", () => {
   ]);
 });
 
+test("groups different workspaces by their shared logical project", () => {
+  const shared = [
+    {
+      ...documents[0]!,
+      projectId: "project-11111111111111111111",
+      projectName: "EyWizards / SA-2913 (COA Worker Continuity)",
+    },
+    {
+      ...documents[1]!,
+      projectId: "project-11111111111111111111",
+      projectName: "EyWizards / SA-2913 (COA Worker Continuity)",
+    },
+  ];
+
+  assert.deepEqual(groupQueue(shared, "project", []), [
+    {
+      key: "project:project-11111111111111111111",
+      label: "EyWizards / SA-2913 (COA Worker Continuity)",
+      documents: shared,
+    },
+  ]);
+  assert.deepEqual(visibleWorkspaces(shared, []), [
+    {
+      id: "project-11111111111111111111",
+      name: "EyWizards / SA-2913 (COA Worker Continuity)",
+      documentCount: 2,
+      route: "/p/project-11111111111111111111",
+    },
+  ]);
+});
+
 test("groups multi-tag documents under every tag and puts untagged last", () => {
   const untagged = {
     ...documents[1]!,

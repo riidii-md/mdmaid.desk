@@ -51,6 +51,10 @@ test("adds a workspace, registers a document, and lists it", async () => {
         "example",
         "--name",
         "Example",
+        "--repository",
+        "github.com/riidii-md/eywizards",
+        "--repository-name",
+        "EyWizards",
       ],
       stdout,
       stderr,
@@ -69,6 +73,8 @@ test("adds a workspace, registers a document, and lists it", async () => {
         "plan",
         "--task",
         "PROJECT-123",
+        "--feature-name",
+        "Durable Project Naming",
         "--attention",
         "approval",
       ],
@@ -96,6 +102,13 @@ test("adds a workspace, registers a document, and lists it", async () => {
   assert.match(stdout.text(), /registered doc-/);
   assert.match(stdout.text(), /PROJECT-123/);
   assert.equal(stderr.text(), "");
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.equal(
+    catalog.listDocuments()[0]?.projectName,
+    "EyWizards / PROJECT-123 (Durable Project Naming)",
+  );
+  catalog.close();
 });
 
 test("publishes an explicit review gate and returns its response as JSON", async () => {

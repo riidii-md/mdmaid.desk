@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -9,11 +10,14 @@ import {
   isReviewKind,
   isReviewOutcome,
   isReviewStatus,
+  projectDisplayName,
   type Attention,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type Project,
+  type RepositoryIdentity,
   type ReviewRequestFilters,
   type ReviewFeedbackItem,
   type ReviewResponse,
@@ -23,7 +27,7 @@ import {
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 6;
+export const SQLITE_SCHEMA_VERSION = 7;
 
 interface WorkspaceRow {
   id: string;
@@ -33,6 +37,21 @@ interface WorkspaceRow {
 
 interface ArtifactRootRow {
   path: string;
+}
+
+interface WorkspaceRepositoryRow {
+  repository_key: string;
+  repository_name: string;
+}
+
+interface ProjectRow {
+  id: string;
+  repository_key: string;
+  repository_name: string;
+  task_key: string;
+  feature_name: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface DocumentRow {
@@ -54,6 +73,10 @@ interface DocumentRow {
   missing_at: string | null;
   created_at: string;
   updated_at: string;
+  project_id: string;
+  project_repository_name: string;
+  project_task_key: string;
+  project_feature_name: string | null;
 }
 
 interface TagRow {
@@ -102,6 +125,23 @@ const INITIAL_SCHEMA = `
     PRIMARY KEY (workspace_id, path)
   ) STRICT;
 
+  CREATE TABLE workspace_repositories (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+    repository_key TEXT NOT NULL,
+    repository_name TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE projects (
+    id TEXT PRIMARY KEY,
+    repository_key TEXT NOT NULL,
+    repository_name TEXT NOT NULL,
+    task_key TEXT NOT NULL DEFAULT '',
+    feature_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (repository_key, task_key)
+  ) STRICT;
+
   CREATE TABLE documents (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
@@ -131,6 +171,11 @@ const INITIAL_SCHEMA = `
     workspace_path TEXT NOT NULL,
     PRIMARY KEY (document_id, id),
     UNIQUE (document_id, href)
+  ) STRICT;
+
+  CREATE TABLE document_projects (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT
   ) STRICT;
 
   CREATE TABLE review_requests (
@@ -176,6 +221,15 @@ const INITIAL_SCHEMA = `
   CREATE INDEX review_requests_status_idx
     ON review_requests(status, created_at DESC);
 `;
+
+const DOCUMENT_SELECT = `SELECT d.*,
+  dp.project_id,
+  p.repository_name AS project_repository_name,
+  p.task_key AS project_task_key,
+  p.feature_name AS project_feature_name
+  FROM documents d
+  JOIN document_projects dp ON dp.document_id = d.id
+  JOIN projects p ON p.id = dp.project_id`;
 
 export class SqliteCatalogStorage implements CatalogStorage {
   readonly #database: Database.Database;
@@ -267,7 +321,22 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return validateWorkspaceRow(row, artifactRoots);
   }
 
-  saveWorkspace(workspace: Workspace): void {
+  getWorkspaceRepository(id: string): RepositoryIdentity | undefined {
+    const row = this.#database
+      .prepare<[string], WorkspaceRepositoryRow>(
+        `SELECT repository_key, repository_name
+         FROM workspace_repositories WHERE workspace_id = ?`,
+      )
+      .get(id);
+    return row
+      ? { key: row.repository_key, name: row.repository_name }
+      : undefined;
+  }
+
+  saveWorkspace(
+    workspace: Workspace,
+    repository: RepositoryIdentity,
+  ): void {
     this.transaction(() => {
       this.#database
         .prepare(
@@ -285,7 +354,45 @@ export class SqliteCatalogStorage implements CatalogStorage {
       for (const artifactRoot of workspace.artifactRoots) {
         insertRoot.run(workspace.id, artifactRoot);
       }
+      this.#database
+        .prepare(
+          `INSERT INTO workspace_repositories (
+             workspace_id, repository_key, repository_name
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(workspace_id) DO UPDATE SET
+             repository_key = excluded.repository_key,
+             repository_name = excluded.repository_name`,
+        )
+        .run(workspace.id, repository.key, repository.name);
     });
+  }
+
+  saveProject(project: Project): Project {
+    this.#database
+      .prepare(
+        `INSERT INTO projects (
+           id, repository_key, repository_name, task_key, feature_name,
+           created_at, updated_at
+         ) VALUES (
+           @id, @repositoryKey, @repositoryName, @taskKey, @featureName,
+           @createdAt, @updatedAt
+         )
+         ON CONFLICT(repository_key, task_key) DO UPDATE SET
+           feature_name = COALESCE(projects.feature_name, excluded.feature_name),
+           updated_at = CASE
+             WHEN projects.feature_name IS NULL AND excluded.feature_name IS NOT NULL
+             THEN excluded.updated_at ELSE projects.updated_at END`,
+      )
+      .run({ ...project, featureName: project.featureName ?? null });
+    const row = this.#database
+      .prepare<[string, string], ProjectRow>(
+        "SELECT * FROM projects WHERE repository_key = ? AND task_key = ?",
+      )
+      .get(project.repositoryKey, project.taskKey);
+    if (!row) {
+      throw new Error("could not persist project");
+    }
+    return mapProject(row);
   }
 
   listDocuments(filters: DocumentFilters = {}): StoredDocument[] {
@@ -334,7 +441,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.#database
       .prepare<Array<string | number>, DocumentRow>(
-        `SELECT d.* FROM documents d${where} ORDER BY d.updated_at DESC, d.id`,
+        `${DOCUMENT_SELECT}${where} ORDER BY d.updated_at DESC, d.id`,
       )
       .all(...parameters);
     return rows.map((row) => this.#mapDocument(row));
@@ -342,7 +449,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
 
   getDocument(id: string): StoredDocument | undefined {
     const row = this.#database
-      .prepare<[string], DocumentRow>("SELECT * FROM documents WHERE id = ?")
+      .prepare<[string], DocumentRow>(`${DOCUMENT_SELECT} WHERE d.id = ?`)
       .get(id);
     return row ? this.#mapDocument(row) : undefined;
   }
@@ -443,6 +550,13 @@ export class SqliteCatalogStorage implements CatalogStorage {
           sourceLink.workspacePath,
         );
       }
+      this.#database
+        .prepare(
+          `INSERT INTO document_projects (document_id, project_id)
+           VALUES (?, ?)
+           ON CONFLICT(document_id) DO UPDATE SET project_id = excluded.project_id`,
+        )
+        .run(document.id, document.projectId);
       this.#database.exec(
         "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM document_tags WHERE document_tags.tag_name = tags.name)",
       );
@@ -595,6 +709,14 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return {
       id: row.id,
       workspaceId: row.workspace_id,
+      projectId: row.project_id,
+      projectName: projectDisplayName({
+        repositoryName: row.project_repository_name,
+        taskKey: row.project_task_key,
+        ...(row.project_feature_name === null
+          ? {}
+          : { featureName: row.project_feature_name }),
+      }),
       ...(row.task_id === null ? {} : { taskId: row.task_id }),
       ...(row.producer === null ? {} : { producer: row.producer }),
       kind: row.kind as DocumentKind,
@@ -761,6 +883,89 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 6");
     })();
   }
+  if (rawVersion < 7) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE IF NOT EXISTS workspace_repositories (
+           workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+           repository_key TEXT NOT NULL,
+           repository_name TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS projects (
+           id TEXT PRIMARY KEY,
+           repository_key TEXT NOT NULL,
+           repository_name TEXT NOT NULL,
+           task_key TEXT NOT NULL DEFAULT '',
+           feature_name TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE (repository_key, task_key)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS document_projects (
+           document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+           project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT
+         ) STRICT;`,
+      );
+      const workspaces = database
+        .prepare<[], { id: string; name: string; root: string }>(
+          "SELECT id, name, root FROM workspaces ORDER BY id",
+        )
+        .all();
+      const saveRepository = database.prepare(
+        `INSERT INTO workspace_repositories (
+           workspace_id, repository_key, repository_name
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(workspace_id) DO NOTHING`,
+      );
+      for (const workspace of workspaces) {
+        saveRepository.run(
+          workspace.id,
+          localRepositoryKey(workspace.root),
+          workspace.name,
+        );
+      }
+      const documents = database
+        .prepare<[], {
+          id: string;
+          task_id: string | null;
+          created_at: string;
+          updated_at: string;
+          repository_key: string;
+          repository_name: string;
+        }>(
+          `SELECT d.id, d.task_id, d.created_at, d.updated_at,
+                  wr.repository_key, wr.repository_name
+           FROM documents d
+           JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+           ORDER BY d.id`,
+        )
+        .all();
+      const saveProject = database.prepare(
+        `INSERT OR IGNORE INTO projects (
+           id, repository_key, repository_name, task_key, feature_name,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+      );
+      const mapDocument = database.prepare(
+        `INSERT INTO document_projects (document_id, project_id) VALUES (?, ?)
+         ON CONFLICT(document_id) DO NOTHING`,
+      );
+      for (const document of documents) {
+        const taskKey = document.task_id?.trim().toUpperCase() ?? "";
+        const id = projectId(document.repository_key, taskKey);
+        saveProject.run(
+          id,
+          document.repository_key,
+          document.repository_name,
+          taskKey,
+          document.created_at,
+          document.updated_at,
+        );
+        mapDocument.run(document.id, id);
+      }
+      database.pragma("user_version = 7");
+    })();
+  }
 }
 
 function validateWorkspaceRow(
@@ -782,6 +987,43 @@ function validateWorkspaceRow(
   return { ...row, artifactRoots };
 }
 
+function mapProject(row: ProjectRow): Project {
+  if (
+    !/^project-[a-f0-9]{20}$/.test(row.id) ||
+    row.repository_key.trim() === "" ||
+    row.repository_name.trim() === "" ||
+    row.task_key.trim() !== row.task_key ||
+    (row.feature_name !== null && row.feature_name.trim() === "") ||
+    !isDate(row.created_at) ||
+    !isDate(row.updated_at)
+  ) {
+    throw new Error(`invalid project row ${row.id}`);
+  }
+  return {
+    id: row.id,
+    repositoryKey: row.repository_key,
+    repositoryName: row.repository_name,
+    taskKey: row.task_key,
+    ...(row.feature_name === null ? {} : { featureName: row.feature_name }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function localRepositoryKey(root: string): string {
+  return `local:${createHash("sha256").update(root).digest("hex")}`;
+}
+
+function projectId(repositoryKey: string, taskKey: string): string {
+  const hash = createHash("sha256")
+    .update(repositoryKey)
+    .update("\0")
+    .update(taskKey)
+    .digest("hex")
+    .slice(0, 20);
+  return `project-${hash}`;
+}
+
 function validateDocumentRow(
   row: DocumentRow,
   tags: string[],
@@ -790,6 +1032,11 @@ function validateDocumentRow(
   if (
     !/^doc-[a-f0-9]{20}$/.test(row.id) ||
     !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.workspace_id) ||
+    !/^project-[a-f0-9]{20}$/.test(row.project_id) ||
+    row.project_repository_name.trim() === "" ||
+    row.project_task_key.trim() !== row.project_task_key ||
+    (row.project_feature_name !== null &&
+      row.project_feature_name.trim() === "") ||
     (row.task_id !== null && row.task_id.trim() === "") ||
     (row.producer !== null && row.producer.trim() === "") ||
     !isDocumentKind(row.kind) ||
