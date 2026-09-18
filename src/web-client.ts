@@ -6,6 +6,7 @@ import type {
   PublicReviewRequest,
   PublicWorkspace,
   ReadingStatus,
+  ReviewFeedbackItem,
   ReviewOutcome,
 } from "./api-types.js";
 import type {
@@ -56,6 +57,10 @@ export type WebSyntaxKind =
 export interface WebSyntaxToken {
   kind: WebSyntaxKind;
   text: string;
+}
+
+export interface WebMermaidRenderer {
+  run(options: { nodes: Element[] }): Promise<void>;
 }
 
 export interface DocumentOutlineItem {
@@ -330,6 +335,13 @@ interface WebState {
   workspaces: WebWorkspace[];
 }
 
+interface WebFeedbackAnchor {
+  path: string;
+  hunkId?: string;
+  line?: number;
+  side?: "old" | "new";
+}
+
 class WebApiError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
@@ -513,10 +525,27 @@ export function pendingReviewForDocument(
 export function reviewResponseError(
   outcome: ReviewOutcome,
   message: string,
+  items: readonly ReviewFeedbackItem[] = [],
 ): string | undefined {
-  return outcome === "changes_requested" && message.trim() === ""
+  return outcome === "changes_requested" &&
+      message.trim() === "" &&
+      items.length === 0
     ? "Explain what needs to change."
     : undefined;
+}
+
+export async function renderMermaidNodes(
+  renderer: WebMermaidRenderer,
+  nodes: Element[],
+  onError: (node: Element, error: unknown) => void,
+): Promise<void> {
+  for (const node of nodes) {
+    try {
+      await renderer.run({ nodes: [node] });
+    } catch (error) {
+      onError(node, error);
+    }
+  }
 }
 
 export function queueCounts(
@@ -787,6 +816,13 @@ async function boot(): Promise<void> {
   const reviewRequestMessage = element("review-request-message");
   const reviewStatus = element("review-status");
   const reviewResponse = element("review-response") as HTMLTextAreaElement;
+  const reviewFeedbackSection = element("review-feedback-section");
+  const reviewFeedbackList = element("review-feedback-list");
+  const reviewFeedbackComposer = element("review-feedback-composer");
+  const reviewFeedbackAnchor = element("review-feedback-anchor");
+  const reviewFeedbackMessage = element("review-feedback-message") as HTMLTextAreaElement;
+  const reviewFeedbackSave = element("review-feedback-save") as HTMLButtonElement;
+  const reviewFeedbackCancel = element("review-feedback-cancel") as HTMLButtonElement;
   const reviewError = element("review-error");
   const reviewActions = element("review-actions");
   const reviewApprove = element("review-approve") as HTMLButtonElement;
@@ -794,6 +830,7 @@ async function boot(): Promise<void> {
   const reviewReject = element("review-reject") as HTMLButtonElement;
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
+  const copyLink = element("copy-link") as HTMLButtonElement;
   const print = element("print") as HTMLButtonElement;
   const empty = element("queue-empty");
   const search = element("search") as HTMLInputElement;
@@ -810,6 +847,8 @@ async function boot(): Promise<void> {
   let changeHunkIndex = 0;
   let changeReviewLayout: "unified" | "side-by-side" = "side-by-side";
   let changeReviewView: "diff" | "document" = "diff";
+  let feedbackItems: ReviewFeedbackItem[] = [];
+  let feedbackDraft: WebFeedbackAnchor | undefined;
   let renderSequence = 0;
   let catalogRefresh = Promise.resolve();
 
@@ -1092,6 +1131,99 @@ async function boot(): Promise<void> {
       : "document";
   }
 
+  function feedbackAnchorLabel(anchor: WebFeedbackAnchor): string {
+    if (anchor.line !== undefined && anchor.side !== undefined) {
+      return `${anchor.path}:${anchor.line} (${anchor.side})`;
+    }
+    return anchor.path;
+  }
+
+  function openFeedbackComposer(anchor: WebFeedbackAnchor): void {
+    if (!state.selectedId || !pendingReviewForDocument(
+      state.reviewRequests,
+      state.selectedId,
+    )) {
+      return;
+    }
+    feedbackDraft = anchor;
+    reviewFeedbackAnchor.textContent = `Feedback on ${feedbackAnchorLabel(anchor)}`;
+    reviewFeedbackMessage.value = "";
+    reviewFeedbackComposer.removeAttribute("hidden");
+    reviewFeedbackMessage.focus();
+    reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function closeFeedbackComposer(): void {
+    feedbackDraft = undefined;
+    reviewFeedbackMessage.value = "";
+    reviewFeedbackComposer.setAttribute("hidden", "");
+  }
+
+  function renderFeedbackPanel(current: WebReviewRequest | undefined): void {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    const show = selected?.kind === "change-review" && current !== undefined;
+    reviewFeedbackSection.toggleAttribute("hidden", !show);
+    reviewFeedbackList.replaceChildren();
+    if (!show || !current) {
+      closeFeedbackComposer();
+      return;
+    }
+    const pending = current.status === "pending";
+    const items = pending ? feedbackItems : current.response?.items ?? [];
+    for (const [index, item] of items.entries()) {
+      const row = document.createElement("div");
+      row.className = "review-feedback-item";
+      const content = document.createElement("span");
+      content.textContent = `${feedbackAnchorLabel(item)} — ${item.message}`;
+      row.append(content);
+      if (pending) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "action";
+        remove.textContent = "remove";
+        remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
+        remove.addEventListener("click", () => {
+          feedbackItems = feedbackItems.filter((_, candidate) => candidate !== index);
+          renderFeedbackPanel(current);
+        });
+        row.append(remove);
+      }
+      reviewFeedbackList.append(row);
+    }
+    reviewFeedbackComposer.toggleAttribute("hidden", !pending || !feedbackDraft);
+  }
+
+  function saveFeedback(): void {
+    if (!feedbackDraft) {
+      return;
+    }
+    const message = reviewFeedbackMessage.value.trim();
+    if (message === "") {
+      reviewError.textContent = "Feedback text is required.";
+      reviewFeedbackMessage.focus();
+      return;
+    }
+    if (feedbackItems.length >= 32) {
+      reviewError.textContent = "A review can contain at most 32 feedback items.";
+      return;
+    }
+    feedbackItems.push({
+      id: `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      kind: "feedback",
+      ...feedbackDraft,
+      message,
+    });
+    reviewError.textContent = "";
+    closeFeedbackComposer();
+    if (state.selectedId) {
+      const current = pendingReviewForDocument(
+        state.reviewRequests,
+        state.selectedId,
+      );
+      renderFeedbackPanel(current);
+    }
+  }
+
   function renderChangeReview(): void {
     const review = renderedChangeReview;
     const showDiff = Boolean(
@@ -1160,6 +1292,19 @@ async function boot(): Promise<void> {
       ? `renamed from ${file.previousPath}`
       : file.status;
     heading.append(path, details);
+    if (state.selectedId && pendingReviewForDocument(
+      state.reviewRequests,
+      state.selectedId,
+    )) {
+      const fileFeedback = document.createElement("button");
+      fileFeedback.type = "button";
+      fileFeedback.className = "action change-feedback-button";
+      fileFeedback.textContent = "feedback on file";
+      fileFeedback.addEventListener("click", () => {
+        openFeedbackComposer({ path: file.path });
+      });
+      heading.append(fileFeedback);
+    }
     changeDiffStage.append(heading);
     if (!hunk) {
       const emptyHunk = document.createElement("p");
@@ -1187,31 +1332,34 @@ async function boot(): Promise<void> {
         const rowElement = document.createElement("div");
         rowElement.className = "diff-row";
         rowElement.append(
-          renderDiffCell(row.old, file.path),
-          renderDiffCell(row.new, file.path),
+          renderDiffCell(row.old, file.path, hunk.id, "old"),
+          renderDiffCell(row.new, file.path, hunk.id, "new"),
         );
         table.append(rowElement);
       }
     } else {
       for (const row of webDiffRows(hunk)) {
         if (row.old?.kind === "context") {
-          table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path));
+          table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path, hunk.id));
         } else {
-          if (row.old) table.append(renderUnifiedCell(row.old, null, file.path));
-          if (row.new) table.append(renderUnifiedCell(row.new, row.new.line, file.path));
+          if (row.old) table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
+          if (row.new) table.append(renderUnifiedCell(row.new, row.new.line, file.path, hunk.id));
         }
       }
     }
     changeDiffStage.append(table);
   }
 
-  function renderDiffCell(cell: WebDiffCell | undefined, path: string): HTMLElement {
+  function renderDiffCell(
+    cell: WebDiffCell | undefined,
+    path: string,
+    hunkId: string,
+    side: "old" | "new",
+  ): HTMLElement {
     const value = document.createElement("div");
     value.className = `diff-cell${cell ? ` ${cell.kind}` : " empty-cell"}`;
     if (!cell) return value;
-    const line = document.createElement("span");
-    line.className = "diff-line-number";
-    line.textContent = cell.line === null ? "" : String(cell.line);
+    const line = renderDiffLineControl(cell.line, { path, hunkId, side });
     value.append(line, diffText(cell, path));
     return value;
   }
@@ -1220,18 +1368,43 @@ async function boot(): Promise<void> {
     cell: WebDiffCell,
     newLine: number | null,
     path: string,
+    hunkId: string,
   ): HTMLElement {
     const value = document.createElement("div");
     value.className = `diff-unified-line ${cell.kind}`;
-    const oldNumber = document.createElement("span");
-    oldNumber.className = "diff-line-number";
-    oldNumber.textContent = cell.kind === "addition" || cell.line === null
-      ? ""
-      : String(cell.line);
-    const newNumber = document.createElement("span");
-    newNumber.className = "diff-line-number";
-    newNumber.textContent = newLine === null ? "" : String(newLine);
+    const oldLine = cell.kind === "addition" ? null : cell.line;
+    const oldNumber = renderDiffLineControl(oldLine, {
+      path,
+      hunkId,
+      side: "old",
+    });
+    const newNumber = renderDiffLineControl(newLine, {
+      path,
+      hunkId,
+      side: "new",
+    });
     value.append(oldNumber, newNumber, diffText(cell, path));
+    return value;
+  }
+
+  function renderDiffLineControl(
+    line: number | null,
+    anchor: Omit<WebFeedbackAnchor, "line">,
+  ): HTMLElement {
+    const pending = state.selectedId
+      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
+      : undefined;
+    const value = document.createElement(line !== null && pending ? "button" : "span");
+    value.className = "diff-line-number";
+    value.textContent = line === null ? "" : String(line);
+    if (value instanceof HTMLButtonElement && line !== null) {
+      value.type = "button";
+      value.title = `Add feedback on ${anchor.side} line ${line}`;
+      value.setAttribute("aria-label", value.title);
+      value.addEventListener("click", () => {
+        openFeedbackComposer({ ...anchor, line });
+      });
+    }
     return value;
   }
 
@@ -1334,6 +1507,7 @@ async function boot(): Promise<void> {
     if (options.showLoading) {
       readerContent.textContent = "Rendering…";
     }
+    let documentRendered = false;
     try {
       const rendered = await api<RenderedDocument>(
         `/api/v1/documents/${id}/render?target=web`,
@@ -1347,7 +1521,15 @@ async function boot(): Promise<void> {
       changeHunkIndex = 0;
       changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
+      documentRendered = true;
       renderChangeReview();
+      if (options.pushHistory) {
+        history.pushState(
+          { documentId: id },
+          "",
+          rendered.document.route,
+        );
+      }
       if (window.mermaid) {
         window.mermaid.initialize({
           startOnLoad: false,
@@ -1355,8 +1537,22 @@ async function boot(): Promise<void> {
           theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
           fontFamily: "Departure Mono, monospace",
         });
-        await window.mermaid.run({
-          nodes: Array.from(readerContent.querySelectorAll(".mermaid")),
+        const nodes = Array.from(
+          readerContent.querySelectorAll<HTMLElement>(".mermaid"),
+        );
+        const sources = new Map(nodes.map((node) => [node, node.textContent ?? ""]));
+        await renderMermaidNodes(window.mermaid, nodes, (node, error) => {
+          const element = node as HTMLElement;
+          const diagnostic = error instanceof Error
+            ? error.message
+            : String(error);
+          element.classList.add("mermaid-error");
+          element.removeAttribute("data-processed");
+          element.textContent = [
+            `Diagram could not render: ${diagnostic}`,
+            "",
+            sources.get(element) ?? "",
+          ].join("\n");
         });
       }
       if (sequence !== renderSequence || state.selectedId !== id) {
@@ -1382,9 +1578,6 @@ async function boot(): Promise<void> {
         return;
       }
       replaceDocument(updated);
-      if (options.pushHistory) {
-        history.pushState({ documentId: id }, "", updated.route);
-      }
     } catch (error) {
       if (sequence !== renderSequence || state.selectedId !== id) {
         return;
@@ -1412,7 +1605,7 @@ async function boot(): Promise<void> {
           return;
         }
       }
-      if (options.markOpened) {
+      if (options.markOpened && !documentRendered) {
         readerContent.textContent =
           error instanceof Error ? error.message : "Could not render document";
       }
@@ -1420,6 +1613,10 @@ async function boot(): Promise<void> {
   }
 
   async function openDocument(id: string, pushHistory = true): Promise<void> {
+    if (state.selectedId !== id) {
+      feedbackItems = [];
+      closeFeedbackComposer();
+    }
     state.selectedId = id;
     queuePanel.setAttribute("hidden", "");
     reader.removeAttribute("hidden");
@@ -1455,12 +1652,14 @@ async function boot(): Promise<void> {
       reviewStatus.textContent = "";
       reviewResponse.value = "";
       reviewError.textContent = "";
+      renderFeedbackPanel(undefined);
       return;
     }
     reviewPanel.removeAttribute("hidden");
     reviewRequestMessage.textContent = current.requestMessage;
     reviewError.textContent = "";
     const pending = current.status === "pending";
+    renderFeedbackPanel(current);
     reviewResponse.toggleAttribute("hidden", !pending);
     reviewActions.toggleAttribute("hidden", !pending);
     if (pending) {
@@ -1488,11 +1687,12 @@ async function boot(): Promise<void> {
     }
     const message = reviewResponse.value;
     const selected = state.documents.find(({ id }) => id === state.selectedId);
-    const validation =
-      selected?.kind === "change-review" && outcome === "approved"
+    const validation = outcome !== "changes_requested" && feedbackItems.length > 0
+      ? "Request changes or remove the anchored feedback before deciding."
+      : selected?.kind === "change-review" && outcome === "approved"
         ? changeReviewApprovalError(renderedChangeReview) ??
-          reviewResponseError(outcome, message)
-        : reviewResponseError(outcome, message);
+          reviewResponseError(outcome, message, feedbackItems)
+        : reviewResponseError(outcome, message, feedbackItems);
     if (validation) {
       reviewError.textContent = validation;
       reviewResponse.focus();
@@ -1507,13 +1707,21 @@ async function boot(): Promise<void> {
         `/api/v1/review-requests/${request.id}/respond`,
         {
           method: "POST",
-          body: JSON.stringify({ outcome, message }),
+          body: JSON.stringify({
+            outcome,
+            message,
+            ...(outcome === "changes_requested" && feedbackItems.length > 0
+              ? { items: feedbackItems }
+              : {}),
+          }),
         },
       );
       state.reviewRequests = state.reviewRequests.map((item) =>
         item.id === updated.id ? updated : item,
       );
       reviewResponse.value = "";
+      feedbackItems = [];
+      closeFeedbackComposer();
       render();
       renderReviewPanel(state.selectedId);
     } catch (error) {
@@ -1656,6 +1864,23 @@ async function boot(): Promise<void> {
   element("reader-back").addEventListener("click", () => closeReader());
   markRead.addEventListener("click", () => void act("read"));
   markUnread.addEventListener("click", () => void act("unread"));
+  copyLink.addEventListener("click", () => {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) {
+      return;
+    }
+    void navigator.clipboard
+      .writeText(new URL(selected.route, location.origin).href)
+      .then(() => {
+        copyLink.textContent = "copied";
+        window.setTimeout(() => {
+          copyLink.textContent = "copy link";
+        }, 1_500);
+      })
+      .catch(() => {
+        copyLink.textContent = "copy failed";
+      });
+  });
   print.addEventListener("click", () => requestDocumentPrint(window));
   element("archive").addEventListener("click", () => void act("archive"));
   reviewApprove.addEventListener("click", () =>
@@ -1667,6 +1892,8 @@ async function boot(): Promise<void> {
   reviewReject.addEventListener("click", () =>
     void respondToReview("rejected"),
   );
+  reviewFeedbackSave.addEventListener("click", saveFeedback);
+  reviewFeedbackCancel.addEventListener("click", closeFeedbackComposer);
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
   document.documentElement.dataset.theme =

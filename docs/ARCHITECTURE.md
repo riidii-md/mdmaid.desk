@@ -98,8 +98,9 @@ The Markdown remains the source artifact, while the parsed model is a derived
 render response and is not stored as a second approval identity.
 
 Requested-change responses may include bounded structured feedback items.
-`feedback` items require a safe relative file path and stable hunk ID; `todo`
-items require a file path and deliberately have no hunk ID. Items are stored
+`feedback` items require a safe relative file path and may add a stable hunk ID
+or a hunk plus line/side anchor; path-only items are file-level. Legacy `todo`
+items require a file path and deliberately have no finer anchor. Items are stored
 atomically with the immutable response. Draft TUI notes stay in the current
 reader session until the human submits Request Changes.
 
@@ -107,6 +108,9 @@ Registration and import parse Markdown links on every ingress. Relative local
 links and image references are resolved from the original Markdown path,
 authorized against the canonical workspace root, and persisted only as
 workspace-relative paths.
+They also parse every Mermaid fence before any catalog mutation. Invalid
+diagrams return their block number, Markdown line, and bounded parser diagnostic
+to the producer; live reference reconciliation applies the same validation.
 Rendered web links use opaque, document-scoped identifiers under
 `/d/:document/source/:source`. The authenticated source viewer repeats
 realpath, regular-file, symlink, size, and UTF-8 checks on every read. It does

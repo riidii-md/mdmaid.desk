@@ -315,6 +315,8 @@ test("returns a bounded native diff model for change-review documents", async ()
       kind: "feedback",
       path: "src/auth.ts",
       hunkId: body.data.changeReview.files[0]?.hunks[0]?.id,
+      line: 1,
+      side: "new",
       message: "Use a constant-time comparison.",
     };
     const responded = await authorized(
@@ -846,6 +848,40 @@ test("registers documents through validated producer-neutral input", async () =>
   }
 });
 
+test("returns an actionable Mermaid diagnostic to document producers", async () => {
+  const value = await fixture();
+  try {
+    const documentPath = join(value.workspace, "broken-diagram.md");
+    await writeFile(documentPath, [
+      "# Broken",
+      "```mermaid",
+      "stateDiagram-v2",
+      "  [*] -->",
+      "```",
+    ].join("\n"), "utf8");
+
+    const response = await authorized(value, "/api/v1/documents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "example",
+        kind: "review",
+        title: "Broken",
+        path: documentPath,
+        attention: "review",
+      }),
+    });
+    assert.equal(response.status, 422);
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+    assert.equal(body.error.code, "invalid_mermaid");
+    assert.match(body.error.message, /Mermaid diagram 1.*line 2.*parse error/is);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("imports outside documents without leaking source or managed paths", async () => {
   const value = await fixture();
   try {
@@ -1006,7 +1042,10 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(pageContent, /id="change-file-list"/);
     assert.match(pageContent, /id="change-layout"/);
     assert.match(pageContent, /id="change-view-document"/);
+    assert.match(pageContent, /id="copy-link"/);
     assert.match(pageContent, /id="review-panel"/);
+    assert.match(pageContent, /id="review-feedback-section"/);
+    assert.match(pageContent, /id="review-feedback-message"/);
     assert.match(pageContent, /id="review-response"/);
     assert.match(pageContent, /id="review-approve"/);
     assert.match(pageContent, /id="review-changes"/);

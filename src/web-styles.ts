@@ -382,6 +382,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 }
 .change-file-heading strong { overflow-wrap: anywhere; }
 .change-file-heading span { color: var(--muted); font-size: 10px; }
+.change-feedback-button { margin-left: auto; white-space: nowrap; }
 .change-hunk-header {
   padding: 8px 10px;
   border: 1px solid var(--line);
@@ -419,6 +420,21 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   text-align: right;
   user-select: none;
 }
+button.diff-line-number {
+  margin: 0;
+  border-top: 0;
+  border-bottom: 0;
+  border-left: 0;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+button.diff-line-number:hover,
+button.diff-line-number:focus-visible {
+  background: var(--reading-soft);
+  color: var(--ink);
+  outline: 1px solid var(--reading);
+}
 .diff-cell.addition, .diff-unified-line.addition { background: var(--diff-add); }
 .diff-cell.deletion, .diff-unified-line.deletion { background: var(--diff-delete); }
 .diff-cell.context, .diff-unified-line.context { background: var(--surface); }
@@ -451,6 +467,30 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .review-panel label { display: block; margin: 18px 0 7px; font-size: 10px; text-transform: uppercase; }
 .review-message, .review-status { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 .review-status { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.review-feedback-section {
+  margin: 18px 0 4px;
+  padding: 12px;
+  border: 1px solid var(--ink);
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+}
+.review-feedback-heading,
+.review-feedback-item,
+.review-feedback-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.review-feedback-heading span { color: var(--muted); font-size: 10px; }
+.review-feedback-list { display: grid; gap: 7px; margin-top: 10px; }
+.review-feedback-item {
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+.review-feedback-item span { overflow-wrap: anywhere; }
+.review-feedback-composer { margin-top: 10px; }
+.review-feedback-actions { justify-content: flex-start; margin-top: 8px; }
 .review-panel textarea {
   width: 100%;
   resize: vertical;
@@ -473,6 +513,14 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 15px;
   line-height: 1.7;
+}
+.reader-content .mermaid-error {
+  padding: 14px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
 }
 .reader-content h1, .reader-content h2, .reader-content h3 { font-family: "Departure Mono", monospace; line-height: 1.25; }
 .reader-content h1, .reader-content h2, .reader-content h3,

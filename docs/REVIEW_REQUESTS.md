@@ -97,8 +97,10 @@ List filters:
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
 `requestMessage`. Response accepts `outcome`, `message`, and optional `items`.
 Items are available only for `changes_requested`: a `feedback` item identifies
-a safe relative `path` and stable `hunkId`, while a file-level `todo` identifies
-only its `path`. Both carry an ID and bounded plain-text message. Unknown
+a safe relative `path`, optionally a stable `hunkId`, and optionally a paired
+`line` plus `side` (`old` or `new`). A path-only feedback item is file-level;
+a line anchor must also identify its hunk. Legacy file-level `todo` items remain
+accepted. All items carry an ID and bounded plain-text message. Unknown
 fields, unknown enum values, unsafe paths or control data, malformed anchors,
 and oversized messages are rejected. The first valid response wins atomically.
 An identical retry returns the stored result, while a different retry receives
@@ -114,6 +116,8 @@ a conflict.
       "kind": "feedback",
       "path": "src/auth.ts",
       "hunkId": "hunk-44444444444444444444",
+      "line": 14,
+      "side": "new",
       "message": "Use a constant-time comparison."
     },
     {
@@ -140,21 +144,31 @@ tag groups and then to one ordered list. Wide layouts show section headings;
 narrow layouts retain the same grouped navigation order without spending rows
 on headings.
 
-The browser always provides a response text area. In the TUI, use `r` for the
+The browser always provides a separate general-note text area. In the TUI, use `r` for the
 Actions view, `y` to approve, `c` to request changes, or `x` to reject. The TUI
 composer uses `Enter` for a newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
 A Change Review containing fenced Git patches opens in a native read-only diff
-view. Use `[`/`]` or arrow keys for files, `p`/`n` for hunks, `m` for
+view. Use `[`/`]` or arrow keys for files, `p`/`n` for hunks, `j`/`k` for
+lines, `m` for
 unified/side-by-side layout, and `d` for the complete Markdown explanation.
 Both native viewers color common keywords, strings, comments, numbers,
 properties, types, and function calls according to the changed file extension
 while preserving the red/green line backgrounds and intra-line emphasis.
-Use `f` for current-hunk feedback, `t` for a file todo, and `z` to undo the
-latest unsent note. Request Changes stores all notes as response `items`; open
+Use `f` for feedback on the selected line, `t` for feedback on the current
+file, and `z` to undo the latest unsent note. The browser exposes equivalent
+controls on each line and file. Request Changes stores all anchored notes as
+response `items` and keeps the general note separate; open
 notes block Approve and Reject so they cannot be discarded accidentally. A
 Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
+
+Every Mermaid fence is parsed during registration and import. Invalid diagrams
+reject ingress with the diagram number, Markdown start line, and Mermaid parser
+diagnostic so the producer can correct the artifact. Live reference changes are
+validated by the same gate. The browser still isolates runtime failures per
+diagram so an older document or client-only renderer problem cannot hide the
+rest of the review.
 
 ## Waiting and Recovery
 
