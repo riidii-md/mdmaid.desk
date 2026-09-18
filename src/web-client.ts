@@ -42,6 +42,33 @@ export interface WebDiffRow {
   new?: WebDiffCell;
 }
 
+export interface WebDiffLineControlModel {
+  lineText: string;
+  feedbackMarker?: string;
+  feedbackLabel?: string;
+}
+
+export const WEB_LINE_FEEDBACK_HINT =
+  "Line feedback: click + beside a line number.";
+
+export function webDiffLineControlModel(
+  line: number | null,
+  side: "old" | "new",
+  feedbackEnabled: boolean,
+): WebDiffLineControlModel {
+  if (line === null) {
+    return { lineText: "" };
+  }
+  const lineText = String(line);
+  return feedbackEnabled
+    ? {
+        lineText,
+        feedbackMarker: "+",
+        feedbackLabel: `Add feedback on ${side} line ${line}`,
+      }
+    : { lineText };
+}
+
 export type WebSyntaxKind =
   | "plain"
   | "comment"
@@ -1303,6 +1330,9 @@ async function boot(): Promise<void> {
       warningElement.textContent = `warning: ${warning}`;
       changeDiffStage.append(warningElement);
     }
+    const pendingReview = state.selectedId
+      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
+      : undefined;
     const heading = document.createElement("header");
     heading.className = "change-file-heading";
     const path = document.createElement("strong");
@@ -1312,10 +1342,7 @@ async function boot(): Promise<void> {
       ? `renamed from ${file.previousPath}`
       : file.status;
     heading.append(path, details);
-    if (state.selectedId && pendingReviewForDocument(
-      state.reviewRequests,
-      state.selectedId,
-    )) {
+    if (pendingReview) {
       const fileFeedback = document.createElement("button");
       fileFeedback.type = "button";
       fileFeedback.className = "action change-feedback-button";
@@ -1326,6 +1353,12 @@ async function boot(): Promise<void> {
       heading.append(fileFeedback);
     }
     changeDiffStage.append(heading);
+    if (pendingReview) {
+      const feedbackHint = document.createElement("p");
+      feedbackHint.className = "change-line-feedback-hint";
+      feedbackHint.textContent = WEB_LINE_FEEDBACK_HINT;
+      changeDiffStage.append(feedbackHint);
+    }
     if (!hunk) {
       const emptyHunk = document.createElement("p");
       emptyHunk.className = "change-empty";
@@ -1409,18 +1442,34 @@ async function boot(): Promise<void> {
 
   function renderDiffLineControl(
     line: number | null,
-    anchor: Omit<WebFeedbackAnchor, "line">,
+    anchor: Pick<WebFeedbackAnchor, "path" | "hunkId"> & {
+      side: "old" | "new";
+    },
   ): HTMLElement {
     const pending = state.selectedId
       ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
       : undefined;
-    const value = document.createElement(line !== null && pending ? "button" : "span");
+    const model = webDiffLineControlModel(line, anchor.side, Boolean(pending));
+    const value = document.createElement(model.feedbackLabel ? "button" : "span");
     value.className = "diff-line-number";
-    value.textContent = line === null ? "" : String(line);
-    if (value instanceof HTMLButtonElement && line !== null) {
+    const number = document.createElement("span");
+    number.className = "diff-line-number-value";
+    number.textContent = model.lineText;
+    value.append(number);
+    if (
+      value instanceof HTMLButtonElement &&
+      line !== null &&
+      model.feedbackLabel &&
+      model.feedbackMarker
+    ) {
       value.type = "button";
-      value.title = `Add feedback on ${anchor.side} line ${line}`;
-      value.setAttribute("aria-label", value.title);
+      value.title = model.feedbackLabel;
+      value.setAttribute("aria-label", model.feedbackLabel);
+      const marker = document.createElement("span");
+      marker.className = "diff-line-feedback-marker";
+      marker.setAttribute("aria-hidden", "true");
+      marker.textContent = model.feedbackMarker;
+      value.append(marker);
       value.addEventListener("click", () => {
         openFeedbackComposer({ ...anchor, line });
       });
