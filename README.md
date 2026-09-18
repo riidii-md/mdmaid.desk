@@ -315,10 +315,11 @@ Changing the review artifact makes the pending request stale.
 
 For a native terminal diff, include one or more standard Git patches in fenced
 `diff` blocks. The reader opens in Diff mode when it finds a valid patch and
-provides file (`[`/`]` or arrow keys), hunk (`p`/`n`), line (`j`/`k`),
-unified/side-by-side (`m`), and Markdown/diff (`d`) navigation. Changed spans inside paired removed
-and added lines are emphasized. Binary and mode-only files remain visible even
-when they have no text hunk.
+provides file (`p`/`n`, with `[`/`]` aliases), line (`j`/`k`),
+unified/side-by-side (`m`), and Markdown/diff (`d`) navigation. Line navigation
+continues across hunk boundaries, so every displayed line can receive feedback.
+Changed spans inside paired removed and added lines are emphasized. Binary and
+mode-only files remain visible even when they have no text hunk.
 
 The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
