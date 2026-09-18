@@ -19,6 +19,8 @@ import {
   renderMermaidNodes,
   shouldRefreshWebReader,
   sourceModeLabel,
+  WEB_LINE_FEEDBACK_HINT,
+  webDiffLineControlModel,
   webDiffRows,
   webLoadFailure,
   visibleWorkspaces,
@@ -346,6 +348,24 @@ test("requires explanatory text only when changes are requested", () => {
   );
   assert.equal(reviewResponseError("approved", ""), undefined);
   assert.equal(reviewResponseError("rejected", ""), undefined);
+});
+
+test("makes pending line feedback an explicit visible action", () => {
+  assert.deepEqual(webDiffLineControlModel(14, "new", true), {
+    lineText: "14",
+    feedbackMarker: "+",
+    feedbackLabel: "Add feedback on new line 14",
+  });
+  assert.deepEqual(webDiffLineControlModel(14, "old", false), {
+    lineText: "14",
+  });
+  assert.deepEqual(webDiffLineControlModel(null, "new", true), {
+    lineText: "",
+  });
+  assert.equal(
+    WEB_LINE_FEEDBACK_HINT,
+    "Line feedback: click + beside a line number.",
+  );
 });
 
 test("isolates Mermaid failures so one diagram cannot hide the document", async () => {

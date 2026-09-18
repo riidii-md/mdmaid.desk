@@ -326,8 +326,9 @@ common source formats. Patch text remains inert text; syntax highlighting does
 not inject it as HTML or fetch a remote grammar.
 
 Use `f` to attach feedback to the selected line, `t` to add file feedback, and
-`z` to undo the most recent unsent note. The browser exposes matching file and
-line controls. Anchored notes become durable structured response items when
+`z` to undo the most recent unsent note. In the browser, click the visible `+`
+beside a line number for line feedback or use **feedback on file**. Anchored
+notes become durable structured response items when
 Request Changes is submitted, alongside a separate general note;
 `review wait --json` returns their file paths, stable hunk IDs, optional line
 and side, kinds, and messages. Open notes prevent accidental

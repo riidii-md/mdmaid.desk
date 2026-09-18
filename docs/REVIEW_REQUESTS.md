@@ -157,7 +157,8 @@ properties, types, and function calls according to the changed file extension
 while preserving the red/green line backgrounds and intra-line emphasis.
 Use `f` for feedback on the selected line, `t` for feedback on the current
 file, and `z` to undo the latest unsent note. The browser exposes equivalent
-controls on each line and file. Request Changes stores all anchored notes as
+controls: click the visible `+` beside a line number or **feedback on file**.
+Request Changes stores all anchored notes as
 response `items` and keeps the general note separate; open
 notes block Approve and Reject so they cannot be discarded accidentally. A
 Change Review with no parsed files or any parser warning also blocks Approve,

@@ -1341,6 +1341,7 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
     assert.match(cssText, /\.reader-toc/);
     assert.match(cssText, /\.syntax-keyword/);
+    assert.match(cssText, /\.diff-line-feedback-marker/);
     assert.match(cssText, /--syntax-string:/);
     assert.match(cssText, /@media print/);
 
@@ -1351,6 +1352,7 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(app.headers.get("content-type") ?? "", /javascript/);
     const appText = await app.text();
     assert.match(appText, /mdmaid\.desk web client/);
+    assert.match(appText, /Line feedback: click \+ beside a line number\./);
     assert.match(appText, /requestDocumentPrint\(window\)/);
 
     const mermaid = await fetch(

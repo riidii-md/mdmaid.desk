@@ -383,6 +383,12 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .change-file-heading strong { overflow-wrap: anywhere; }
 .change-file-heading span { color: var(--muted); font-size: 10px; }
 .change-feedback-button { margin-left: auto; white-space: nowrap; }
+.change-line-feedback-hint {
+  margin: 0 0 8px;
+  color: var(--reading);
+  font-size: 11px;
+  font-weight: 700;
+}
 .change-hunk-header {
   padding: 8px 10px;
   border: 1px solid var(--line);
@@ -410,10 +416,14 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   text-transform: uppercase;
 }
 .diff-labels span + span, .diff-row > :nth-child(2) { border-left: 1px solid var(--line); }
-.diff-cell { display: grid; grid-template-columns: 5ch max-content; min-height: 1.55em; }
-.diff-unified-line { display: grid; grid-template-columns: 5ch 5ch max-content; min-width: 100%; }
+.diff-cell { display: grid; grid-template-columns: 8ch max-content; min-height: 1.55em; }
+.diff-unified-line { display: grid; grid-template-columns: 8ch 8ch max-content; min-width: 100%; }
 .diff-cell code, .diff-unified-line code { padding: 0 10px; white-space: pre; }
 .diff-line-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: .6ch;
   padding: 0 1ch;
   border-right: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
   color: var(--muted);
@@ -428,6 +438,18 @@ button.diff-line-number {
   background: transparent;
   font: inherit;
   cursor: pointer;
+}
+.diff-line-feedback-marker {
+  display: inline-grid;
+  width: 1.25em;
+  height: 1.25em;
+  place-items: center;
+  border: 1px solid var(--reading);
+  border-radius: 2px;
+  background: var(--reading-soft);
+  color: var(--reading);
+  font-weight: 800;
+  line-height: 1;
 }
 button.diff-line-number:hover,
 button.diff-line-number:focus-visible {
