@@ -428,6 +428,9 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
     "@@ -1 +1 @@",
     "-return token == expected;",
     "+return token === expected;",
+    "@@ -10 +10 @@",
+    "-return fallback;",
+    "+return secureFallback;",
     "diff --git a/test/auth.test.ts b/test/auth.test.ts",
     "--- a/test/auth.test.ts",
     "+++ b/test/auth.test.ts",
@@ -478,16 +481,23 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   );
   assert.doesNotMatch(renderTui(hostileState, 130, 32, { color: true }), /\u001b\]52/);
 
-  state = handleTuiKey(state, "]").state;
+  state = handleTuiKey(state, "n").state;
   assert.equal(state.reader?.changeFileIndex, 1);
   assert.match(renderTui(state, 130, 32), /test\/auth\.test\.ts/);
-  state = handleTuiKey(state, "[").state;
+  state = handleTuiKey(state, "p").state;
   assert.equal(state.reader?.changeFileIndex, 0);
   state = handleTuiKey(state, "j").state;
+  assert.equal(state.reader?.changeLineIndex, 1);
+  state = handleTuiKey(state, "j").state;
+  assert.equal(state.reader?.changeHunkIndex, 1);
+  assert.equal(state.reader?.changeLineIndex, 0);
+  state = handleTuiKey(state, "k").state;
+  assert.equal(state.reader?.changeHunkIndex, 0);
   assert.equal(state.reader?.changeLineIndex, 1);
   state = handleTuiKey(state, "k").state;
   assert.equal(state.reader?.changeLineIndex, 0);
   assert.match(renderTui(state, 130, 32), /j\/k line/);
+  assert.match(renderTui(state, 130, 32), /p \/ n file/);
   state = handleTuiKey(state, "m").state;
   assert.equal(state.reader?.changeLayout, "side-by-side");
   frame = renderTui(state, 130, 32);

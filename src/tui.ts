@@ -426,8 +426,8 @@ export function renderTui(
                     state.reviewRequests,
                     state.reader.document.id,
                   )
-                ? [["[/]", "file"], ["p/n", "hunk"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["b", "queue"]]
-                : [["[/]", "file"], ["p/n", "hunk"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
+                ? [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["b", "queue"]]
+                : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
             : pendingReviewForDocument(
                   state.reviewRequests,
                   state.reader?.document.id ?? "",
@@ -911,10 +911,16 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
   if (state.reader?.changeView === "diff" && state.reader.changeReview) {
     const reader = state.reader;
     const files = reader.changeReview?.files ?? [];
-    if ((key === "[" || key === "left") && files.length > 0) {
+    if (
+      (key === "p" || key === "[" || key === "left" || key === "pageup") &&
+      files.length > 0
+    ) {
       return moveChangeFile(state, -1);
     }
-    if ((key === "]" || key === "right") && files.length > 0) {
+    if (
+      (key === "n" || key === "]" || key === "right" || key === "pagedown") &&
+      files.length > 0
+    ) {
       return moveChangeFile(state, 1);
     }
     const file = files[reader.changeFileIndex];
@@ -924,12 +930,6 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     }
     if ((key === "k" || key === "up") && hunk && hunk.lines.length > 0) {
       return moveChangeLine(state, -1);
-    }
-    if ((key === "p" || key === "pageup") && file && file.hunks.length > 0) {
-      return moveChangeHunk(state, -1);
-    }
-    if ((key === "n" || key === "pagedown") && file && file.hunks.length > 0) {
-      return moveChangeHunk(state, 1);
     }
     if (key === "m") {
       return {
@@ -1276,48 +1276,54 @@ function moveChangeFile(state: TuiState, amount: number): TuiTransition {
   };
 }
 
-function moveChangeHunk(state: TuiState, amount: number): TuiTransition {
-  const reader = state.reader;
-  const file = reader?.changeReview?.files[reader.changeFileIndex];
-  if (!reader || !file || file.hunks.length === 0) {
-    return { state, effects: [] };
-  }
-  return {
-    state: {
-      ...state,
-      reader: {
-        ...reader,
-        changeHunkIndex: clamp(
-          reader.changeHunkIndex + amount,
-          0,
-          file.hunks.length - 1,
-        ),
-        changeLineIndex: 0,
-      },
-      scroll: 0,
-    },
-    effects: [],
-  };
-}
-
 function moveChangeLine(state: TuiState, amount: number): TuiTransition {
   const reader = state.reader;
-  const hunk = reader?.changeReview?.files[reader.changeFileIndex]
-    ?.hunks[reader.changeHunkIndex];
-  if (!reader || !hunk || hunk.lines.length === 0) {
+  const file = reader?.changeReview?.files[reader.changeFileIndex];
+  if (!reader || !file || file.hunks.length === 0 || amount === 0) {
     return { state, effects: [] };
+  }
+  let hunkIndex = clamp(
+    reader.changeHunkIndex,
+    0,
+    file.hunks.length - 1,
+  );
+  let lineIndex = reader.changeLineIndex;
+  const direction = amount < 0 ? -1 : 1;
+  const steps = Math.abs(amount);
+  for (let step = 0; step < steps; step += 1) {
+    const hunk = file.hunks[hunkIndex]!;
+    if (direction > 0 && lineIndex < hunk.lines.length - 1) {
+      lineIndex += 1;
+      continue;
+    }
+    if (direction < 0 && lineIndex > 0) {
+      lineIndex -= 1;
+      continue;
+    }
+    let nextHunkIndex = hunkIndex + direction;
+    while (
+      nextHunkIndex >= 0 &&
+      nextHunkIndex < file.hunks.length &&
+      file.hunks[nextHunkIndex]!.lines.length === 0
+    ) {
+      nextHunkIndex += direction;
+    }
+    const nextHunk = file.hunks[nextHunkIndex];
+    if (!nextHunk || nextHunk.lines.length === 0) {
+      break;
+    }
+    hunkIndex = nextHunkIndex;
+    lineIndex = direction > 0 ? 0 : nextHunk.lines.length - 1;
   }
   return {
     state: {
       ...state,
       reader: {
         ...reader,
-        changeLineIndex: clamp(
-          reader.changeLineIndex + amount,
-          0,
-          hunk.lines.length - 1,
-        ),
+        changeHunkIndex: hunkIndex,
+        changeLineIndex: lineIndex,
       },
+      scroll: 0,
     },
     effects: [],
   };
@@ -2219,7 +2225,7 @@ function changeFileLines(
     const value = `${prefix} ${changeStatusSymbol(file.status)} ${sanitizeTerminalText(file.path)}`;
     lines.push(index === selectedIndex ? theme.styles.bold(value) : theme.muted(value));
   }
-  lines.push("", theme.muted("[ / ] file · p / n hunk · j / k line"));
+  lines.push("", theme.muted("p / n file · j / k line"));
   return lines.map((line) => fitLine(line, width));
 }
 

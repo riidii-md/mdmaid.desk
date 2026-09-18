@@ -149,8 +149,8 @@ Actions view, `y` to approve, `c` to request changes, or `x` to reject. The TUI
 composer uses `Enter` for a newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
 A Change Review containing fenced Git patches opens in a native read-only diff
-view. Use `[`/`]` or arrow keys for files, `p`/`n` for hunks, `j`/`k` for
-lines, `m` for
+view. Use `p`/`n` for files (`[`/`]` remain aliases), `j`/`k`
+to move through lines across hunk boundaries, `m` for
 unified/side-by-side layout, and `d` for the complete Markdown explanation.
 Both native viewers color common keywords, strings, comments, numbers,
 properties, types, and function calls according to the changed file extension
