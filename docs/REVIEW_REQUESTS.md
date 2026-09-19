@@ -191,6 +191,13 @@ the CLI resolves the current descriptor and reconnects. Without a daemon it
 polls SQLite without holding a transaction, so a later web or TUI service can
 respond through the same catalog.
 
+A live waiter also compares its loaded package version with the installed
+package. After an upgrade it stops the old subscription and delegates only the
+existing `review wait` operation to the updated CLI. The original process then
+finishes its normal output, including the combined document-and-review JSON
+from `register --wait` or `import --wait`; it does not repeat publication or
+create another review request.
+
 The command waits without using model turns. If the waiting process exits, the
 request and response remain recoverable with `review show` or another
 `review wait`. Mdmaid.desk does not execute callbacks or relaunch a dead agent

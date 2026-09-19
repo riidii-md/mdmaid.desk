@@ -425,7 +425,7 @@ function isPublicDocument(value: unknown): value is PublicDocument {
   );
 }
 
-function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
+export function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
   if (!isRecord(value)) {
     return false;
   }
@@ -481,9 +481,23 @@ function isReviewFeedbackItem(value: unknown): boolean {
   if (!/^feedback-[a-f0-9]{20}$/.test(value.id) || !validPath || !validMessage) {
     return false;
   }
-  return value.kind === "feedback"
-    ? typeof value.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(value.hunkId)
-    : value.kind === "todo" && value.hunkId === undefined;
+  const validHunk = value.hunkId === undefined ||
+    (typeof value.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(value.hunkId));
+  const validLine = value.line === undefined ||
+    (typeof value.line === "number" && Number.isSafeInteger(value.line) && value.line > 0);
+  const validSide = value.side === undefined || value.side === "old" || value.side === "new";
+  if (
+    !validHunk ||
+    !validLine ||
+    !validSide ||
+    (value.line === undefined) !== (value.side === undefined) ||
+    (value.line !== undefined && value.hunkId === undefined)
+  ) {
+    return false;
+  }
+  return value.kind === "feedback" ||
+    (value.kind === "todo" && value.hunkId === undefined &&
+      value.line === undefined && value.side === undefined);
 }
 
 function isWebRender(value: unknown): value is WebRender {
