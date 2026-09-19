@@ -405,6 +405,60 @@ test("validates review requests and receives their live events", async () => {
   }
 });
 
+test("reads file-level feedback from the daemon after a human decision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-file-feedback-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "change-review.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Change review\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Change review",
+    path: documentPath,
+    attention: "approval",
+  });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "file-feedback-token",
+  });
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    const request = await client.createReviewRequest({
+      documentId: document.id,
+      kind: "change-decision",
+      requestMessage: "Review this implementation.",
+    });
+    const item = {
+      id: "feedback-11111111111111111111",
+      kind: "feedback" as const,
+      path: "docs/ai/agentic/harness-migration-plan.md",
+      message: "Leave this file unchanged.",
+    };
+    const decided = await client.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "Everything else is good.",
+      items: [item],
+    });
+    assert.deepEqual(decided.response?.items, [item]);
+    assert.deepEqual((await client.getReviewRequest(request.id)).response?.items, [item]);
+  } finally {
+    await server.close();
+    catalog.close();
+  }
+});
+
 test("rejects malformed or unauthorized daemon responses", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-client-auth-"));
   const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {

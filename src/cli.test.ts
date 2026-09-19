@@ -511,6 +511,250 @@ test("returns a superseded review so a waiting agent can ignore it", async () =>
   assert.equal(JSON.parse(stdout.text()).reviewRequest.status, "superseded");
 });
 
+test("hands an active review wait to the updated CLI when its installed version changes", async () => {
+  const pending = {
+    id: "review-0123456789abcdefabcd",
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review the exact implementation.",
+    status: "pending" as const,
+    response: null,
+    staleAt: null,
+    createdAt: "2026-09-18T14:59:03.835Z",
+  };
+  const changed = {
+    ...pending,
+    status: "changes_requested" as const,
+    response: {
+      outcome: "changes_requested" as const,
+      message: "Keep the migration plan unchanged.",
+      items: [{
+        id: "feedback-cf4ac9f1f7fe422f8076",
+        kind: "feedback" as const,
+        path: "docs/ai/agentic/harness-migration-plan.md",
+        message: "Remove this file from the change.",
+      }],
+      createdAt: "2026-09-18T19:59:27.931Z",
+    },
+  };
+  let installedVersion = "0.1.17";
+  let subscriptionStarted: (() => void) | undefined;
+  const subscribed = new Promise<void>((resolvePromise) => {
+    subscriptionStarted = resolvePromise;
+  });
+  let subscriptionAborted = false;
+  const client = {
+    getReviewRequest: async () => pending,
+    subscribeCatalog: async (
+      _onEvent: (event: { action: string; reviewRequestId: string }) => void,
+      options: { signal?: AbortSignal; onReady?: () => void },
+    ) => {
+      options.onReady?.();
+      subscriptionStarted?.();
+      await new Promise<void>((resolvePromise) => {
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            subscriptionAborted = true;
+            resolvePromise();
+          },
+          { once: true },
+        );
+      });
+    },
+  } as unknown as DeskApiClient;
+  const resumed: string[] = [];
+  const stdout = output();
+  const stderr = output();
+
+  const waiting = run(
+    ["review", "wait", pending.id, "--json"],
+    stdout,
+    stderr,
+    {
+      statePath: "/unused/catalog.sqlite3",
+      connectDaemon: async () => client,
+      reviewPollIntervalMs: 1,
+      runningPackageVersion: "0.1.17",
+      readInstalledPackageVersion: () => installedVersion,
+      resumeReviewWait: async (id) => {
+        resumed.push(id);
+        return changed;
+      },
+    },
+  );
+  await subscribed;
+  installedVersion = "0.1.18";
+
+  assert.equal(await waiting, 0);
+  assert.deepEqual(resumed, [pending.id]);
+  assert.equal(subscriptionAborted, true);
+  assert.deepEqual(JSON.parse(stdout.text()).reviewRequest, changed);
+  assert.equal(stderr.text(), "");
+});
+
+test("continues the wait through the updated CLI entrypoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-"));
+  const entryPath = join(root, "updated-cli.mjs");
+  await writeFile(
+    entryPath,
+    [
+      "const id = process.argv[4];",
+      "if (process.argv.slice(2, 4).join(' ') !== 'review wait' || process.argv[5] !== '--json') process.exit(2);",
+      "process.stdout.write(JSON.stringify({",
+      "  schemaVersion: 1,",
+      "  reviewRequest: {",
+      "    id,",
+      "    documentId: 'doc-0123456789abcdefabcd',",
+      "    documentRevision: 1,",
+      "    kind: 'change-decision',",
+      "    requestMessage: 'Review the exact implementation.',",
+      "    status: 'changes_requested',",
+      "    response: { outcome: 'changes_requested', message: 'Keep the migration plan unchanged.',",
+      "      items: [{ id: 'feedback-11111111111111111111', kind: 'feedback',",
+      "        path: 'docs/ai/agentic/harness-migration-plan.md', message: 'Leave this file unchanged.' }],",
+      "      createdAt: '2026-09-18T20:00:00.000Z' },",
+      "    staleAt: null,",
+      "    createdAt: '2026-09-18T14:59:03.835Z'",
+      "  }",
+      "}) + '\\n');",
+    ].join("\n"),
+    "utf8",
+  );
+  const stdout = output();
+  const stderr = output();
+  const id = "review-0123456789abcdefabcd";
+
+  assert.equal(
+    await run(
+      ["review", "wait", id, "--json"],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        updatedCliEntryPath: entryPath,
+      },
+    ),
+    0,
+  );
+  const result = JSON.parse(stdout.text());
+  assert.equal(result.reviewRequest.id, id);
+  assert.equal(result.reviewRequest.status, "changes_requested");
+  assert.equal(result.reviewRequest.response.items[0].path, "docs/ai/agentic/harness-migration-plan.md");
+  assert.equal(stderr.text(), "");
+});
+
+test("rejects an invalid decision returned by the updated CLI", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-invalid-"));
+  const entryPath = join(root, "updated-cli.mjs");
+  await writeFile(
+    entryPath,
+    "process.stdout.write(JSON.stringify({ schemaVersion: 1, reviewRequest: { id: process.argv[4], status: 'approved' } }) + '\\n');\n",
+    "utf8",
+  );
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      ["review", "wait", "review-0123456789abcdefabcd", "--json"],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        updatedCliEntryPath: entryPath,
+      },
+    ),
+    1,
+  );
+  assert.equal(stdout.text(), "");
+  assert.match(stderr.text(), /invalid review request/);
+});
+
+test("preserves register output without repeating publication during waiter handoff", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-register-"));
+  const documentPath = join(root, "change-review.md");
+  await writeFile(documentPath, "# Change review\n", "utf8");
+  const id = "review-0123456789abcdefabcd";
+  const pending = {
+    id,
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review this change.",
+    status: "pending" as const,
+    response: null,
+    staleAt: null,
+    createdAt: "2026-09-18T14:59:03.835Z",
+  };
+  const approved = {
+    ...pending,
+    status: "approved" as const,
+    response: {
+      outcome: "approved" as const,
+      message: "Ship it.",
+      createdAt: "2026-09-18T20:00:00.000Z",
+    },
+  };
+  let registrations = 0;
+  let reviewCreations = 0;
+  const client = {
+    registerDocument: async () => {
+      registrations += 1;
+      return { id: pending.documentId, revision: 1 };
+    },
+    createReviewRequest: async () => {
+      reviewCreations += 1;
+      return pending;
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "change-review",
+        "--expect",
+        "change-decision",
+        "--request-message",
+        pending.requestMessage,
+        "--wait",
+        "--json",
+      ],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        connectDaemon: async () => client,
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        resumeReviewWait: async (reviewId) => {
+          assert.equal(reviewId, id);
+          return approved;
+        },
+      },
+    ),
+    0,
+  );
+  const result = JSON.parse(stdout.text());
+  assert.equal(registrations, 1);
+  assert.equal(reviewCreations, 1);
+  assert.equal(result.document.id, pending.documentId);
+  assert.deepEqual(result.reviewRequest, approved);
+  assert.equal(stderr.text(), "");
+});
+
 test("keeps attention-only documents passive and validates review flags", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-passive-"));
   const workspace = join(root, "workspace");
