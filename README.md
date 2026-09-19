@@ -174,11 +174,12 @@ mdmaid-desk register /path/to/repository/docs/plan.md \
   --json
 ```
 
-The web and TUI show Approve, Request changes, and Reject only while that exact
-document revision has a pending request. The response JSON includes both the
-producer's request message and the human's response text. `changes_requested`
-requires explanatory text. Updating document content makes the old request
-stale; opening, reading, or marking the document done never approves it.
+The web and TUI show Approve, Request changes, Reject, and Mark superseded only
+while that exact document revision has a pending request. The response JSON
+includes both the producer's request message and the human's response text.
+`changes_requested` requires explanatory text. Updating document content makes
+the old request stale; opening, reading, or marking the document done never
+approves it.
 
 Review operations are also composable:
 
@@ -343,6 +344,9 @@ mdmaid-desk register .agent-runs/change-reviews/current/review.md \
 
 The decision is bound to the registered document revision and content hash.
 Changing the review artifact makes the pending request stale.
+If a separate newer review replaces an unreviewed request, mark the old request
+`superseded`; this wakes a waiting producer without approving, requesting
+changes, or rejecting the obsolete version.
 
 For a native terminal diff, include one or more standard Git patches in fenced
 `diff` blocks. The reader opens in Diff mode when it finds a valid patch and
@@ -362,8 +366,8 @@ beside a line number for line feedback or use **feedback on file**. Anchored
 notes become durable structured response items when
 Request Changes is submitted, alongside a separate general note;
 `review wait --json` returns their file paths, stable hunk IDs, optional line
-and side, kinds, and messages. Open notes prevent accidental
-Approve or Reject decisions. The review surface is intentionally read-only:
+and side, kinds, and messages. Open notes prevent accidental Approve, Reject,
+or Supersede actions. The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings
 cannot be approved; the human can still Request Changes or Reject them.

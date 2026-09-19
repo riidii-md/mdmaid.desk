@@ -480,6 +480,37 @@ test("waits on daemon events and returns the durable review decision", async () 
   assert.equal(stderr.text(), "");
 });
 
+test("returns a superseded review so a waiting agent can ignore it", async () => {
+  const request = {
+    id: "review-0123456789abcdefabcd",
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review the old implementation.",
+    status: "superseded" as const,
+    response: {
+      outcome: "superseded" as const,
+      message: "A newer change review is available.",
+      createdAt: "2026-09-18T09:05:00.000Z",
+    },
+    staleAt: null,
+    createdAt: "2026-09-18T09:00:00.000Z",
+  };
+  const client = {
+    getReviewRequest: async () => request,
+  } as unknown as DeskApiClient;
+  const stdout = output();
+
+  assert.equal(
+    await run(["review", "wait", request.id, "--json"], stdout, output(), {
+      statePath: "/unused/catalog.sqlite3",
+      connectDaemon: async () => client,
+    }),
+    0,
+  );
+  assert.equal(JSON.parse(stdout.text()).reviewRequest.status, "superseded");
+});
+
 test("keeps attention-only documents passive and validates review flags", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-passive-"));
   const workspace = join(root, "workspace");

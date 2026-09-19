@@ -88,6 +88,7 @@ const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
   "approved",
   "changes_requested",
   "rejected",
+  "superseded",
 ]);
 
 const registerUsage = `Usage:
@@ -128,7 +129,8 @@ Usage:
       [--kind plan-decision|change-decision] [--message <text>] [--json]
   mdmaid-desk review show <review-id> [--json]
   mdmaid-desk review wait <review-id> [--json]
-  mdmaid-desk review respond <review-id> --outcome <outcome>
+  mdmaid-desk review respond <review-id>
+      --outcome approved|changes_requested|rejected|superseded
       [--message <text>] [--json]
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]

@@ -426,13 +426,13 @@ export function renderTui(
                     state.reviewRequests,
                     state.reader.document.id,
                   )
-                ? [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["b", "queue"]]
+                ? [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["o", "supersede"], ["b", "queue"]]
                 : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
             : pendingReviewForDocument(
                   state.reviewRequests,
                   state.reader?.document.id ?? "",
                 )
-              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["j/k", "scroll"], ["b", "queue"]]
+              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["j/k", "scroll"], ["b", "queue"]]
               : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
           theme,
         )
@@ -1017,6 +1017,7 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     y: "approved",
     c: "changes_requested",
     x: "rejected",
+    o: "superseded",
   };
   const reviewOutcome = reviewOutcomes[key];
   if (pending && reviewOutcome) {

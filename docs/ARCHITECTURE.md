@@ -82,9 +82,12 @@ the source or managed filesystem paths.
 Review requests bind the document ID, revision, and private content hash at
 creation. Only one request may be pending for a document. A content change or
 missing source makes that request stale. Responses are immutable, exactly-once
-decisions with optional text, except that requested changes require an
-explanation. Request and response text are plain text and are never interpreted
-as HTML, terminal control data, callback configuration, or executable commands.
+resolutions with optional text: approve, request changes, reject, or supersede
+an obsolete request. Superseding is terminal but carries no approval or
+rejection meaning, so a waiting producer can ignore the old version. Requested
+changes require an explanation. Request and response text is plain text and is
+never interpreted as HTML, terminal control data, callback configuration, or
+executable commands.
 
 Change reviews reuse this revision-safe lifecycle without overloading a
 workspace. A workspace remains the repository and filesystem authorization

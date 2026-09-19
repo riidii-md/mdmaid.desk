@@ -381,6 +381,7 @@ test("requires explanatory text only when changes are requested", () => {
   );
   assert.equal(reviewResponseError("approved", ""), undefined);
   assert.equal(reviewResponseError("rejected", ""), undefined);
+  assert.equal(reviewResponseError("superseded", ""), undefined);
 });
 
 test("makes pending line feedback an explicit visible action", () => {

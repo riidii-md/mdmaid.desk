@@ -1257,6 +1257,45 @@ test("records one durable human response and requires reasons for changes", asyn
   catalog.close();
 });
 
+test("supersedes an obsolete review without treating it as rejection", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "superseded.md");
+  await writeFile(documentPath, "# First proposal\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "First proposal",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review this proposal.",
+  });
+
+  const superseded = await catalog.respondToReviewRequest(request.id, {
+    outcome: "superseded",
+    message: "A newer review replaces this one.",
+  });
+
+  assert.equal(superseded.status, "superseded");
+  assert.equal(superseded.response?.outcome, "superseded");
+  assert.equal(catalog.listReviewRequests({ status: "pending" }).length, 0);
+  assert.deepEqual(
+    await catalog.respondToReviewRequest(request.id, {
+      outcome: "superseded",
+      message: "A newer review replaces this one.",
+    }),
+    superseded,
+  );
+
+  catalog.close();
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getReviewRequest(request.id), superseded);
+  restored.close();
+});
+
 test("persists structured file, hunk, line, and todo feedback", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "change-feedback.md");
@@ -1663,7 +1702,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 7);
+  assert.equal(database.pragma("user_version", { simple: true }), 8);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -1740,7 +1779,7 @@ test("migrates version four review requests without losing decisions", async () 
   migrated.close();
 
   const database = new Database(statePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 7);
+  assert.equal(database.pragma("user_version", { simple: true }), 8);
   const schema = database
     .prepare<[], { sql: string }>(
       "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",

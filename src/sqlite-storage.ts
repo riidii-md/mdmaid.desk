@@ -27,7 +27,7 @@ import {
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 7;
+export const SQLITE_SCHEMA_VERSION = 8;
 
 interface WorkspaceRow {
   id: string;
@@ -185,14 +185,14 @@ const INITIAL_SCHEMA = `
     document_content_hash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
     request_message TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'superseded', 'stale')),
     stale_at TEXT,
     created_at TEXT NOT NULL
   ) STRICT;
 
   CREATE TABLE review_responses (
     review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
-    outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
     message TEXT NOT NULL,
     items_json TEXT,
     created_at TEXT NOT NULL
@@ -964,6 +964,46 @@ function migrate(database: Database.Database): void {
         mapDocument.run(document.id, id);
       }
       database.pragma("user_version = 7");
+    })();
+  }
+  if (rawVersion < 8) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE review_requests_v8 (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
+           request_message TEXT NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'superseded', 'stale')),
+           stale_at TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE review_responses_v8 (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests_v8(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
+           message TEXT NOT NULL,
+           items_json TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO review_requests_v8 SELECT * FROM review_requests;
+         INSERT INTO review_responses_v8 (
+           review_request_id, outcome, message, items_json, created_at
+         ) SELECT review_request_id, outcome, message, items_json, created_at
+           FROM review_responses;
+         DROP TABLE review_responses;
+         DROP TABLE review_requests;
+         ALTER TABLE review_requests_v8 RENAME TO review_requests;
+         ALTER TABLE review_responses_v8 RENAME TO review_responses;
+         CREATE UNIQUE INDEX review_requests_pending_document_idx
+           ON review_requests(document_id) WHERE status = 'pending';
+         CREATE INDEX review_requests_document_idx
+           ON review_requests(document_id, created_at DESC);
+         CREATE INDEX review_requests_status_idx
+           ON review_requests(status, created_at DESC);`,
+      );
+      database.pragma("user_version = 8");
     })();
   }
 }

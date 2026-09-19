@@ -1508,6 +1508,7 @@ function workspaceHtml(pathname: string): string {
               <button id="review-approve" class="action" type="button">approve</button>
               <button id="review-changes" class="action" type="button">request changes</button>
               <button id="review-reject" class="action" type="button">reject</button>
+              <button id="review-supersede" class="action" type="button">mark superseded</button>
             </div>
           </section>
         </article>
