@@ -42,7 +42,9 @@ import { readPackageVersion } from "./package-info.js";
 import {
   DEFAULT_DESK_ORIGIN,
   DEFAULT_DESK_PORT,
+  FALLBACK_DESK_PORT,
 } from "./service-config.js";
+import { ensureTraefikRoute as ensureDefaultTraefikRoute } from "./traefik-route.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
 import {
   installUserService as installLoginService,
@@ -174,6 +176,7 @@ export interface RunOptions {
   startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
   runTui?: (client: DeskApiClient) => Promise<void>;
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
+  ensureTraefikRoute?: () => Promise<boolean>;
   signal?: AbortSignal;
   reviewPollIntervalMs?: number;
 }
@@ -398,16 +401,52 @@ async function runWeb(
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
-  const { port, publicUrl } = configuration;
   const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
-  const server = await startServer({
-    catalog,
-    host: "127.0.0.1",
-    port,
-    token,
-    ...(publicUrl ? { publicUrl } : {}),
-  });
+  let publicUrl = configuration.publicUrl;
+  let server: RunningDeskServer;
+  try {
+    server = await startServer({
+      catalog,
+      host: "127.0.0.1",
+      port: configuration.port,
+      token,
+      ...(publicUrl ? { publicUrl } : {}),
+    });
+  } catch (error) {
+    if (!shouldTryFallback(error, configuration)) {
+      throw error;
+    }
+    server = await startServer({
+      catalog,
+      host: "127.0.0.1",
+      port: FALLBACK_DESK_PORT,
+      token,
+      publicUrl: DEFAULT_DESK_ORIGIN,
+    });
+    let proxied: boolean;
+    try {
+      proxied = await (
+        options.ensureTraefikRoute ?? ensureDefaultTraefikRoute
+      )();
+    } catch (routeError) {
+      await server.close();
+      throw routeError;
+    }
+    if (proxied) {
+      publicUrl = DEFAULT_DESK_ORIGIN;
+    } else {
+      await server.close();
+      publicUrl = directPublicUrl(FALLBACK_DESK_PORT);
+      server = await startServer({
+        catalog,
+        host: "127.0.0.1",
+        port: FALLBACK_DESK_PORT,
+        token,
+        publicUrl,
+      });
+    }
+  }
   const descriptor = descriptorForServer(server);
   const descriptorPath = daemonDescriptorPath(statePath);
   try {
@@ -564,7 +603,23 @@ async function runDaemon(
 }
 
 function daemonWebUrl(connection: DaemonConnection): string {
-  return `${directPublicUrl(connection.descriptor.port)}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+  const publicUrl =
+    connection.descriptor.publicUrl ??
+    directPublicUrl(connection.descriptor.port);
+  return `${publicUrl}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+}
+
+function shouldTryFallback(
+  error: unknown,
+  configuration: WebConfiguration,
+): boolean {
+  return (
+    !configuration.explicitPort &&
+    !configuration.explicitPublicUrl &&
+    error instanceof Error &&
+    "code" in error &&
+    (error.code === "EADDRINUSE" || error.code === "EACCES")
+  );
 }
 
 function directPublicUrl(port: number): string {

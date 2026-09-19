@@ -15,7 +15,6 @@ import { fileURLToPath } from "node:url";
 
 import { stopDaemon } from "./daemon-lifecycle.js";
 import { syncDirectory } from "./fs-durability.js";
-import { DEFAULT_DESK_PORT } from "./service-config.js";
 
 const SERVICE_LABEL = "dev.mdmaid.desk";
 
@@ -36,15 +35,15 @@ export interface UserServiceDefinition {
 export function userServiceDefinition(
   options: UserServiceOptions,
 ): UserServiceDefinition {
-  const port = options.port ?? DEFAULT_DESK_PORT;
   const arguments_ = [
     options.execPath,
     options.entrypoint,
     "__daemon-serve",
     "--state-path",
     resolve(options.statePath),
-    "--port",
-    String(port),
+    ...(options.port === undefined
+      ? []
+      : ["--port", String(options.port)]),
   ];
   if (options.platform === "darwin") {
     const logPath = join(dirname(resolve(options.statePath)), "daemon.log");

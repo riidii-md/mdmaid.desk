@@ -12,7 +12,7 @@ import { basename, dirname, join, resolve } from "node:path";
 
 import { DeskApiClient } from "./api-client.js";
 import { syncDirectory } from "./fs-durability.js";
-import type { RunningDeskServer } from "./server.js";
+import { normalizePublicUrl, type RunningDeskServer } from "./server.js";
 
 export const DESK_PROTOCOL_VERSION = 1;
 const MAX_DESCRIPTOR_BYTES = 8 * 1024;
@@ -25,6 +25,7 @@ export interface DaemonDescriptor {
   port: number;
   token: string;
   startedAt: string;
+  publicUrl?: string;
 }
 
 export interface DaemonConnection {
@@ -38,6 +39,7 @@ export function daemonDescriptorPath(statePath: string): string {
 }
 
 export function descriptorForServer(server: RunningDeskServer): DaemonDescriptor {
+  const publicUrl = safeServerPublicUrl(server.webUrl);
   return {
     protocolVersion: DESK_PROTOCOL_VERSION,
     pid: process.pid,
@@ -45,6 +47,7 @@ export function descriptorForServer(server: RunningDeskServer): DaemonDescriptor
     port: server.port,
     token: server.token,
     startedAt: new Date().toISOString(),
+    ...(publicUrl === undefined ? {} : { publicUrl }),
   };
 }
 
@@ -212,7 +215,24 @@ function validateDaemonDescriptor(value: DaemonDescriptor): void {
 }
 
 function isDaemonDescriptor(value: unknown): value is DaemonDescriptor {
-  if (!isRecord(value) || Object.keys(value).length !== 6) {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  const allowed = new Set([
+    "protocolVersion",
+    "pid",
+    "host",
+    "port",
+    "token",
+    "startedAt",
+    "publicUrl",
+  ]);
+  if (
+    keys.length < 6 ||
+    keys.length > 7 ||
+    keys.some((key) => !allowed.has(key))
+  ) {
     return false;
   }
   return (
@@ -229,8 +249,29 @@ function isDaemonDescriptor(value: unknown): value is DaemonDescriptor {
     typeof value.token === "string" &&
     value.token.length >= 8 &&
     typeof value.startedAt === "string" &&
-    !Number.isNaN(Date.parse(value.startedAt))
+    !Number.isNaN(Date.parse(value.startedAt)) &&
+    (value.publicUrl === undefined || isSafePublicUrl(value.publicUrl))
   );
+}
+
+function isSafePublicUrl(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  try {
+    return normalizePublicUrl(value) === value;
+  } catch {
+    return false;
+  }
+}
+
+function safeServerPublicUrl(webUrl: string): string | undefined {
+  try {
+    const origin = new URL(webUrl).origin;
+    return isSafePublicUrl(origin) ? origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function assertReplaceable(path: string): Promise<void> {
@@ -254,7 +295,8 @@ function sameDescriptor(left: DaemonDescriptor, right: DaemonDescriptor): boolea
     left.host === right.host &&
     left.port === right.port &&
     left.token === right.token &&
-    left.startedAt === right.startedAt
+    left.startedAt === right.startedAt &&
+    left.publicUrl === right.publicUrl
   );
 }
 

@@ -836,6 +836,10 @@ test("runs the web service until shutdown and prints its browser URL", async () 
       );
       assert.equal(descriptor?.port, 43121);
       assert.equal(descriptor?.token, "test-token");
+      assert.equal(
+        descriptor?.publicUrl,
+        "http://mdmaid.desk.localhost:43121",
+      );
     },
   });
 
@@ -885,6 +889,31 @@ test("prints the portless canonical URL when reusing the default daemon", async 
   const stdout = output();
   const stderr = output();
   const connection = fakeConnection(80);
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("prints a proxied daemon's recorded public URL", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-proxied-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(
+    43127,
+    "http://mdmaid.desk.localhost",
+  );
 
   const exit = await run(["web"], stdout, stderr, {
     statePath: join(root, "catalog.sqlite3"),
@@ -1028,12 +1057,12 @@ test("uses the canonical direct localhost HTTP origin by default", async () => {
   assert.equal(stderr.text(), "");
 });
 
-test("does not move the daemon to a random port when the default is occupied", async () => {
+test("uses Traefik with a fixed backend port when port 80 is occupied", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-open-port-"));
   const statePath = join(root, "catalog.sqlite3");
   const stdout = output();
   const stderr = output();
-  const attempted: number[] = [];
+  const attempted: Array<{ port: number | undefined; publicUrl: string | undefined }> = [];
 
   const exit = await run(
     ["__daemon-serve", "--state-path", statePath],
@@ -1041,17 +1070,146 @@ test("does not move the daemon to a random port when the default is occupied", a
     stderr,
     {
       startServer: async (options) => {
-        attempted.push(options.port ?? -1);
-        const error = new Error("address in use") as NodeJS.ErrnoException;
-        error.code = "EADDRINUSE";
-        throw error;
+        attempted.push({ port: options.port, publicUrl: options.publicUrl });
+        if (attempted.length === 1) {
+          const error = new Error("address in use") as NodeJS.ErrnoException;
+          error.code = "EADDRINUSE";
+          throw error;
+        }
+        return fakeServer(() => undefined, {
+          port: options.port ?? 0,
+          url: `http://127.0.0.1:${options.port}`,
+          webUrl: `${options.publicUrl}/?token=${options.token ?? ""}`,
+        });
       },
+      ensureTraefikRoute: async () => true,
+      waitForShutdown: async () => undefined,
     },
   );
 
-  assert.equal(exit, 1);
-  assert.deepEqual(attempted, [80]);
+  assert.equal(exit, 0);
+  assert.deepEqual(attempted, [
+    { port: 80, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost" },
+  ]);
   assert.equal(stdout.text(), "");
+  assert.equal(stderr.text(), "");
+});
+
+test("uses the fixed direct fallback when another service owns port 80", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-fallback-port-"));
+  const stdout = output();
+  const stderr = output();
+  const attempted: Array<{ port: number | undefined; publicUrl: string | undefined }> = [];
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      attempted.push({ port: options.port, publicUrl: options.publicUrl });
+      if (attempted.length === 1) {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return fakeServer(() => undefined, {
+        port: options.port ?? 0,
+        url: `http://127.0.0.1:${options.port}`,
+        webUrl: `${options.publicUrl}/?token=${options.token ?? ""}`,
+      });
+    },
+    ensureTraefikRoute: async () => false,
+    waitForShutdown: async () => undefined,
+  });
+
+  assert.equal(exit, 0);
+  assert.deepEqual(attempted, [
+    { port: 80, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost:43127" },
+  ]);
+  assert.match(
+    stdout.text(),
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("does not publish a Traefik route when the backend port is occupied", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-busy-backend-"));
+  const stderr = output();
+  const attempted: number[] = [];
+  let routeChecks = 0;
+
+  const exit = await run(["web"], output(), stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      attempted.push(options.port ?? -1);
+      const error = new Error("address in use") as NodeJS.ErrnoException;
+      error.code = "EADDRINUSE";
+      throw error;
+    },
+    ensureTraefikRoute: async () => {
+      routeChecks += 1;
+      return true;
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.deepEqual(attempted, [80, 43127]);
+  assert.equal(routeChecks, 0);
+  assert.match(stderr.text(), /address in use/);
+});
+
+test("closes a reserved backend if Traefik route setup fails unexpectedly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-route-error-"));
+  const stderr = output();
+  let attempts = 0;
+  let closed = false;
+
+  const exit = await run(["web"], output(), stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("address in use") as NodeJS.ErrnoException;
+        error.code = "EADDRINUSE";
+        throw error;
+      }
+      return fakeServer(() => {
+        closed = true;
+      });
+    },
+    ensureTraefikRoute: async () => {
+      throw new Error("Docker route failed");
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(closed, true);
+  assert.match(stderr.text(), /Docker route failed/);
+});
+
+test("keeps an explicit port strict when binding fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-strict-port-"));
+  const stdout = output();
+  const stderr = output();
+  let routeChecks = 0;
+
+  const exit = await run(["web", "--port", "80"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async () => {
+      const error = new Error("address in use") as NodeJS.ErrnoException;
+      error.code = "EADDRINUSE";
+      throw error;
+    },
+    ensureTraefikRoute: async () => {
+      routeChecks += 1;
+      return true;
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(routeChecks, 0);
   assert.match(stderr.text(), /address in use/);
 });
 
@@ -1231,7 +1389,10 @@ function fakeServer(
   };
 }
 
-function fakeConnection(port = 43121): DaemonConnection {
+function fakeConnection(
+  port = 43121,
+  publicUrl?: string,
+): DaemonConnection {
   return {
     client: new DeskApiClient(`http://127.0.0.1:${port}`, "test-token"),
     descriptor: {
@@ -1241,6 +1402,7 @@ function fakeConnection(port = 43121): DaemonConnection {
       port,
       token: "test-token",
       startedAt: "2026-08-12T00:00:00.000Z",
+      ...(publicUrl === undefined ? {} : { publicUrl }),
     },
     url: `http://127.0.0.1:${port}`,
   };
