@@ -111,6 +111,119 @@ test("adds a workspace, registers a document, and lists it", async () => {
   catalog.close();
 });
 
+test("preflights Mermaid and returns every issue as JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-validate-"));
+  const documentPath = join(root, "review.md");
+  await writeFile(documentPath, [
+    "```mermaid",
+    "flowchart LR",
+    "  A --> B",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"), "utf8");
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(["validate", documentPath, "--json"], stdout, stderr, {
+      statePath: join(root, "unused.sqlite3"),
+    }),
+    1,
+  );
+  const result = JSON.parse(stdout.text()) as {
+    schemaVersion: number;
+    validation: {
+      kind: string;
+      valid: boolean;
+      diagramCount: number;
+      issues: Array<{ block: number; line: number; message: string }>;
+    };
+  };
+  assert.equal(result.schemaVersion, 1);
+  assert.equal(result.validation.kind, "mermaid");
+  assert.equal(result.validation.valid, false);
+  assert.equal(result.validation.diagramCount, 3);
+  assert.deepEqual(
+    result.validation.issues.map(({ block, line }) => ({ block, line })),
+    [
+      { block: 2, line: 6 },
+      { block: 3, line: 11 },
+    ],
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("returns structured Mermaid failures from JSON registration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-register-mermaid-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "broken.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, [
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"), "utf8");
+  assert.equal(
+    await run(
+      ["workspace", "add", workspace, "--id", "example"],
+      output(),
+      output(),
+      { statePath },
+    ),
+    0,
+  );
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run([
+      "register",
+      documentPath,
+      "--workspace",
+      "example",
+      "--json",
+    ], stdout, stderr, { statePath }),
+    1,
+  );
+  const result = JSON.parse(stderr.text()) as {
+    schemaVersion: number;
+    error: {
+      code: string;
+      validation: {
+        diagramCount: number;
+        issues: Array<{ block: number; line: number }>;
+      };
+    };
+  };
+  assert.equal(result.schemaVersion, 1);
+  assert.equal(result.error.code, "invalid_mermaid");
+  assert.equal(result.error.validation.diagramCount, 2);
+  assert.deepEqual(
+    result.error.validation.issues.map(({ block, line }) => ({ block, line })),
+    [
+      { block: 1, line: 1 },
+      { block: 2, line: 6 },
+    ],
+  );
+  assert.equal(stdout.text(), "");
+});
+
 test("publishes an explicit review gate and returns its response as JSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-review-"));
   const workspace = join(root, "workspace");

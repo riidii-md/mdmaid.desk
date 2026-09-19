@@ -113,8 +113,11 @@ links and image references are resolved from the original Markdown path,
 authorized against the canonical workspace root, and persisted only as
 workspace-relative paths.
 They also parse every Mermaid fence before any catalog mutation. Invalid
-diagrams return their block number, Markdown line, and bounded parser diagnostic
-to the producer; live reference reconciliation applies the same validation.
+diagrams return a versioned validation report with the total diagram count and
+every issue's block number, Markdown line, and bounded parser diagnostic. The
+API exposes it as `error.validation`, and JSON CLI callers preserve the same
+data. `mdmaid-desk validate <file.md>` provides the check without a catalog
+mutation. Live reference reconciliation applies the same validation.
 Rendered web links use opaque, document-scoped identifiers under
 `/d/:document/source/:source`. The authenticated source viewer repeats
 realpath, regular-file, symlink, size, and UTF-8 checks on every read. It does
