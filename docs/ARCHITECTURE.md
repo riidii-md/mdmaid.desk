@@ -206,7 +206,8 @@ a clamped line offset. Linked source pages and SVG media remain live on request
 but are not watched in this release.
 
 `daemon start` is idempotent. The daemon publishes its PID, loopback host,
-port, and protocol version through `daemon.json`. `daemon install` explicitly
+actual port, public browser origin, and protocol version through `daemon.json`.
+`daemon install` explicitly
 configures a user service for people who want an always-available browser URL;
 installation or registration must not silently leave a permanent background
 process running. The npm CLI installs a LaunchAgent on macOS or systemd user
@@ -215,18 +216,22 @@ service on Linux; a future Homebrew service uses the same lifecycle contract.
 Both foreground `mdmaid-desk web` and the background daemon atomically publish
 a mode-`0600` descriptor. CLI writes, web, and TUI health-check and reuse it.
 The TUI starts a session-scoped embedded loopback server when no daemon exists.
-A user can select a port for an isolated instance. The default daemon stays on
-port `80` and fails rather than silently moving to a random port. A
-healthy descriptor remains the attach-first authority for CLI and TUI clients.
+A user can select a port for an isolated instance. The default daemon tries
+port `80` first; when that fails, it uses fixed port `43127` through an existing
+compatible Traefik or as a direct URL with a port suffix. It never selects a
+random port. A healthy descriptor remains the attach-first authority for CLI
+and TUI clients.
 
 `web` should attach to and open an existing healthy daemon when one exists. If
 none exists, it starts the service in the foreground until interrupted. The
 TUI follows the same attach-first policy without leaving its fallback server
 running after the terminal session ends.
 
-The foreground browser service uses the stable direct origin
+The foreground browser service prefers the stable origin
 `http://mdmaid.desk.localhost/`. The special-use `.localhost` name maps
-back to loopback, so it needs no DNS, hosts-file, proxy, or certificate setup.
+back to loopback, so it needs no DNS, hosts-file, or certificate setup. When
+Traefik already owns port 80, a labeled mdmaid route container on its Docker
+network forwards to the loopback-only backend through OrbStack's host gateway.
 Browser origin checks use that explicit origin rather than forwarding headers.
 The daemon keeps a stable random mode-`0600` authentication token so browser
 sessions and local API authentication survive service restarts. Its browser

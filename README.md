@@ -261,7 +261,9 @@ authenticated URL such as:
 http://mdmaid.desk.localhost/?token=...
 ```
 
-No proxy, certificate, DNS, or `/etc/hosts` setup is required. After the first
+No manual proxy, certificate, DNS, or `/etc/hosts` setup is required. If
+Traefik already owns port 80 on macOS, mdmaid.desk can add its route
+automatically. After the first
 authenticated open, the browser redirects to the clean URL, which can be
 bookmarked. The service publishes a user-only `daemon.json` for local clients
 and keeps its persistent random authentication token in a user-only
@@ -286,10 +288,13 @@ mdmaid-desk web
 mdmaid-desk daemon stop
 ```
 
-The default port is `80`. Mdmaid.desk does not silently move a daemon to a
-random port when it is occupied. A default `web`, `tui`, `daemon start`, or CLI
-mutation attaches to the healthy daemon recorded in the user-only descriptor.
-Select a different port only when deliberately running an isolated instance:
+The default attempt is port `80`. If it is unavailable and a compatible
+Docker-backed Traefik owns it on macOS, mdmaid.desk registers a route there,
+serves on private port `43127`, and keeps the portless browser URL. Otherwise
+it serves directly on `43127` and reports the URL with that port. No random
+port is selected. A default `web`, `tui`, `daemon start`, or CLI mutation
+attaches to the healthy daemon recorded in the user-only descriptor. Select a
+different port only when deliberately running an isolated instance:
 
 ```bash
 mdmaid-desk daemon start --port 43210
@@ -297,7 +302,8 @@ mdmaid-desk daemon start --port 43210
 
 If a healthy daemon already exists, the same-port `web` command reuses it and
 a conflicting port is rejected. Stop the shared daemon before starting an
-isolated instance against the same state directory.
+isolated instance against the same state directory. An explicit `--port`
+requires that exact port; it does not trigger the automatic fallbacks.
 
 To start mdmaid.desk automatically at login, explicitly install its user
 service (LaunchAgent on macOS, systemd user service on Linux):

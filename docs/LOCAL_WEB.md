@@ -6,9 +6,12 @@ The canonical browser origin is:
 http://mdmaid.desk.localhost/
 ```
 
-It is served directly by mdmaid.desk. The application remains bound to
-`127.0.0.1`; the `.localhost` name maps back to loopback without DNS or an
-`/etc/hosts` entry. No reverse proxy or locally trusted certificate is needed.
+The application always binds to `127.0.0.1`; the `.localhost` name maps back
+to loopback without DNS or an `/etc/hosts` entry. Mdmaid.desk first attempts
+to serve the portless URL directly on port 80. On macOS, if an existing
+Docker-backed Traefik service already owns port 80, mdmaid.desk can register a
+small route container on Traefik's network and serve privately on port 43127.
+No local certificate is needed.
 
 ## Start the workspace
 
@@ -25,8 +28,13 @@ browsers share cookies across ports: token-scoped names let multiple local
 mdmaid.desk daemons coexist on the same `.localhost` hostname without signing
 each other out.
 
-The default backend port is the standard HTTP port `80`, so the browser URL
-does not need a port suffix. To choose a different port for isolated testing:
+The default attempt is port `80`. When Traefik owns it, the private backend
+uses fixed port `43127` and the browser URL stays portless. If port 80 cannot
+be used and there is no compatible Traefik, the browser URL becomes
+`http://mdmaid.desk.localhost:43127/`. Port 43127 must be free for either
+fallback; startup fails rather than selecting a random port if it is occupied.
+
+To choose a different port for isolated testing:
 
 ```bash
 node dist/cli.js web --port 43128
@@ -43,8 +51,11 @@ mdmaid-desk daemon install
 
 After that, `web`, `tui`, `daemon start`, and daemon-aware CLI mutations reuse
 the healthy running service. They do not need to start another server. The
-daemon does not silently fall back to a random port when port 80 is occupied;
-free that port or install it with an explicit alternate `--port`.
+daemon never silently falls back to a random port. An explicit `--port`
+disables both automatic fallbacks. The Traefik route container is created only
+after the private backend has bound successfully, is labeled as mdmaid-owned,
+and is reused on subsequent starts. It is not installed when Traefik is not
+detected; removing the container is a separate administrative action.
 If the healthy shared daemon is already running, `web` reuses it when the
 requested port matches and rejects a conflicting second server.
 
@@ -68,7 +79,11 @@ automatic push event.
 - the application server refuses non-loopback bind addresses;
 - public browser URLs accept only credential-free HTTP or HTTPS `.localhost`
   origins with no path, query, or fragment;
-- a direct HTTP public URL must use the same port as the server;
+- an explicitly selected direct HTTP public URL must use the same port as the
+  server; the managed Traefik route is the only default HTTP port exception;
+- the Traefik proxy preserves the browser `Host` header and does not mount the
+  daemon's state directory; the one-time bootstrap URL (including its token)
+  passes through the proxy, so access logging for this route should stay off;
 - browser mutations authenticated by cookie must send the exact public origin;
 - forwarding headers are not trusted or used for authentication;
 - browser cookies are token-scoped and marked `HttpOnly` and `SameSite=Strict`;
@@ -79,7 +94,14 @@ automatic push event.
 - bearer-authenticated local clients connect directly to the loopback address
   recorded in `daemon.json`.
 
-HTTP is intentional here: the listener is local-only, and removing local TLS
-avoids certificate installation and trust prompts. HTTPS `.localhost` origins
+If Traefik publishes port 80 to the LAN, its mdmaid route is also reachable
+there by a client supplying the hostname. The mdmaid backend still binds only
+to loopback and requires the browser session or bearer token for document
+access; limit Traefik's published port to local clients if LAN access is not
+desired.
+
+HTTP is intentional here: the application listener is local-only, and removing
+local TLS avoids certificate installation and trust prompts. A shared Traefik
+listener may have a broader reach as noted above. HTTPS `.localhost` origins
 remain available as an advanced configuration and receive `Secure` cookies
 and HSTS.

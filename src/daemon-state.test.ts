@@ -8,6 +8,7 @@ import { Catalog } from "./catalog.js";
 import {
   connectToDaemon,
   daemonDescriptorPath,
+  descriptorForServer,
   readDaemonDescriptor,
   removeDaemonDescriptor,
   writeDaemonDescriptor,
@@ -23,6 +24,18 @@ const descriptor: DaemonDescriptor = {
   token: "daemon-test-token",
   startedAt: "2026-08-08T10:00:00.000Z",
 };
+
+test("omits a non-.localhost internal origin from the shared descriptor", () => {
+  const server = {
+    host: "127.0.0.1",
+    port: 43121,
+    token: "daemon-test-token",
+    url: "http://127.0.0.1:43121",
+    webUrl: "http://127.0.0.1:43121/?token=daemon-test-token",
+    close: async () => undefined,
+  };
+  assert.equal(descriptorForServer(server).publicUrl, undefined);
+});
 
 test("atomically stores a user-only daemon descriptor", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-daemon-state-"));
@@ -51,6 +64,14 @@ test("rejects malformed and symlinked daemon descriptors", async () => {
   await writeFile(target, JSON.stringify(descriptor), { mode: 0o600 });
   await symlink(target, link);
   await assert.rejects(readDaemonDescriptor(link), /non-symlink file/);
+
+  await assert.rejects(
+    writeDaemonDescriptor(join(root, "unsafe.json"), {
+      ...descriptor,
+      publicUrl: "http://example.com",
+    }),
+    /Invalid daemon descriptor/,
+  );
 });
 
 test("connects to a live descriptor and removes stale connection state", async () => {
