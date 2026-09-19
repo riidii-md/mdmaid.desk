@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -17,7 +18,11 @@ import {
   type ReviewOutcome,
   type ReviewRequest,
 } from "./catalog.js";
-import { DeskApiClient, DeskApiError } from "./api-client.js";
+import {
+  DeskApiClient,
+  DeskApiError,
+  isPublicReviewRequest,
+} from "./api-client.js";
 import {
   connectToDaemon,
   connectToDaemonInfo,
@@ -57,6 +62,9 @@ import {
 } from "./mermaid-validation.js";
 
 const MAX_VALIDATION_BYTES = 2 * 1024 * 1024;
+
+const RUNNING_PACKAGE_VERSION = readPackageVersion();
+const MAX_UPDATED_WAITER_OUTPUT_BYTES = 256 * 1024;
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
   "definition",
@@ -179,9 +187,18 @@ export interface RunOptions {
   ensureTraefikRoute?: () => Promise<boolean>;
   signal?: AbortSignal;
   reviewPollIntervalMs?: number;
+  runningPackageVersion?: string;
+  readInstalledPackageVersion?: () => string;
+  resumeReviewWait?: (
+    id: string,
+    signal?: AbortSignal,
+  ) => Promise<ReviewRequest>;
+  updatedCliEntryPath?: string;
 }
 
 class UsageError extends Error {}
+
+class InstalledPackageVersionChanged extends Error {}
 
 const silentWriter: Writer = { write: () => undefined };
 
@@ -1193,13 +1210,32 @@ async function waitForReviewRequest(
   options: RunOptions,
 ): Promise<ReviewRequest> {
   const interval = options.reviewPollIntervalMs ?? 1_000;
+  const resumeWithUpdatedCli = async (): Promise<ReviewRequest> =>
+    await (options.resumeReviewWait ?? ((reviewId, signal) =>
+      resumeReviewWaitWithUpdatedCli(
+        reviewId,
+        signal,
+        options.updatedCliEntryPath,
+      )))(id, options.signal);
   while (true) {
     throwIfAborted(options.signal);
+    if (installedPackageVersionChanged(options)) {
+      return await resumeWithUpdatedCli();
+    }
     const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
     if (client) {
       try {
-        return await waitForReviewEvent(client, id, options.signal);
+        return await waitForReviewEvent(
+          client,
+          id,
+          options.signal,
+          interval,
+          () => installedPackageVersionChanged(options),
+        );
       } catch (error) {
+        if (error instanceof InstalledPackageVersionChanged) {
+          return await resumeWithUpdatedCli();
+        }
         if (options.signal?.aborted) {
           throw new Error("review wait cancelled");
         }
@@ -1236,6 +1272,8 @@ async function waitForReviewEvent(
   client: DeskApiClient,
   id: string,
   signal?: AbortSignal,
+  updateCheckIntervalMs = 1_000,
+  packageVersionChanged: () => boolean = () => false,
 ): Promise<ReviewRequest> {
   const current = await client.getReviewRequest(id);
   if (current.status !== "pending") {
@@ -1245,11 +1283,17 @@ async function waitForReviewEvent(
   return await new Promise<ReviewRequest>((resolvePromise, reject) => {
     let settled = false;
     let checking = false;
+    const updateTimer = setInterval(() => {
+      if (packageVersionChanged()) {
+        finish(() => reject(new InstalledPackageVersionChanged()));
+      }
+    }, updateCheckIntervalMs);
     const finish = (operation: () => void): void => {
       if (settled) {
         return;
       }
       settled = true;
+      clearInterval(updateTimer);
       controller.abort();
       signal?.removeEventListener("abort", onAbort);
       operation();
@@ -1298,6 +1342,101 @@ async function waitForReviewEvent(
       })
       .catch((error: unknown) => finish(() => reject(error)));
   });
+}
+
+function installedPackageVersionChanged(options: RunOptions): boolean {
+  try {
+    const runningVersion = options.runningPackageVersion ??
+      RUNNING_PACKAGE_VERSION;
+    const installedVersion = (
+      options.readInstalledPackageVersion ?? readPackageVersion
+    )();
+    return installedVersion !== runningVersion;
+  } catch {
+    // Package replacement is not necessarily atomic. Keep the existing wait
+    // alive until the new installation exposes valid package metadata.
+    return false;
+  }
+}
+
+function resumeReviewWaitWithUpdatedCli(
+  id: string,
+  signal?: AbortSignal,
+  updatedCliEntryPath?: string,
+): Promise<ReviewRequest> {
+  const entryPath = updatedCliEntryPath ?? process.argv[1];
+  if (!entryPath) {
+    throw new Error("cannot locate the CLI entrypoint for waiter update");
+  }
+  return new Promise<ReviewRequest>((resolvePromise, reject) => {
+    execFile(
+      process.execPath,
+      [entryPath, "review", "wait", id, "--json"],
+      {
+        encoding: "utf8",
+        env: process.env,
+        maxBuffer: MAX_UPDATED_WAITER_OUTPUT_BYTES,
+        signal,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          if (signal?.aborted) {
+            reject(new Error("review wait cancelled"));
+            return;
+          }
+          const detail = stderr.trim();
+          reject(
+            new Error(
+              detail === ""
+                ? `updated review waiter failed: ${error.message}`
+                : `updated review waiter failed: ${detail}`,
+            ),
+          );
+          return;
+        }
+        try {
+          resolvePromise(parseUpdatedReviewWaitOutput(stdout, id));
+        } catch (parseError) {
+          reject(parseError);
+        }
+      },
+    );
+  });
+}
+
+function parseUpdatedReviewWaitOutput(
+  output: string,
+  expectedId: string,
+): ReviewRequest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error("updated review waiter returned invalid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("updated review waiter returned an invalid response");
+  }
+  const envelope = parsed as Record<string, unknown>;
+  const request = envelope.reviewRequest;
+  if (
+    typeof envelope.schemaVersion !== "number" ||
+    !Number.isSafeInteger(envelope.schemaVersion) ||
+    envelope.schemaVersion < 1 ||
+    typeof request !== "object" ||
+    request === null ||
+    Array.isArray(request)
+  ) {
+    throw new Error("updated review waiter returned an invalid response");
+  }
+  if (
+    !isPublicReviewRequest(request) ||
+    request.id !== expectedId ||
+    request.status === "pending"
+  ) {
+    throw new Error("updated review waiter returned an invalid review request");
+  }
+  return structuredClone(request);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
