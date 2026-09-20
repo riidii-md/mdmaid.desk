@@ -106,12 +106,16 @@ const registerUsage = `Usage:
       [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
       [--kind <kind>]
       [--title <title>] [--attention <state>] [--tag <tag> ...]
-      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+      [--expect plan-decision|change-decision]
+      [--request-message <text>] [--wait] [--json]
 
   register keeps the authorized Markdown source as a live reference.
   --live explicitly requests this default live-reference behavior.
   A running web service or daemon watches it and refreshes open Web and TUI
   readers after saved changes. Use import for a managed snapshot instead.
+
+  For an implementation approval, use --kind change-review with
+  --attention approval --expect change-decision.
 `;
 
 const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
@@ -155,6 +159,10 @@ Usage:
 Document sources:
   register keeps an authorized source as a live reference; --live explicitly
   requests that default behavior. import creates a managed snapshot instead.
+
+Change reviews:
+  register <file.md> --workspace <id> --kind change-review
+      --attention approval --expect change-decision
 `;
 
 interface Writer {

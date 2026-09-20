@@ -21,6 +21,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      - run: npx playwright install --with-deps --only-shell chromium
       - run: npm run check
 
   package-smoke:
@@ -67,6 +68,7 @@ jobs:
           package-manager-cache: false
 
       - run: npm ci
+      - run: npx playwright install --with-deps --only-shell chromium
       - run: npm run check
       - run: npm run package:smoke
 
