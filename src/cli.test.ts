@@ -1022,6 +1022,27 @@ test("documents live registration in global and command help", async () => {
   assert.equal(stderr.text(), "");
 });
 
+test("documents change-review registration and its decision request in help", async () => {
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(await run(["--help"], stdout, stderr), 0);
+  assert.match(
+    stdout.text(),
+    /--kind change-review\s+--attention approval --expect change-decision/,
+  );
+  assert.equal(stderr.text(), "");
+
+  const registerHelp = output();
+  assert.equal(await run(["register", "--help"], registerHelp, stderr), 0);
+  assert.match(registerHelp.text(), /\[--expect plan-decision\|change-decision\]/);
+  assert.match(
+    registerHelp.text(),
+    /--kind change-review with\s+--attention approval --expect change-decision/,
+  );
+  assert.equal(stderr.text(), "");
+});
+
 test("prints the published package version without opening the catalog", async () => {
   const stdout = output();
   const stderr = output();

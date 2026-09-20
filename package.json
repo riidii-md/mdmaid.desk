@@ -31,8 +31,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/*.test.js",
+    "test:e2e": "npm run build && playwright test",
+    "typecheck:e2e": "tsc -p tsconfig.e2e.json",
     "test:coverage": "npm run build && node --test --experimental-test-coverage dist/*.test.js",
-    "check": "npm run test",
+    "check": "npm run test && npm run typecheck:e2e && npm run test:e2e",
     "package:smoke": "npm run build && node scripts/package-smoke.mjs",
     "prepublishOnly": "npm run check && npm run package:smoke"
   },
@@ -44,6 +46,7 @@
     "provenance": true
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.1.0",
     "@types/sanitize-html": "^2.16.1",

@@ -29,6 +29,11 @@ export interface WebFilters {
   changeReviewsOnly?: boolean | undefined;
 }
 
+export interface WebProjectQueueSelection {
+  filters: WebFilters;
+  route: string;
+}
+
 export interface WebDiffCell {
   kind: ChangeLineKind;
   line: number | null;
@@ -447,6 +452,121 @@ export function filterQueue(
       .toLowerCase();
     return terms.every((term) => haystack.includes(term));
   });
+}
+
+export function projectQueueSelection(
+  filters: WebFilters,
+  workspace: Pick<WebWorkspace, "id" | "route"> | undefined,
+): WebProjectQueueSelection {
+  return {
+    filters: {
+      ...filters,
+      workspaceId: workspace?.id,
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: workspace?.route ?? "/",
+  };
+}
+
+export function projectQueueRoute(
+  workspaceId: string | undefined,
+  workspaces: readonly WebWorkspace[],
+): string {
+  return workspaces.find(({ id }) => id === workspaceId)?.route ?? "/";
+}
+
+export function queueHistoryState(
+  filters: WebFilters,
+): { space?: "actions" | "change-reviews" } {
+  if (filters.changeReviewsOnly === true) {
+    return { space: "change-reviews" };
+  }
+  return filters.actionsOnly === true ? { space: "actions" } : {};
+}
+
+export function documentHistoryState(
+  documentId: string,
+  filters: WebFilters,
+  workspaces: readonly WebWorkspace[],
+): { documentId: string; queueRoute: string; space?: "actions" | "change-reviews" } {
+  return {
+    documentId,
+    queueRoute: projectQueueRoute(filters.workspaceId, workspaces),
+    ...queueHistoryState(filters),
+  };
+}
+
+export function projectQueueSelectionForReaderHistory(
+  filters: WebFilters,
+  historyState: unknown,
+  workspaces: readonly WebWorkspace[],
+): WebProjectQueueSelection | undefined {
+  if (!isRecord(historyState) || typeof historyState.queueRoute !== "string") {
+    return undefined;
+  }
+  return projectQueueSelectionForRoute(
+    filters,
+    historyState.queueRoute,
+    workspaces,
+    historyState,
+  );
+}
+
+export function actionsQueueTransition(
+  filters: WebFilters,
+  readerOpen: boolean,
+  workspaces: readonly WebWorkspace[],
+): WebProjectQueueSelection & {
+  historyState: { space?: "actions" | "change-reviews" };
+  pushHistory: boolean;
+} {
+  const actionsOnly = filters.actionsOnly !== true;
+  const nextFilters = { ...filters, actionsOnly, changeReviewsOnly: false };
+  return {
+    filters: nextFilters,
+    route: projectQueueRoute(filters.workspaceId, workspaces),
+    historyState: queueHistoryState(nextFilters),
+    pushHistory: readerOpen,
+  };
+}
+
+export function projectQueueSelectionForRoute(
+  filters: WebFilters,
+  route: string,
+  workspaces: readonly WebWorkspace[],
+  historyState?: unknown,
+): WebProjectQueueSelection | undefined {
+  let selection: WebProjectQueueSelection | undefined;
+  if (route === "/") {
+    selection = projectQueueSelection(filters, undefined);
+  } else {
+    const workspace = workspaces.find((candidate) => candidate.route === route);
+    if (workspace) {
+      selection = projectQueueSelection(filters, workspace);
+    } else if (
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(route) ||
+      /^\/p\/project-[a-f0-9]{20}$/.test(route)
+    ) {
+      selection = projectQueueSelection(filters, undefined);
+    }
+  }
+  if (!selection || !isRecord(historyState)) {
+    return selection;
+  }
+  if (route === "/" && historyState.space === "change-reviews") {
+    return {
+      ...selection,
+      filters: { ...selection.filters, changeReviewsOnly: true },
+    };
+  }
+  if (historyState.space === "actions") {
+    return {
+      ...selection,
+      filters: { ...selection.filters, actionsOnly: true },
+    };
+  }
+  return selection;
 }
 
 export function webDiffRows(hunk: ChangeReviewHunk): WebDiffRow[] {
@@ -973,18 +1093,19 @@ async function boot(): Promise<void> {
     const workspaces = visibleWorkspaces(ordinaryDocuments, state.workspaces);
     if (
       state.filters.workspaceId !== undefined &&
-      !workspaces.some(({ id }) => id === state.filters.workspaceId)
+      !workspaces.some(({ id }) => id === state.filters.workspaceId) &&
+      !state.workspaces.some(({ id }) => id === state.filters.workspaceId)
     ) {
       state.filters.workspaceId = undefined;
     }
-    const all = projectButton("all projects", ordinaryDocuments.length, undefined);
+    const all = projectButton("all projects", ordinaryDocuments.length);
     projectNav.append(all);
     for (const workspace of workspaces) {
       projectNav.append(
         projectButton(
           workspace.name,
           workspace.documentCount,
-          workspace.id,
+          workspace,
         ),
       );
     }
@@ -1006,12 +1127,12 @@ async function boot(): Promise<void> {
   function projectButton(
     name: string,
     count: number,
-    workspaceId: string | undefined,
+    workspace?: WebWorkspace,
   ): HTMLButtonElement {
     const button = document.createElement("button");
     button.className = "project-button";
     if (
-      state.filters.workspaceId === workspaceId &&
+      state.filters.workspaceId === workspace?.id &&
       state.filters.changeReviewsOnly !== true &&
       state.filters.actionsOnly !== true
     ) {
@@ -1025,10 +1146,12 @@ async function boot(): Promise<void> {
     badge.textContent = `${count} ${count === 1 ? "doc" : "docs"}`;
     button.append(label, badge);
     button.addEventListener("click", () => {
-      state.filters.workspaceId = workspaceId;
-      state.filters.actionsOnly = false;
-      state.filters.changeReviewsOnly = false;
+      const selection = projectQueueSelection(state.filters, workspace);
+      state.filters = selection.filters;
+      closeReader(false);
+      history.pushState({}, "", selection.route);
       render();
+      window.scrollTo(0, 0);
     });
     return button;
   }
@@ -1199,6 +1322,37 @@ async function boot(): Promise<void> {
     state.documents = documents;
     state.workspaces = workspaces;
     state.reviewRequests = reviewRequests;
+    if (openSelected || !state.selectedId) {
+      const visible = visibleWorkspaces(
+        state.documents.filter(({ kind }) => kind !== "change-review"),
+        state.workspaces,
+      );
+      const queueWorkspaces = [...visible, ...state.workspaces];
+      const selection = state.selectedId
+        ? projectQueueSelectionForReaderHistory(
+            state.filters,
+            history.state,
+            queueWorkspaces,
+          )
+        : projectQueueSelectionForRoute(
+            state.filters,
+            location.pathname,
+            queueWorkspaces,
+            history.state,
+          );
+      if (selection) {
+        state.filters = selection.filters;
+        if (!state.selectedId && selection.route !== location.pathname) {
+          history.replaceState(queueHistoryState(selection.filters), "", selection.route);
+        }
+      } else if (state.selectedId) {
+        history.replaceState(
+          documentHistoryState(state.selectedId, state.filters, queueWorkspaces),
+          "",
+          location.href,
+        );
+      }
+    }
     render();
     if (openSelected && state.selectedId) {
       await openDocument(state.selectedId, false);
@@ -1598,6 +1752,18 @@ async function boot(): Promise<void> {
     }
   }
 
+  function pushDocumentHistory(id: string, route: string): void {
+    const visible = visibleWorkspaces(
+      state.documents.filter(({ kind }) => kind !== "change-review"),
+      state.workspaces,
+    );
+    history.pushState(
+      documentHistoryState(id, state.filters, [...visible, ...state.workspaces]),
+      "",
+      route,
+    );
+  }
+
   async function renderSelectedDocument(
     id: string,
     options: {
@@ -1639,11 +1805,7 @@ async function boot(): Promise<void> {
       documentRendered = true;
       renderChangeReview();
       if (options.pushHistory) {
-        history.pushState(
-          { documentId: id },
-          "",
-          rendered.document.route,
-        );
+        pushDocumentHistory(id, rendered.document.route);
       }
       const mermaid = window.mermaid;
       if (mermaid) {
@@ -1704,11 +1866,17 @@ async function boot(): Promise<void> {
             api<WebDocument[]>("/api/v1/documents"),
             api<WebReviewRequest[]>("/api/v1/review-requests"),
           ]);
+          if (sequence !== renderSequence || state.selectedId !== id) {
+            return;
+          }
           state.documents = documents;
           state.reviewRequests = reviewRequests;
           render();
         } catch {
           // The safe missing-source state remains actionable without a refresh.
+        }
+        if (sequence !== renderSequence || state.selectedId !== id) {
+          return;
         }
         const missing =
           state.documents.find((item) => item.id === id) ?? selected;
@@ -1716,7 +1884,7 @@ async function boot(): Promise<void> {
           showMissingSource(missing);
           renderedRevision = missing.revision;
           if (options.pushHistory) {
-            history.pushState({ documentId: id }, "", missing.route);
+            pushDocumentHistory(id, missing.route);
           }
           return;
         }
@@ -1895,7 +2063,15 @@ async function boot(): Promise<void> {
     readerTocList.replaceChildren();
     queuePanel.removeAttribute("hidden");
     if (pushHistory) {
-      history.pushState({}, "", "/");
+      const workspaces = visibleWorkspaces(
+        state.documents.filter(({ kind }) => kind !== "change-review"),
+        state.workspaces,
+      );
+      history.pushState(
+        queueHistoryState(state.filters),
+        "",
+        projectQueueRoute(state.filters.workspaceId, [...workspaces, ...state.workspaces]),
+      );
     }
   }
 
@@ -1907,21 +2083,24 @@ async function boot(): Promise<void> {
   }
 
   async function act(action: "read" | "unread" | "archive"): Promise<void> {
-    if (!state.selectedId) {
+    const id = state.selectedId;
+    if (!id) {
       return;
     }
-    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    const selected = state.documents.find((item) => item.id === id);
     if (action !== "archive" && selected && isSourceMissing(selected)) {
       return;
     }
     const updated = await api<WebDocument>(
-      `/api/v1/documents/${state.selectedId}/${action}`,
+      `/api/v1/documents/${id}/${action}`,
       { method: "POST" },
     );
     replaceDocument(updated);
     if (action === "archive") {
       state.documents = state.documents.filter(({ id }) => id !== updated.id);
-      closeReader();
+      if (state.selectedId === id) {
+        closeReader();
+      }
       render();
     }
   }
@@ -1931,15 +2110,33 @@ async function boot(): Promise<void> {
     renderQueue();
   });
   actionsFilter.addEventListener("click", () => {
-    state.filters.actionsOnly = state.filters.actionsOnly !== true;
-    state.filters.changeReviewsOnly = false;
+    const workspaces = visibleWorkspaces(
+      state.documents.filter(({ kind }) => kind !== "change-review"),
+      state.workspaces,
+    );
+    const transition = actionsQueueTransition(
+      state.filters,
+      state.selectedId !== undefined,
+      [...workspaces, ...state.workspaces],
+    );
+    state.filters = transition.filters;
+    if (transition.pushHistory) {
+      closeReader(false);
+      history.pushState(transition.historyState, "", transition.route);
+      window.scrollTo(0, 0);
+    } else {
+      history.replaceState(transition.historyState, "", transition.route);
+    }
     render();
   });
   changeReviewsFilter.addEventListener("click", () => {
     state.filters.changeReviewsOnly = true;
     state.filters.actionsOnly = false;
     state.filters.workspaceId = undefined;
+    closeReader(false);
+    history.pushState({ space: "change-reviews" }, "", "/");
     render();
+    window.scrollTo(0, 0);
   });
   changeFilePrevious.addEventListener("click", () => {
     changeFileIndex -= 1;
@@ -2066,12 +2263,39 @@ async function boot(): Promise<void> {
     }
   });
 
-  window.addEventListener("popstate", () => {
+  window.addEventListener("popstate", (event) => {
+    const workspaces = visibleWorkspaces(
+      state.documents.filter(({ kind }) => kind !== "change-review"),
+      state.workspaces,
+    );
+    const queueWorkspaces = [...workspaces, ...state.workspaces];
     const match = location.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/);
     if (match?.[1]) {
+      const selection = projectQueueSelectionForReaderHistory(
+        state.filters,
+        event.state,
+        queueWorkspaces,
+      );
+      if (selection) {
+        state.filters = selection.filters;
+        render();
+      }
       void openDocument(match[1], false);
     } else {
+      const selection = projectQueueSelectionForRoute(
+        state.filters,
+        location.pathname,
+        queueWorkspaces,
+        event.state,
+      );
+      if (selection) {
+        state.filters = selection.filters;
+        if (selection.route !== location.pathname) {
+          history.replaceState(queueHistoryState(selection.filters), "", selection.route);
+        }
+      }
       closeReader(false);
+      render();
     }
   });
 

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  actionsQueueTransition,
   changeReviewApprovalError,
+  documentHistoryState,
   documentFragmentId,
   documentOutline,
   filterQueue,
@@ -12,6 +14,11 @@ import {
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
   pendingReviewForDocument,
+  projectQueueRoute,
+  projectQueueSelection,
+  projectQueueSelectionForRoute,
+  projectQueueSelectionForReaderHistory,
+  queueHistoryState,
   queueGroupingPreference,
   queueCounts,
   requestDocumentPrint,
@@ -137,6 +144,338 @@ test("filters the browser queue by workspace, status, and search", () => {
   assert.deepEqual(filterQueue(documents, { search: "codex" }), [
     documents[0],
   ]);
+});
+
+test("filters the queue by logical project across workspaces", () => {
+  const sharedProject = "project-11111111111111111111";
+  const otherProject = "project-22222222222222222222";
+  const projectDocuments = [
+    { ...documents[0]!, projectId: sharedProject },
+    { ...documents[1]!, projectId: sharedProject },
+    { ...documents[2]!, projectId: otherProject },
+  ];
+  assert.deepEqual(
+    filterQueue(projectDocuments, {
+      workspaceId: sharedProject,
+      status: "all",
+    }).map(({ id }) => id),
+    [documents[0]!.id, documents[1]!.id],
+  );
+});
+
+test("selects a project queue and leaves document-only spaces", () => {
+  const current: WebFilters = {
+    workspaceId: "beta",
+    status: "reading",
+    search: "migration",
+    actionsOnly: true,
+    changeReviewsOnly: true,
+  };
+
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  assert.deepEqual(projectQueueSelection(current, project), {
+    filters: {
+      workspaceId: project.id,
+      status: "reading",
+      search: "migration",
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: project.route,
+  });
+  assert.deepEqual(current, {
+    workspaceId: "beta",
+    status: "reading",
+    search: "migration",
+    actionsOnly: true,
+    changeReviewsOnly: true,
+  });
+});
+
+test("selects the unfiltered queue for all projects", () => {
+  assert.deepEqual(projectQueueSelection({ status: "all" }, undefined), {
+    filters: {
+      status: "all",
+      workspaceId: undefined,
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: "/",
+  });
+});
+
+test("uses canonical workspace routes and restores queue filters on history navigation", () => {
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = { workspaceId: workspace.id, status: "done" };
+
+  assert.equal(projectQueueSelection(filters, workspace).route, "/w/alpha");
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, project.route, [workspace, project]),
+    {
+      filters: {
+        workspaceId: project.id,
+        status: "done",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: project.route,
+    },
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/", [workspace, project]),
+    projectQueueSelection(filters, undefined),
+  );
+  assert.equal(
+    projectQueueSelectionForRoute(filters, "/d/doc-11111111111111111111", [workspace, project]),
+    undefined,
+  );
+});
+
+test("restores a stable workspace route alongside logical project routes", () => {
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha workspace",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = { workspaceId: project.id, status: "all" };
+
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, workspace.route, [project, workspace]),
+    {
+      filters: {
+        workspaceId: workspace.id,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: workspace.route,
+    },
+  );
+  assert.equal(projectQueueRoute(workspace.id, [project, workspace]), workspace.route);
+});
+
+test("restores special queues from browser history state", () => {
+  const filters: WebFilters = { workspaceId: "alpha", status: "all" };
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/", [], { space: "change-reviews" }),
+    {
+      filters: {
+        workspaceId: undefined,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: true,
+      },
+      route: "/",
+    },
+  );
+  assert.equal(
+    projectQueueSelectionForRoute(filters, "/", [], { space: "unknown" })?.filters.changeReviewsOnly,
+    false,
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/w/alpha", [
+      { id: "alpha", name: "Alpha", documentCount: 1, route: "/w/alpha" },
+    ], { space: "actions" }),
+    {
+      filters: {
+        workspaceId: "alpha",
+        status: "all",
+        actionsOnly: true,
+        changeReviewsOnly: false,
+      },
+      route: "/w/alpha",
+    },
+  );
+});
+
+test("opens the Actions queue when toggled from a reader", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = {
+    workspaceId: project.id,
+    status: "all",
+    changeReviewsOnly: true,
+  };
+
+  assert.deepEqual(actionsQueueTransition(filters, true, [project]), {
+    filters: {
+      workspaceId: project.id,
+      status: "all",
+      actionsOnly: true,
+      changeReviewsOnly: false,
+    },
+    route: project.route,
+    historyState: { space: "actions" },
+    pushHistory: true,
+  });
+  assert.deepEqual(
+    actionsQueueTransition({ ...filters, actionsOnly: true }, false, [project]),
+    {
+      filters: {
+        workspaceId: project.id,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: project.route,
+      historyState: {},
+      pushHistory: false,
+    },
+  );
+});
+
+test("restores a document's originating project and space from history", () => {
+  const projectA: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Project A",
+    documentCount: 1,
+    route: "/p/project-11111111111111111111",
+  };
+  const projectB: PublicWorkspace = {
+    id: "project-22222222222222222222",
+    name: "Project B",
+    documentCount: 1,
+    route: "/p/project-22222222222222222222",
+  };
+  const historyState = documentHistoryState(
+    documents[0]!.id,
+    { workspaceId: projectA.id, status: "all", actionsOnly: true },
+    [projectA, projectB],
+  );
+  assert.deepEqual(historyState, {
+    documentId: documents[0]!.id,
+    queueRoute: projectA.route,
+    space: "actions",
+  });
+  assert.deepEqual(
+    projectQueueSelectionForReaderHistory(
+      { workspaceId: projectB.id, status: "all" },
+      historyState,
+      [projectA, projectB],
+    ),
+    {
+      filters: {
+        workspaceId: projectA.id,
+        status: "all",
+        actionsOnly: true,
+        changeReviewsOnly: false,
+      },
+      route: projectA.route,
+    },
+  );
+  assert.equal(
+    projectQueueSelectionForReaderHistory(
+      { workspaceId: projectB.id, status: "all" },
+      { queueRoute: "/d/doc-11111111111111111111" },
+      [projectA, projectB],
+    ),
+    undefined,
+  );
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  assert.equal(
+    documentHistoryState(documents[0]!.id, { workspaceId: "alpha", status: "all" }, [workspace]).queueRoute,
+    "/w/alpha",
+  );
+  assert.deepEqual(
+    documentHistoryState(documents[0]!.id, { status: "all", changeReviewsOnly: true }, []),
+    {
+      documentId: documents[0]!.id,
+      queueRoute: "/",
+      space: "change-reviews",
+    },
+  );
+});
+
+test("preserves Actions state when a vanished project route becomes all projects", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Project A",
+    documentCount: 1,
+    route: "/p/project-11111111111111111111",
+  };
+  const current: WebFilters = { workspaceId: project.id, status: "all" };
+  const selection = projectQueueSelectionForRoute(
+    current,
+    project.route,
+    [],
+    { space: "actions" },
+  );
+  assert.equal(selection?.route, "/");
+  assert.equal(selection?.filters.actionsOnly, true);
+  const normalizedHistoryState = queueHistoryState(selection!.filters);
+  assert.deepEqual(normalizedHistoryState, { space: "actions" });
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/", [], normalizedHistoryState),
+    selection,
+  );
+});
+
+test("returns from a reader to its selected project's canonical route", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  assert.equal(projectQueueRoute(project.id, [project]), project.route);
+  assert.equal(projectQueueRoute(undefined, [project]), "/");
+  assert.equal(projectQueueRoute("archived-project", [project]), "/");
+});
+
+test("falls back to all projects for a vanished project history route", () => {
+  const current: WebFilters = { workspaceId: "beta", status: "reading" };
+  const visible: PublicWorkspace[] = [
+    { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
+  ];
+  const all = {
+    filters: {
+      workspaceId: undefined,
+      status: "reading",
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: "/",
+  };
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/w/alpha", visible),
+    all,
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/p/project-11111111111111111111", visible),
+    all,
+  );
 });
 
 test("provides a dedicated browser Change Reviews space", () => {
