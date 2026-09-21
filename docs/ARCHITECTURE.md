@@ -104,7 +104,8 @@ length keep rendering bounded. Unsupported or unsafe entries produce warnings.
 The Markdown remains the source artifact, while the parsed model is a derived
 render response and is not stored as a second approval identity.
 
-Requested-change responses may include bounded structured feedback items.
+Approved and requested-change responses may include bounded structured
+feedback items. Approval treats them as non-blocking comments.
 `feedback` items require a safe relative file path and may add a stable hunk ID
 or a hunk plus line/side anchor; path-only items are file-level. Legacy `todo`
 items require a file path and deliberately have no finer anchor. Items are stored

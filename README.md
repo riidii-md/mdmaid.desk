@@ -369,11 +369,13 @@ not inject it as HTML or fetch a remote grammar.
 Use `f` to attach feedback to the selected line, `t` to add file feedback, and
 `z` to undo the most recent unsent note. In the browser, click the visible `+`
 beside a line number for line feedback or use **feedback on file**. Anchored
-notes become durable structured response items when
-Request Changes is submitted, alongside a separate general note;
-`review wait --json` returns their file paths, stable hunk IDs, optional line
-and side, kinds, and messages. Open notes prevent accidental Approve, Reject,
-or Supersede actions. The review surface is intentionally read-only:
+notes become durable structured response items when Approve or Request Changes
+is submitted, alongside a separate general note. Approval records them as
+non-blocking comments. Browser drafts survive reload and can be edited or
+removed before submission. `review wait --json` returns their file paths,
+stable hunk IDs, optional line
+and side, kinds, and messages. Open notes prevent accidental Reject or
+Supersede actions. The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings
 cannot be approved; the human can still Request Changes or Reject them.

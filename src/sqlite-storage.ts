@@ -1132,7 +1132,8 @@ function validateReviewRequestRow(
       (!isReviewOutcome(response.outcome) ||
         !isValidReviewMessage(response.message) ||
         (response.items !== undefined &&
-          (response.outcome !== "changes_requested" ||
+          ((response.outcome !== "changes_requested" &&
+              response.outcome !== "approved") ||
             !response.items.every(isValidReviewFeedbackItem))) ||
         !isDate(response.createdAt) ||
         response.outcome !== row.status))

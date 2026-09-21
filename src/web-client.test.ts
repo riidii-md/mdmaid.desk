@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   actionsQueueTransition,
+  activateReviewDraft,
   changeReviewApprovalError,
+  cleanupReviewDrafts,
   documentHistoryState,
   documentFragmentId,
   documentOutline,
@@ -22,6 +24,10 @@ import {
   queueGroupingPreference,
   queueCounts,
   requestDocumentPrint,
+  loadReviewDraft,
+  persistReviewDraft,
+  removeReviewDraftFeedback,
+  reviewFeedbackItemsForOutcome,
   reviewResponseError,
   renderMermaidNodes,
   mermaidErrorMessage,
@@ -33,6 +39,8 @@ import {
   webDiffRows,
   webLoadFailure,
   visibleWorkspaces,
+  upsertReviewDraftFeedback,
+  type ReviewDraftStorage,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
@@ -721,6 +729,231 @@ test("requires explanatory text only when changes are requested", () => {
   assert.equal(reviewResponseError("approved", ""), undefined);
   assert.equal(reviewResponseError("rejected", ""), undefined);
   assert.equal(reviewResponseError("superseded", ""), undefined);
+});
+
+test("round-trips revision-bound review drafts and removes empty drafts", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const item = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-22222222222222222222",
+    line: 14,
+    side: "new" as const,
+    message: "Keep this comment after reload.",
+  };
+
+  persistReviewDraft(storage, request, {
+    message: "Approval context",
+    items: [item],
+  });
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [item],
+  });
+
+  const revised = { ...request, documentRevision: request.documentRevision + 1 };
+  assert.deepEqual(loadReviewDraft(storage, revised), { message: "", items: [] });
+
+  persistReviewDraft(storage, request, { message: "", items: [] });
+  assert.deepEqual(loadReviewDraft(storage, request), { message: "", items: [] });
+  assert.equal(values.size, 0);
+});
+
+test("restores, edits, removes, and approves persisted review feedback", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const original = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-22222222222222222222",
+    line: 14,
+    side: "new" as const,
+    message: "Keep this comment after reload.",
+  };
+  persistReviewDraft(storage, request, {
+    message: "Approval context",
+    items: [original],
+  });
+
+  const restored = loadReviewDraft(storage, request);
+  const edited = upsertReviewDraftFeedback(restored, {
+    ...original,
+    message: "Use the constant-time helper here.",
+  });
+  persistReviewDraft(storage, request, edited);
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [{
+      ...original,
+      message: "Use the constant-time helper here.",
+    }],
+  });
+  assert.deepEqual(
+    reviewFeedbackItemsForOutcome("approved", edited.items),
+    edited.items,
+  );
+
+  const removed = removeReviewDraftFeedback(edited, original.id);
+  persistReviewDraft(storage, request, removed);
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [],
+  });
+});
+
+test("activates a replacement review with a composer reset", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const replacement: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  persistReviewDraft(storage, replacement, {
+    message: "Replacement context",
+    items: [],
+  });
+
+  assert.deepEqual(
+    activateReviewDraft(
+      storage,
+      replacement,
+      "review-11111111111111111111",
+    ),
+    {
+      requestId: replacement.id,
+      resetComposer: true,
+      draft: { message: "Replacement context", items: [] },
+    },
+  );
+  assert.equal(
+    activateReviewDraft(storage, replacement, replacement.id),
+    undefined,
+  );
+});
+
+test("sweeps drafts for review requests observed in a terminal state", () => {
+  const values = new Map<string, string>([
+    ["mdmaid-desk-review-draft:review-11111111111111111111", "pending"],
+    ["mdmaid-desk-review-draft:review-22222222222222222222", "terminal"],
+    ["mdmaid-desk-review-draft:review-33333333333333333333", "unknown"],
+    ["unrelated", "keep"],
+  ]);
+  const storage: ReviewDraftStorage = {
+    get length() {
+      return values.size;
+    },
+    key: (index) => [...values.keys()][index] ?? null,
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+
+  cleanupReviewDrafts(storage, new Set([
+    "review-22222222222222222222",
+  ]));
+
+  assert.deepEqual([...values.keys()], [
+    "mdmaid-desk-review-draft:review-11111111111111111111",
+    "mdmaid-desk-review-draft:review-33333333333333333333",
+    "unrelated",
+  ]);
+});
+
+test("ignores malformed persisted review feedback", () => {
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const storage: ReviewDraftStorage = {
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "Approval context",
+      items: [{
+        id: "feedback-11111111111111111111",
+        kind: "feedback",
+        path: "../../outside.txt",
+        message: "Unsafe",
+      }],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  };
+
+  assert.deepEqual(loadReviewDraft(storage, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "Approval\u0000context",
+      items: [],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "",
+      items: [{
+        id: "feedback-11111111111111111111",
+        kind: "feedback",
+        path: "src/auth.ts",
+        message: "Unsafe\u0000feedback",
+      }],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => {
+      throw new Error("browser storage unavailable");
+    },
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
 });
 
 test("makes pending line feedback an explicit visible action", () => {

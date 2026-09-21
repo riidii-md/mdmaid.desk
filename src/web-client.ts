@@ -124,6 +124,25 @@ export interface WebLoadFailure {
   title: string;
 }
 
+export interface ReviewDraftStorage {
+  readonly length?: number;
+  key?(index: number): string | null;
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+export interface WebReviewDraft {
+  message: string;
+  items: ReviewFeedbackItem[];
+}
+
+export interface WebReviewDraftActivation {
+  requestId: string;
+  resetComposer: true;
+  draft: WebReviewDraft;
+}
+
 interface DocumentHeading {
   id: string;
   tagName: string;
@@ -683,6 +702,210 @@ export function reviewResponseError(
     : undefined;
 }
 
+export function upsertReviewDraftFeedback(
+  draft: WebReviewDraft,
+  item: ReviewFeedbackItem,
+): WebReviewDraft {
+  const index = draft.items.findIndex(({ id }) => id === item.id);
+  return {
+    message: draft.message,
+    items: index < 0
+      ? [...draft.items, item]
+      : draft.items.map((candidate, candidateIndex) =>
+        candidateIndex === index ? item : candidate
+      ),
+  };
+}
+
+export function removeReviewDraftFeedback(
+  draft: WebReviewDraft,
+  itemId: string,
+): WebReviewDraft {
+  return {
+    message: draft.message,
+    items: draft.items.filter(({ id }) => id !== itemId),
+  };
+}
+
+export function reviewFeedbackItemsForOutcome(
+  outcome: ReviewOutcome,
+  items: readonly ReviewFeedbackItem[],
+): ReviewFeedbackItem[] | undefined {
+  return (outcome === "changes_requested" || outcome === "approved") &&
+      items.length > 0
+    ? [...items]
+    : undefined;
+}
+
+export function loadReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+): WebReviewDraft {
+  const empty = { message: "", items: [] };
+  if (request.status !== "pending") {
+    return empty;
+  }
+  try {
+    const raw = storage.getItem(reviewDraftStorageKey(request.id));
+    if (raw === null) {
+      return empty;
+    }
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !hasOnlyKeys(value, [
+        "version",
+        "documentId",
+        "documentRevision",
+        "message",
+        "items",
+      ]) ||
+      value.version !== 1 ||
+      value.documentId !== request.documentId ||
+      value.documentRevision !== request.documentRevision ||
+      typeof value.message !== "string" ||
+      value.message.length > 16 * 1024 ||
+      !isSafeReviewMessage(value.message) ||
+      !Array.isArray(value.items) ||
+      value.items.length > 32 ||
+      !value.items.every(isStoredReviewFeedbackItem)
+    ) {
+      return empty;
+    }
+    return {
+      message: value.message,
+      items: value.items.map((item) => ({ ...item })),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function activateReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+  activeRequestId: string | undefined,
+): WebReviewDraftActivation | undefined {
+  if (request.status !== "pending" || activeRequestId === request.id) {
+    return undefined;
+  }
+  return {
+    requestId: request.id,
+    resetComposer: true,
+    draft: loadReviewDraft(storage, request),
+  };
+}
+
+export function persistReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+  draft: WebReviewDraft,
+): void {
+  const key = reviewDraftStorageKey(request.id);
+  if (draft.message === "" && draft.items.length === 0) {
+    storage.removeItem(key);
+    return;
+  }
+  storage.setItem(key, JSON.stringify({
+    version: 1,
+    documentId: request.documentId,
+    documentRevision: request.documentRevision,
+    message: draft.message,
+    items: draft.items,
+  }));
+}
+
+export function cleanupReviewDrafts(
+  storage: ReviewDraftStorage,
+  terminalRequestIds: ReadonlySet<string>,
+): void {
+  if (storage.length === undefined || storage.key === undefined) {
+    return;
+  }
+  const keys = Array.from(
+    { length: storage.length },
+    (_, index) => storage.key?.(index) ?? null,
+  );
+  for (const key of keys) {
+    if (
+      key?.startsWith(REVIEW_DRAFT_STORAGE_PREFIX) &&
+      terminalRequestIds.has(key.slice(REVIEW_DRAFT_STORAGE_PREFIX.length))
+    ) {
+      storage.removeItem(key);
+    }
+  }
+}
+
+function reviewDraftStorageKey(requestId: string): string {
+  return `${REVIEW_DRAFT_STORAGE_PREFIX}${requestId}`;
+}
+
+const REVIEW_DRAFT_STORAGE_PREFIX = "mdmaid-desk-review-draft:";
+
+function isStoredReviewFeedbackItem(
+  value: unknown,
+): value is ReviewFeedbackItem {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "id",
+      "kind",
+      "path",
+      "hunkId",
+      "line",
+      "side",
+      "message",
+    ]) ||
+    typeof value.id !== "string" ||
+    !/^feedback-[a-f0-9]{20}$/.test(value.id) ||
+    (value.kind !== "feedback" && value.kind !== "todo") ||
+    typeof value.path !== "string" ||
+    !isSafeReviewPath(value.path) ||
+    typeof value.message !== "string" ||
+    value.message.trim() === "" ||
+    value.message.length > 512 ||
+    !isSafeReviewMessage(value.message) ||
+    (value.hunkId !== undefined &&
+      (typeof value.hunkId !== "string" ||
+        !/^hunk-[a-f0-9]{20}$/.test(value.hunkId))) ||
+    (value.line !== undefined &&
+      (typeof value.line !== "number" ||
+        !Number.isSafeInteger(value.line) ||
+        value.line <= 0)) ||
+    (value.side !== undefined && value.side !== "old" && value.side !== "new") ||
+    ((value.line === undefined) !== (value.side === undefined)) ||
+    (value.line !== undefined && value.hunkId === undefined) ||
+    (value.kind === "todo" &&
+      (value.hunkId !== undefined ||
+        value.line !== undefined ||
+        value.side !== undefined))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isSafeReviewMessage(value: string): boolean {
+  return !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+
+function isSafeReviewPath(value: string): boolean {
+  if (
+    value === "" ||
+    value.length > 1_024 ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .replaceAll("\\", "/")
+    .split("/")
+    .every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
 export async function renderMermaidNodes(
   renderer: WebMermaidRenderer,
   nodes: Element[],
@@ -973,6 +1196,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
 async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
@@ -1062,6 +1293,8 @@ async function boot(): Promise<void> {
   let changeReviewView: "diff" | "document" = "diff";
   let feedbackItems: ReviewFeedbackItem[] = [];
   let feedbackDraft: WebFeedbackAnchor | undefined;
+  let feedbackEditingId: string | undefined;
+  let activeReviewDraftId: string | undefined;
   let renderSequence = 0;
   let catalogRefresh = Promise.resolve();
 
@@ -1353,6 +1586,18 @@ async function boot(): Promise<void> {
         );
       }
     }
+    try {
+      cleanupReviewDrafts(
+        localStorage,
+        new Set(
+          reviewRequests
+            .filter(({ status }) => status !== "pending")
+            .map(({ id }) => id),
+        ),
+      );
+    } catch {
+      // An unavailable browser store must not block loading the workspace.
+    }
     render();
     if (openSelected && state.selectedId) {
       await openDocument(state.selectedId, false);
@@ -1385,7 +1630,10 @@ async function boot(): Promise<void> {
     return anchor.path;
   }
 
-  function openFeedbackComposer(anchor: WebFeedbackAnchor): void {
+  function openFeedbackComposer(
+    anchor: WebFeedbackAnchor,
+    item?: ReviewFeedbackItem,
+  ): void {
     if (!state.selectedId || !pendingReviewForDocument(
       state.reviewRequests,
       state.selectedId,
@@ -1393,8 +1641,10 @@ async function boot(): Promise<void> {
       return;
     }
     feedbackDraft = anchor;
+    feedbackEditingId = item?.id;
     reviewFeedbackAnchor.textContent = `Feedback on ${feedbackAnchorLabel(anchor)}`;
-    reviewFeedbackMessage.value = "";
+    reviewFeedbackMessage.value = item?.message ?? "";
+    reviewFeedbackSave.textContent = item ? "update feedback" : "save feedback";
     reviewFeedbackComposer.removeAttribute("hidden");
     reviewFeedbackMessage.focus();
     reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1402,8 +1652,37 @@ async function boot(): Promise<void> {
 
   function closeFeedbackComposer(): void {
     feedbackDraft = undefined;
+    feedbackEditingId = undefined;
     reviewFeedbackMessage.value = "";
+    reviewFeedbackSave.textContent = "save feedback";
     reviewFeedbackComposer.setAttribute("hidden", "");
+  }
+
+  function persistCurrentReviewDraft(
+    current?: WebReviewRequest,
+  ): void {
+    const request = current ?? (state.selectedId
+      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
+      : undefined);
+    if (!request) {
+      return;
+    }
+    try {
+      persistReviewDraft(localStorage, request, {
+        message: reviewResponse.value,
+        items: feedbackItems,
+      });
+    } catch {
+      // An unavailable browser store must not block the review decision.
+    }
+  }
+
+  function clearStoredReviewDraft(requestId: string): void {
+    try {
+      localStorage.removeItem(reviewDraftStorageKey(requestId));
+    } catch {
+      // An unavailable browser store must not block the review decision.
+    }
   }
 
   function renderFeedbackPanel(current: WebReviewRequest | undefined): void {
@@ -1417,23 +1696,43 @@ async function boot(): Promise<void> {
     }
     const pending = current.status === "pending";
     const items = pending ? feedbackItems : current.response?.items ?? [];
-    for (const [index, item] of items.entries()) {
+    for (const item of items) {
       const row = document.createElement("div");
       row.className = "review-feedback-item";
       const content = document.createElement("span");
       content.textContent = `${feedbackAnchorLabel(item)} — ${item.message}`;
       row.append(content);
       if (pending) {
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "action";
+        edit.textContent = "edit";
+        edit.setAttribute("aria-label", `Edit feedback on ${feedbackAnchorLabel(item)}`);
+        edit.addEventListener("click", () => {
+          openFeedbackComposer({
+            path: item.path,
+            ...(item.hunkId === undefined ? {} : { hunkId: item.hunkId }),
+            ...(item.line === undefined ? {} : { line: item.line }),
+            ...(item.side === undefined ? {} : { side: item.side }),
+          }, item);
+        });
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "action";
         remove.textContent = "remove";
         remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
         remove.addEventListener("click", () => {
-          feedbackItems = feedbackItems.filter((_, candidate) => candidate !== index);
+          feedbackItems = removeReviewDraftFeedback({
+            message: reviewResponse.value,
+            items: feedbackItems,
+          }, item.id).items;
+          if (feedbackEditingId === item.id) {
+            closeFeedbackComposer();
+          }
+          persistCurrentReviewDraft(current);
           renderFeedbackPanel(current);
         });
-        row.append(remove);
+        row.append(edit, remove);
       }
       reviewFeedbackList.append(row);
     }
@@ -1450,16 +1749,21 @@ async function boot(): Promise<void> {
       reviewFeedbackMessage.focus();
       return;
     }
-    if (feedbackItems.length >= 32) {
+    if (!feedbackEditingId && feedbackItems.length >= 32) {
       reviewError.textContent = "A review can contain at most 32 feedback items.";
       return;
     }
-    feedbackItems.push({
-      id: `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+    const item: ReviewFeedbackItem = {
+      id: feedbackEditingId ??
+        `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
       kind: "feedback",
       ...feedbackDraft,
       message,
-    });
+    };
+    feedbackItems = upsertReviewDraftFeedback({
+      message: reviewResponse.value,
+      items: feedbackItems,
+    }, item).items;
     reviewError.textContent = "";
     closeFeedbackComposer();
     if (state.selectedId) {
@@ -1467,6 +1771,7 @@ async function boot(): Promise<void> {
         state.reviewRequests,
         state.selectedId,
       );
+      persistCurrentReviewDraft(current);
       renderFeedbackPanel(current);
     }
   }
@@ -1899,6 +2204,7 @@ async function boot(): Promise<void> {
   async function openDocument(id: string, pushHistory = true): Promise<void> {
     if (state.selectedId !== id) {
       feedbackItems = [];
+      activeReviewDraftId = undefined;
       closeFeedbackComposer();
     }
     state.selectedId = id;
@@ -1943,6 +2249,22 @@ async function boot(): Promise<void> {
     reviewRequestMessage.textContent = current.requestMessage;
     reviewError.textContent = "";
     const pending = current.status === "pending";
+    const activation = activateReviewDraft(
+      localStorage,
+      current,
+      activeReviewDraftId,
+    );
+    if (activation) {
+      closeFeedbackComposer();
+      feedbackItems = activation.draft.items;
+      reviewResponse.value = activation.draft.message;
+      activeReviewDraftId = activation.requestId;
+    } else if (!pending) {
+      clearStoredReviewDraft(current.id);
+      feedbackItems = [];
+      activeReviewDraftId = undefined;
+      closeFeedbackComposer();
+    }
     renderFeedbackPanel(current);
     reviewResponse.toggleAttribute("hidden", !pending);
     reviewActions.toggleAttribute("hidden", !pending);
@@ -1971,7 +2293,8 @@ async function boot(): Promise<void> {
     }
     const message = reviewResponse.value;
     const selected = state.documents.find(({ id }) => id === state.selectedId);
-    const validation = outcome !== "changes_requested" && feedbackItems.length > 0
+    const validation = outcome !== "changes_requested" &&
+        outcome !== "approved" && feedbackItems.length > 0
       ? "Request changes or remove the anchored feedback before deciding."
       : selected?.kind === "change-review" && outcome === "approved"
         ? changeReviewApprovalError(renderedChangeReview) ??
@@ -1991,6 +2314,7 @@ async function boot(): Promise<void> {
     ]) {
       button.disabled = true;
     }
+    const responseItems = reviewFeedbackItemsForOutcome(outcome, feedbackItems);
     try {
       const updated = await api<WebReviewRequest>(
         `/api/v1/review-requests/${request.id}/respond`,
@@ -1999,9 +2323,7 @@ async function boot(): Promise<void> {
           body: JSON.stringify({
             outcome,
             message,
-            ...(outcome === "changes_requested" && feedbackItems.length > 0
-              ? { items: feedbackItems }
-              : {}),
+            ...(responseItems === undefined ? {} : { items: responseItems }),
           }),
         },
       );
@@ -2010,6 +2332,8 @@ async function boot(): Promise<void> {
       );
       reviewResponse.value = "";
       feedbackItems = [];
+      clearStoredReviewDraft(request.id);
+      activeReviewDraftId = undefined;
       closeFeedbackComposer();
       render();
       renderReviewPanel(state.selectedId);
@@ -2220,6 +2544,7 @@ async function boot(): Promise<void> {
   );
   reviewFeedbackSave.addEventListener("click", saveFeedback);
   reviewFeedbackCancel.addEventListener("click", closeFeedbackComposer);
+  reviewResponse.addEventListener("input", () => persistCurrentReviewDraft());
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
   document.documentElement.dataset.theme =
