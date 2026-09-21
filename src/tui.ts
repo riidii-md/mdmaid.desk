@@ -269,6 +269,16 @@ export function shouldRefreshTuiReader(
   );
 }
 
+export function completeTuiReviewResponse(state: TuiState): TuiState {
+  return {
+    ...state,
+    reviewComposer: undefined,
+    reader: state.reader
+      ? { ...state.reader, feedbackItems: [] }
+      : undefined,
+  };
+}
+
 export function replaceTuiDocuments(
   state: TuiState,
   documents: PublicDocument[],
@@ -301,15 +311,25 @@ export function replaceTuiDocuments(
   };
   if (next.reader) {
     const readerDocumentId = next.reader.document.id;
+    const previousPendingId = pendingReviewForDocument(
+      state.reviewRequests,
+      readerDocumentId,
+    )?.id;
+    const nextPendingId = pendingReviewForDocument(
+      reviewRequests,
+      readerDocumentId,
+    )?.id;
     const updated = documents.find(({ id }) => id === readerDocumentId);
     if (updated) {
       next = { ...next, reader: { ...next.reader, document: updated } };
     }
-    if (
-      pendingReviewForDocument(reviewRequests, readerDocumentId) ===
-      undefined
-    ) {
-      next = { ...next, reviewComposer: undefined };
+    if (nextPendingId === undefined || previousPendingId !== nextPendingId) {
+      next = {
+        ...next,
+        annotationComposer: undefined,
+        reviewComposer: undefined,
+        reader: { ...next.reader!, feedbackItems: [] },
+      };
     }
   }
   return next;
@@ -560,7 +580,7 @@ export async function runTui(
           message: effect.message,
           ...(effect.items === undefined ? {} : { items: effect.items }),
         });
-        state = { ...state, reviewComposer: undefined };
+        state = completeTuiReviewResponse(state);
       }
       const [documents, workspaces, reviewRequests] = await Promise.all([
         client.listDocuments(),
@@ -1048,6 +1068,7 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     }
     if (
       reviewOutcome !== "changes_requested" &&
+      reviewOutcome !== "approved" &&
       (state.reader?.feedbackItems.length ?? 0) > 0
     ) {
       return {
@@ -1058,7 +1079,8 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         effects: [],
       };
     }
-    const items = reviewOutcome === "changes_requested"
+    const items = reviewOutcome === "changes_requested" ||
+        reviewOutcome === "approved"
       ? state.reader?.feedbackItems ?? []
       : [];
     return {
@@ -2469,11 +2491,18 @@ function reviewFeedbackLines(
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
   const persisted = request?.response?.items ?? [];
-  const items = [...persisted, ...reader.feedbackItems];
   const lines: string[] = [""];
-  if (items.length > 0) {
+  if (persisted.length > 0 || reader.feedbackItems.length > 0) {
     lines.push(theme.accent(theme.styles.bold("FEEDBACK")));
-    for (const item of items) {
+    for (const item of persisted) {
+      const anchor = item.line !== undefined && item.side !== undefined
+        ? `${item.path}:${item.line} (${item.side})`
+        : item.hunkId
+          ? `${item.path}#${item.hunkId}`
+          : item.path;
+      lines.push(`- ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
+    }
+    for (const item of reader.feedbackItems) {
       const anchor = item.line !== undefined && item.side !== undefined
         ? `${item.path}:${item.line} (${item.side})`
         : item.hunkId

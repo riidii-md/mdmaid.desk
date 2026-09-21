@@ -1508,8 +1508,14 @@ function validateRespondToReviewRequestInput(
       "response message or anchored feedback is required for requested changes",
     );
   }
-  if (items.length > 0 && input.outcome !== "changes_requested") {
-    throw new Error("feedback items require a changes_requested outcome");
+  if (
+    items.length > 0 &&
+    input.outcome !== "changes_requested" &&
+    input.outcome !== "approved"
+  ) {
+    throw new Error(
+      "feedback items require an approved or changes_requested outcome",
+    );
   }
   return {
     outcome: input.outcome,

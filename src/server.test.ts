@@ -357,16 +357,18 @@ test("returns a bounded native diff model for change-review documents", async ()
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          outcome: "changes_requested",
-          message: "Address the anchored feedback.",
+          outcome: "approved",
+          message: "Approved with a non-blocking comment.",
           items: [feedback],
         }),
       },
     );
     assert.equal(responded.status, 200);
     const responseBody = (await responded.json()) as {
-      data: { response: { items: unknown[] } };
+      data: { status: string; response: { outcome: string; items: unknown[] } };
     };
+    assert.equal(responseBody.data.status, "approved");
+    assert.equal(responseBody.data.response.outcome, "approved");
     assert.deepEqual(responseBody.data.response.items, [feedback]);
   } finally {
     await closeFixture(value);
@@ -1429,6 +1431,8 @@ test("serves the browser workspace and local visual assets", async () => {
     const appText = await app.text();
     assert.match(appText, /mdmaid\.desk web client/);
     assert.match(appText, /Line feedback: click \+ beside a line number\./);
+    assert.match(appText, /mdmaid-desk-review-draft:/);
+    assert.match(appText, /update feedback/);
     assert.match(appText, /requestDocumentPrint\(window\)/);
 
     const mermaid = await fetch(

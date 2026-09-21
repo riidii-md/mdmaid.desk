@@ -1338,12 +1338,13 @@ test("persists structured file, hunk, line, and todo feedback", async () => {
 
   await assert.rejects(
     catalog.respondToReviewRequest(request.id, {
-      outcome: "approved",
-      message: "Looks good.",
+      outcome: "rejected",
+      message: "Do not publish.",
       items,
     }),
-    /feedback items require a changes_requested outcome/,
+    /feedback items require an approved or changes_requested outcome/,
   );
+
   await assert.rejects(
     catalog.respondToReviewRequest(request.id, {
       outcome: "changes_requested",
@@ -1360,6 +1361,43 @@ test("persists structured file, hunk, line, and todo feedback", async () => {
   });
   assert.deepEqual(anchoredOnly.response?.items, items);
   assert.equal(anchoredOnly.response?.message, "");
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getReviewRequest(request.id)?.response?.items, items);
+  restored.close();
+});
+
+test("persists anchored feedback as non-blocking approval comments", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "approved-feedback.md");
+  await writeFile(documentPath, "# Approved feedback\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Approved feedback",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review this exact implementation.",
+  });
+  const items = [{
+    id: "feedback-44444444444444444444",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    message: "Approved, but consider simplifying this later.",
+  }];
+
+  const approved = await catalog.respondToReviewRequest(request.id, {
+    outcome: "approved",
+    message: "Safe to publish.",
+    items,
+  });
+  assert.equal(approved.status, "approved");
+  assert.deepEqual(approved.response?.items, items);
   catalog.close();
 
   const restored = await Catalog.open(statePath, { legacyStatePath: false });

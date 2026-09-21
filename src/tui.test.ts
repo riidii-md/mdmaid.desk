@@ -21,6 +21,7 @@ import {
   applyTuiReader,
   applyTuiMissingReader,
   createTuiState,
+  completeTuiReviewResponse,
   groupTuiQueue,
   handleTuiKey,
   handleTuiMouse,
@@ -562,8 +563,10 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   assert.equal(state.reader?.feedbackItems[1]?.hunkId, undefined);
 
   state = handleTuiKey(state, "y").state;
-  assert.equal(state.reviewComposer, undefined);
-  assert.match(state.message ?? "", /remove the open feedback/i);
+  assert.equal(state.reviewComposer?.outcome, "approved");
+  assert.equal(state.reviewComposer?.items.length, 2);
+
+  state = handleTuiKey(state, "escape").state;
 
   state = handleTuiKey(state, "z").state;
   assert.equal(state.reader?.feedbackItems.length, 1);
@@ -595,6 +598,76 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
       : undefined,
     "Also simplify the retry branch.",
   );
+});
+
+test("clears submitted TUI feedback and renders approved items as history", () => {
+  const changeReview: PublicDocument = {
+    ...documents[0]!,
+    id: "doc-33333333333333333333",
+    kind: "change-review",
+    title: "Authentication refactor",
+    attention: "approval",
+  };
+  const item = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-22222222222222222222",
+    line: 1,
+    side: "new" as const,
+    message: "Use the constant-time helper.",
+  };
+  const request: PublicReviewRequest = {
+    ...reviewRequests[0]!,
+    documentId: changeReview.id,
+    documentRevision: changeReview.revision,
+    status: "approved",
+    response: {
+      outcome: "approved",
+      message: "Approved with context.",
+      items: [item],
+      createdAt: "2026-08-19T10:05:00.000Z",
+    },
+  };
+  const diff = parseChangeReviewDiffs([
+    "```diff",
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -1 +1 @@",
+    "-return token == expected;",
+    "+return token === expected;",
+    "```",
+  ].join("\n"));
+  let state = applyTuiReader(
+    createTuiState([changeReview], [workspaces[0]!], [request]),
+    changeReview,
+    "Rendered narrative",
+    "beautiful-mermaid",
+    [],
+    diff,
+  );
+  state = {
+    ...state,
+    reader: state.reader
+      ? { ...state.reader, feedbackItems: [item] }
+      : undefined,
+    reviewComposer: {
+      requestId: request.id,
+      outcome: "approved",
+      message: "Approved with context.",
+      items: [item],
+    },
+  };
+
+  state = completeTuiReviewResponse(state);
+
+  assert.deepEqual(state.reader?.feedbackItems, []);
+  assert.equal(state.reviewComposer, undefined);
+  const frame = renderTui(state, 130, 32);
+  assert.equal(frame.match(/Use the constant-time helper\./g)?.length, 1);
+  assert.doesNotMatch(frame, /\[ \] feedback · Use the constant-time helper\./);
+  assert.match(frame, /- feedback · Use the constant-time helper\./);
 });
 
 test("supports mouse navigation, direct actions, wheel, and page scrolling", () => {
@@ -757,6 +830,75 @@ test("preserves selection and allows only safe document styling", () => {
     unicode: false,
   });
   assert.doesNotMatch(plainAsciiFrame, /\u001b|[┌┐└┘─│●◐✓]/);
+});
+
+test("drops TUI draft feedback when the pending review changes externally", () => {
+  const item = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    message: "Draft feedback",
+  };
+  const base = applyTuiReader(
+    createTuiState(documents, workspaces, reviewRequests),
+    documents[0]!,
+    "Rendered plan.",
+    "beautiful-mermaid",
+    [],
+  );
+  const editing = {
+    ...base,
+    reader: base.reader
+      ? { ...base.reader, feedbackItems: [item] }
+      : undefined,
+    annotationComposer: {
+      kind: "feedback" as const,
+      path: item.path,
+      message: item.message,
+    },
+    reviewComposer: {
+      requestId: reviewRequests[0]!.id,
+      outcome: "approved" as const,
+      message: "",
+      items: [item],
+    },
+  };
+  const terminal: PublicReviewRequest = {
+    ...reviewRequests[0]!,
+    status: "approved",
+    response: {
+      outcome: "approved",
+      message: "",
+      items: [item],
+      createdAt: "2026-08-19T10:05:00.000Z",
+    },
+  };
+  const replacement: PublicReviewRequest = {
+    ...reviewRequests[0]!,
+    id: "review-22222222222222222222",
+  };
+
+  const unchanged = replaceTuiDocuments(
+    editing,
+    documents,
+    workspaces,
+    reviewRequests,
+  );
+  assert.deepEqual(unchanged.reader?.feedbackItems, [item]);
+  assert.deepEqual(unchanged.annotationComposer, editing.annotationComposer);
+  assert.deepEqual(unchanged.reviewComposer, editing.reviewComposer);
+
+  for (const requests of [[terminal], [replacement]]) {
+    const refreshed = replaceTuiDocuments(
+      editing,
+      documents,
+      workspaces,
+      requests,
+    );
+    assert.deepEqual(refreshed.reader?.feedbackItems, []);
+    assert.equal(refreshed.annotationComposer, undefined);
+    assert.equal(refreshed.reviewComposer, undefined);
+  }
 });
 
 test("removes empty projects and clears their active TUI filter", () => {

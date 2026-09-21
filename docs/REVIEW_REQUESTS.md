@@ -104,11 +104,13 @@ List filters:
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
 `requestMessage`. Response accepts `outcome` (`approved`, `changes_requested`,
 `rejected`, or `superseded`), `message`, and optional `items`.
-Items are available only for `changes_requested`: a `feedback` item identifies
-a safe relative `path`, optionally a stable `hunkId`, and optionally a paired
-`line` plus `side` (`old` or `new`). A path-only feedback item is file-level;
-a line anchor must also identify its hunk. Legacy file-level `todo` items remain
-accepted. All items carry an ID and bounded plain-text message. Unknown
+Items are available for `approved` and `changes_requested` outcomes. On an
+approval they are non-blocking comments; on requested changes they identify
+work that must be addressed. A `feedback` item identifies a safe relative
+`path`, optionally a stable `hunkId`, and optionally a paired `line` plus
+`side` (`old` or `new`). A path-only feedback item is file-level; a line anchor
+must also identify its hunk. Legacy file-level `todo` items remain accepted.
+All items carry an ID and bounded plain-text message. Unknown
 fields, unknown enum values, unsafe paths or control data, malformed anchors,
 and oversized messages are rejected. The first valid response wins atomically.
 An identical retry returns the stored result, while a different retry receives
@@ -167,9 +169,11 @@ while preserving the red/green line backgrounds and intra-line emphasis.
 Use `f` for feedback on the selected line, `t` for feedback on the current
 file, and `z` to undo the latest unsent note. The browser exposes equivalent
 controls: click the visible `+` beside a line number or **feedback on file**.
-Request Changes stores all anchored notes as response `items` and keeps the
-general note separate; open notes block Approve, Reject, and Supersede so they
-cannot be discarded accidentally. A
+Approve and Request Changes store all anchored notes as response `items` and
+keep the general note separate. Approval makes the notes non-blocking; Request
+Changes makes them required work. Browser drafts survive reload for the exact
+pending review and expose Edit and Remove controls. Open notes still block
+Reject and Supersede so they cannot be discarded accidentally. A
 Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
 
