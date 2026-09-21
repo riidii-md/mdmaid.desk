@@ -1,6 +1,6 @@
 {
   "name": "mdmaid-desk",
-  "version": "0.1.25",
+  "version": "0.1.26",
   "type": "module",
   "description": "Persistent local document inbox and reading workspace for Markdown artifacts",
   "keywords": [
