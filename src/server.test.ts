@@ -1108,6 +1108,8 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(pageContent, /id="change-review-viewer"/);
     assert.match(pageContent, /id="change-file-list"/);
     assert.match(pageContent, /id="change-layout"/);
+    assert.doesNotMatch(pageContent, /id="change-hunk-previous"/);
+    assert.doesNotMatch(pageContent, /id="change-hunk-next"/);
     assert.match(pageContent, /id="change-view-document"/);
     assert.match(pageContent, /id="copy-link"/);
     assert.match(pageContent, /id="review-panel"/);

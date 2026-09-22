@@ -1246,8 +1246,6 @@ async function boot(): Promise<void> {
   const changePosition = element("change-position");
   const changeFilePrevious = element("change-file-previous") as HTMLButtonElement;
   const changeFileNext = element("change-file-next") as HTMLButtonElement;
-  const changeHunkPrevious = element("change-hunk-previous") as HTMLButtonElement;
-  const changeHunkNext = element("change-hunk-next") as HTMLButtonElement;
   const changeLayout = element("change-layout") as HTMLButtonElement;
   const changeViewDiff = element("change-view-diff") as HTMLButtonElement;
   const changeViewDocument = element("change-view-document") as HTMLButtonElement;
@@ -1288,7 +1286,6 @@ async function boot(): Promise<void> {
   let renderedRevision: number | undefined;
   let renderedChangeReview: ChangeReviewDiff | undefined;
   let changeFileIndex = 0;
-  let changeHunkIndex = 0;
   let changeReviewLayout: "unified" | "side-by-side" = "side-by-side";
   let changeReviewView: "diff" | "document" = "diff";
   let feedbackItems: ReviewFeedbackItem[] = [];
@@ -1797,12 +1794,6 @@ async function boot(): Promise<void> {
     }
     changeFileIndex = clamp(changeFileIndex, 0, review.files.length - 1);
     const file = review.files[changeFileIndex]!;
-    changeHunkIndex = clamp(
-      changeHunkIndex,
-      0,
-      Math.max(0, file.hunks.length - 1),
-    );
-    const hunk = file.hunks[changeHunkIndex];
     changeFileList.replaceChildren();
     review.files.forEach((candidate, index) => {
       const button = document.createElement("button");
@@ -1812,22 +1803,16 @@ async function boot(): Promise<void> {
       button.textContent = `${changeStatusSymbol(candidate.status)} ${candidate.path}`;
       button.addEventListener("click", () => {
         changeFileIndex = index;
-        changeHunkIndex = 0;
         renderChangeReview();
       });
       changeFileList.append(button);
     });
     changeFilePrevious.disabled = changeFileIndex === 0;
     changeFileNext.disabled = changeFileIndex === review.files.length - 1;
-    changeHunkPrevious.disabled = !hunk || changeHunkIndex === 0;
-    changeHunkNext.disabled = !hunk || changeHunkIndex === file.hunks.length - 1;
     changeLayout.textContent = changeReviewLayout === "side-by-side"
       ? "side-by-side"
       : "unified";
-    changePosition.textContent = [
-      `file ${changeFileIndex + 1}/${review.files.length}`,
-      `hunk ${hunk ? changeHunkIndex + 1 : 0}/${file.hunks.length}`,
-    ].join(" · ");
+    changePosition.textContent = `file ${changeFileIndex + 1}/${review.files.length}`;
     changeDiffStage.replaceChildren();
     for (const warning of review.warnings) {
       const warningElement = document.createElement("p");
@@ -1864,48 +1849,60 @@ async function boot(): Promise<void> {
       feedbackHint.textContent = WEB_LINE_FEEDBACK_HINT;
       changeDiffStage.append(feedbackHint);
     }
-    if (!hunk) {
+    if (file.hunks.length === 0) {
       const emptyHunk = document.createElement("p");
       emptyHunk.className = "change-empty";
-      emptyHunk.textContent = "No text hunks. This is a binary or mode-only change.";
+      emptyHunk.textContent = "No text changes. This is a binary or mode-only change.";
       changeDiffStage.append(emptyHunk);
       return;
     }
-    const hunkHeader = document.createElement("div");
-    hunkHeader.className = "change-hunk-header";
-    hunkHeader.textContent = hunk.header;
-    changeDiffStage.append(hunkHeader);
-    const table = document.createElement("div");
-    table.className = `native-diff ${changeReviewLayout}`;
-    if (changeReviewLayout === "side-by-side") {
-      const labels = document.createElement("div");
-      labels.className = "diff-labels";
-      const oldLabel = document.createElement("span");
-      oldLabel.textContent = "old";
-      const newLabel = document.createElement("span");
-      newLabel.textContent = "new";
-      labels.append(oldLabel, newLabel);
-      table.append(labels);
-      for (const row of webDiffRows(hunk)) {
-        const rowElement = document.createElement("div");
-        rowElement.className = "diff-row";
-        rowElement.append(
-          renderDiffCell(row.old, file.path, hunk.id, "old"),
-          renderDiffCell(row.new, file.path, hunk.id, "new"),
-        );
-        table.append(rowElement);
-      }
-    } else {
-      for (const row of webDiffRows(hunk)) {
-        if (row.old?.kind === "context") {
-          table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path, hunk.id));
-        } else {
-          if (row.old) table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
-          if (row.new) table.append(renderUnifiedCell(row.new, row.new.line, file.path, hunk.id));
+    for (const hunk of file.hunks) {
+      const region = document.createElement("section");
+      region.className = "change-region";
+      const regionHeader = document.createElement("div");
+      regionHeader.className = "change-region-header";
+      regionHeader.textContent = hunk.header;
+      region.append(regionHeader);
+      const table = document.createElement("div");
+      table.className = `native-diff ${changeReviewLayout}`;
+      if (changeReviewLayout === "side-by-side") {
+        const labels = document.createElement("div");
+        labels.className = "diff-labels";
+        const oldLabel = document.createElement("span");
+        oldLabel.textContent = "old";
+        const newLabel = document.createElement("span");
+        newLabel.textContent = "new";
+        labels.append(oldLabel, newLabel);
+        table.append(labels);
+        for (const row of webDiffRows(hunk)) {
+          const rowElement = document.createElement("div");
+          rowElement.className = "diff-row";
+          rowElement.append(
+            renderDiffCell(row.old, file.path, hunk.id, "old"),
+            renderDiffCell(row.new, file.path, hunk.id, "new"),
+          );
+          table.append(rowElement);
+        }
+      } else {
+        for (const row of webDiffRows(hunk)) {
+          if (row.old?.kind === "context") {
+            table.append(renderUnifiedCell(
+              row.old,
+              row.new?.line ?? null,
+              file.path,
+              hunk.id,
+            ));
+          } else {
+            if (row.old) table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
+            if (row.new) {
+              table.append(renderUnifiedCell(row.new, row.new.line, file.path, hunk.id));
+            }
+          }
         }
       }
+      region.append(table);
+      changeDiffStage.append(region);
     }
-    changeDiffStage.append(table);
   }
 
   function renderDiffCell(
@@ -2104,7 +2101,6 @@ async function boot(): Promise<void> {
       setMissingReader(false);
       renderedChangeReview = rendered.changeReview;
       changeFileIndex = 0;
-      changeHunkIndex = 0;
       changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
       documentRendered = true;
@@ -2464,20 +2460,10 @@ async function boot(): Promise<void> {
   });
   changeFilePrevious.addEventListener("click", () => {
     changeFileIndex -= 1;
-    changeHunkIndex = 0;
     renderChangeReview();
   });
   changeFileNext.addEventListener("click", () => {
     changeFileIndex += 1;
-    changeHunkIndex = 0;
-    renderChangeReview();
-  });
-  changeHunkPrevious.addEventListener("click", () => {
-    changeHunkIndex -= 1;
-    renderChangeReview();
-  });
-  changeHunkNext.addEventListener("click", () => {
-    changeHunkIndex += 1;
     renderChangeReview();
   });
   changeLayout.addEventListener("click", () => {
