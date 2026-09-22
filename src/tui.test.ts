@@ -522,6 +522,23 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   state = handleTuiKey(state, "n").state;
   assert.equal(state.reader?.changeFileIndex, 1);
   assert.match(renderTui(state, 130, 32), /test\/auth\.test\.ts/);
+  state = handleTuiKey(state, "v").state;
+  assert.equal(state.reader?.changeRangeStartIndex, 0);
+  state = handleTuiKey(state, "j").state;
+  state = handleTuiKey(state, "f").state;
+  assert.equal(state.annotationComposer?.line, 4);
+  assert.equal(state.annotationComposer?.endLine, 5);
+  assert.equal(state.annotationComposer?.side, "new");
+  for (const key of "Keep this assertion block together.") {
+    state = handleTuiKey(state, key).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.feedbackItems[0]?.endLine, 5);
+  assert.match(
+    renderTui(state, 130, 40),
+    /expect\(expired\).*Keep this assertion block together\..*FEEDBACK/s,
+  );
+  state = handleTuiKey(state, "z").state;
   state = handleTuiKey(state, "p").state;
   assert.equal(state.reader?.changeFileIndex, 0);
   state = handleTuiKey(state, "j").state;

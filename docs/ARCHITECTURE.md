@@ -107,7 +107,8 @@ render response and is not stored as a second approval identity.
 Approved and requested-change responses may include bounded structured
 feedback items. Approval treats them as non-blocking comments.
 `feedback` items require a safe relative file path and may add a stable hunk ID
-or a hunk plus line/side anchor; path-only items are file-level. Legacy `todo`
+or a hunk plus line/side anchor with an optional inclusive same-side `endLine`;
+path-only items are file-level. Legacy `todo`
 items require a file path and deliberately have no finer anchor. Items are stored
 atomically with the immutable response. Draft TUI notes stay in the current
 reader session until the human submits Request Changes.

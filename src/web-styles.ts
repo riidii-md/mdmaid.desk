@@ -458,6 +458,11 @@ button.diff-line-number:focus-visible {
   color: var(--ink);
   outline: 1px solid var(--reading);
 }
+button.diff-line-number.selected-range {
+  background: var(--reading-soft);
+  color: var(--ink);
+  box-shadow: inset 3px 0 0 var(--reading);
+}
 .diff-cell.addition, .diff-unified-line.addition { background: var(--diff-add); }
 .diff-cell.deletion, .diff-unified-line.deletion { background: var(--diff-delete); }
 .diff-cell.context, .diff-unified-line.context { background: var(--surface); }
@@ -478,6 +483,42 @@ button.diff-line-number:focus-visible {
 .native-diff .syntax-property { color: var(--syntax-property); }
 .native-diff .syntax-string { color: var(--syntax-string); }
 .native-diff .syntax-type { color: var(--syntax-type); }
+.diff-inline-feedback {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 100%;
+  padding: 10px 12px 10px 10ch;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  background: var(--accent-soft);
+  white-space: normal;
+}
+.diff-inline-feedback strong { font-size: 10px; text-transform: uppercase; }
+.diff-inline-feedback p { margin: 5px 0 0; max-width: 90ch; white-space: pre-wrap; }
+.diff-inline-feedback-actions { display: flex; gap: 8px; }
+.review-feedback-composer.diff-inline-composer {
+  min-width: 100%;
+  margin: 0;
+  padding: 10px 12px 12px 10ch;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  border-left: 4px solid var(--reading);
+  background: var(--reading-soft);
+  white-space: normal;
+}
+.diff-inline-composer textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 12px;
+  line-height: 1.5;
+}
+.diff-inline-composer textarea:focus { outline: 2px solid var(--reading); outline-offset: 2px; }
 
 .review-panel {
   margin: 0 0 24px;

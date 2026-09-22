@@ -1540,6 +1540,7 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
         "path",
         "hunkId",
         "line",
+        "endLine",
         "side",
         "message",
       ]) ||
@@ -1558,12 +1559,19 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
         (typeof item.line !== "number" ||
           !Number.isSafeInteger(item.line) ||
           item.line <= 0)) ||
+      (item.endLine !== undefined &&
+        (typeof item.endLine !== "number" ||
+          !Number.isSafeInteger(item.endLine) ||
+          item.endLine <= 0)) ||
       (item.side !== undefined && item.side !== "old" && item.side !== "new") ||
       ((item.line === undefined) !== (item.side === undefined)) ||
+      (item.endLine !== undefined &&
+        (item.line === undefined || item.endLine <= item.line)) ||
       (item.line !== undefined && item.hunkId === undefined) ||
       (item.kind === "todo" &&
         (item.hunkId !== undefined ||
           item.line !== undefined ||
+          item.endLine !== undefined ||
           item.side !== undefined))
     ) {
       throw new Error("invalid review feedback item");
@@ -1571,6 +1579,7 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
     const message = normalizeReviewMessage(item.message);
     const hunkId = item.hunkId;
     const line = item.line;
+    const endLine = item.endLine;
     const side = item.side;
     return {
       id: item.id,
@@ -1578,6 +1587,7 @@ function validateReviewFeedbackItems(value: unknown): ReviewFeedbackItem[] {
       path: item.path,
       ...(typeof hunkId === "string" ? { hunkId } : {}),
       ...(typeof line === "number" ? { line } : {}),
+      ...(typeof endLine === "number" ? { endLine } : {}),
       ...(side === "old" || side === "new" ? { side } : {}),
       message,
     };

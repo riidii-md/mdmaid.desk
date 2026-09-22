@@ -485,11 +485,21 @@ function isReviewFeedbackItem(value: unknown): boolean {
     (typeof value.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(value.hunkId));
   const validLine = value.line === undefined ||
     (typeof value.line === "number" && Number.isSafeInteger(value.line) && value.line > 0);
+  const validEndLine = value.endLine === undefined ||
+    (typeof value.endLine === "number" &&
+      Number.isSafeInteger(value.endLine) &&
+      value.endLine > 0);
   const validSide = value.side === undefined || value.side === "old" || value.side === "new";
+  const validRange = value.endLine === undefined ||
+    (typeof value.line === "number" &&
+      typeof value.endLine === "number" &&
+      value.endLine > value.line);
   if (
     !validHunk ||
     !validLine ||
+    !validEndLine ||
     !validSide ||
+    !validRange ||
     (value.line === undefined) !== (value.side === undefined) ||
     (value.line !== undefined && value.hunkId === undefined)
   ) {
@@ -497,7 +507,8 @@ function isReviewFeedbackItem(value: unknown): boolean {
   }
   return value.kind === "feedback" ||
     (value.kind === "todo" && value.hunkId === undefined &&
-      value.line === undefined && value.side === undefined);
+      value.line === undefined && value.endLine === undefined &&
+      value.side === undefined);
 }
 
 function isWebRender(value: unknown): value is WebRender {

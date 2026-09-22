@@ -1319,6 +1319,7 @@ test("persists structured file, hunk, line, and todo feedback", async () => {
       path: "src/auth.ts",
       hunkId: "hunk-11111111111111111111",
       line: 14,
+      endLine: 17,
       side: "new" as const,
       message: "Use constant-time comparison here.",
     },
@@ -1350,6 +1351,14 @@ test("persists structured file, hunk, line, and todo feedback", async () => {
       outcome: "changes_requested",
       message: "Address the anchored feedback.",
       items: [{ ...items[0]!, path: "../../private.txt" }],
+    }),
+    /invalid review feedback item/,
+  );
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "Address the anchored feedback.",
+      items: [{ ...items[0]!, endLine: 13 }],
     }),
     /invalid review feedback item/,
   );

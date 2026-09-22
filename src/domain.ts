@@ -59,6 +59,7 @@ export interface ReviewFeedbackItem {
   path: string;
   hunkId?: string;
   line?: number;
+  endLine?: number;
   side?: "old" | "new";
   message: string;
 }

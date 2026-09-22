@@ -369,15 +369,17 @@ The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
 not inject it as HTML or fetch a remote grammar.
 
-Use `f` to attach feedback to the selected line, `t` to add file feedback, and
-`z` to undo the most recent unsent note. In the browser, click the visible `+`
-beside a line number for line feedback or use **feedback on file**. Anchored
-notes become durable structured response items when Approve or Request Changes
+Use `f` to attach feedback to the selected line, or press `v`, move with `j`/`k`,
+and press `f` to comment on a same-side range. Use `t` to add file feedback and
+`z` to undo the most recent unsent note. In the browser, click a visible `+` or
+Shift-click another same-side line to select a range. Anchored comments appear
+inline beside the related diff and in the feedback summary. They become durable
+structured response items when Approve or Request Changes
 is submitted, alongside a separate general note. Approval records them as
 non-blocking comments. Browser drafts survive reload and can be edited or
 removed before submission. `review wait --json` returns their file paths,
-stable hunk IDs, optional line
-and side, kinds, and messages. Open notes prevent accidental Reject or
+stable hunk IDs, optional line, range end, and side, kinds, and messages. Open
+notes prevent accidental Reject or
 Supersede actions. The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings

@@ -54,7 +54,7 @@ export interface WebDiffLineControlModel {
 }
 
 export const WEB_LINE_FEEDBACK_HINT =
-  "Line feedback: click + beside a line number.";
+  "Line feedback: click + beside a line; Shift-click another same-side line for a range.";
 
 export function webDiffLineControlModel(
   line: number | null,
@@ -386,10 +386,11 @@ interface WebState {
   workspaces: WebWorkspace[];
 }
 
-interface WebFeedbackAnchor {
+export interface WebFeedbackAnchor {
   path: string;
   hunkId?: string;
   line?: number;
+  endLine?: number;
   side?: "old" | "new";
 }
 
@@ -690,6 +691,40 @@ export function pendingReviewForDocument(
   );
 }
 
+export function feedbackAnchorLabel(anchor: WebFeedbackAnchor): string {
+  if (anchor.line !== undefined && anchor.side !== undefined) {
+    const lines = anchor.endLine === undefined
+      ? String(anchor.line)
+      : `${anchor.line}-${anchor.endLine}`;
+    return `${anchor.path}:${lines} (${anchor.side})`;
+  }
+  return anchor.hunkId ? `${anchor.path}#${anchor.hunkId}` : anchor.path;
+}
+
+export function feedbackAnchorContainsLine(
+  feedback: WebFeedbackAnchor,
+  anchor: Required<Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">>,
+): boolean {
+  return feedback.path === anchor.path &&
+    feedback.hunkId === anchor.hunkId &&
+    feedback.side === anchor.side &&
+    feedback.line !== undefined &&
+    feedback.line <= anchor.line &&
+    (feedback.endLine ?? feedback.line) >= anchor.line;
+}
+
+export function feedbackEndingAtLine<T extends ReviewFeedbackItem>(
+  items: readonly T[],
+  anchor: Required<Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">>,
+): T[] {
+  return items.filter((item) =>
+    item.path === anchor.path &&
+    item.hunkId === anchor.hunkId &&
+    item.side === anchor.side &&
+    (item.endLine ?? item.line) === anchor.line
+  );
+}
+
 export function reviewResponseError(
   outcome: ReviewOutcome,
   message: string,
@@ -853,6 +888,7 @@ function isStoredReviewFeedbackItem(
       "path",
       "hunkId",
       "line",
+      "endLine",
       "side",
       "message",
     ]) ||
@@ -872,12 +908,19 @@ function isStoredReviewFeedbackItem(
       (typeof value.line !== "number" ||
         !Number.isSafeInteger(value.line) ||
         value.line <= 0)) ||
+    (value.endLine !== undefined &&
+      (typeof value.endLine !== "number" ||
+        !Number.isSafeInteger(value.endLine) ||
+        value.endLine <= 0)) ||
     (value.side !== undefined && value.side !== "old" && value.side !== "new") ||
     ((value.line === undefined) !== (value.side === undefined)) ||
+    (value.endLine !== undefined &&
+      (value.line === undefined || value.endLine <= value.line)) ||
     (value.line !== undefined && value.hunkId === undefined) ||
     (value.kind === "todo" &&
       (value.hunkId !== undefined ||
         value.line !== undefined ||
+        value.endLine !== undefined ||
         value.side !== undefined))
   ) {
     return false;
@@ -1290,6 +1333,7 @@ async function boot(): Promise<void> {
   let changeReviewView: "diff" | "document" = "diff";
   let feedbackItems: ReviewFeedbackItem[] = [];
   let feedbackDraft: WebFeedbackAnchor | undefined;
+  let feedbackRangeStart: WebFeedbackAnchor | undefined;
   let feedbackEditingId: string | undefined;
   let activeReviewDraftId: string | undefined;
   let renderSequence = 0;
@@ -1620,16 +1664,11 @@ async function boot(): Promise<void> {
       : "document";
   }
 
-  function feedbackAnchorLabel(anchor: WebFeedbackAnchor): string {
-    if (anchor.line !== undefined && anchor.side !== undefined) {
-      return `${anchor.path}:${anchor.line} (${anchor.side})`;
-    }
-    return anchor.path;
-  }
-
   function openFeedbackComposer(
     anchor: WebFeedbackAnchor,
     item?: ReviewFeedbackItem,
+    rangeStart: WebFeedbackAnchor = anchor,
+    preserveMessage = false,
   ): void {
     if (!state.selectedId || !pendingReviewForDocument(
       state.reviewRequests,
@@ -1638,17 +1677,26 @@ async function boot(): Promise<void> {
       return;
     }
     feedbackDraft = anchor;
-    feedbackEditingId = item?.id;
+    feedbackRangeStart = rangeStart;
+    if (!preserveMessage) {
+      feedbackEditingId = item?.id;
+    }
     reviewFeedbackAnchor.textContent = `Feedback on ${feedbackAnchorLabel(anchor)}`;
-    reviewFeedbackMessage.value = item?.message ?? "";
-    reviewFeedbackSave.textContent = item ? "update feedback" : "save feedback";
+    if (!preserveMessage) {
+      reviewFeedbackMessage.value = item?.message ?? "";
+    }
+    reviewFeedbackSave.textContent = feedbackEditingId
+      ? "update feedback"
+      : "save feedback";
     reviewFeedbackComposer.removeAttribute("hidden");
+    renderChangeReview();
     reviewFeedbackMessage.focus();
     reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
   function closeFeedbackComposer(): void {
     feedbackDraft = undefined;
+    feedbackRangeStart = undefined;
     feedbackEditingId = undefined;
     reviewFeedbackMessage.value = "";
     reviewFeedbackSave.textContent = "save feedback";
@@ -1687,6 +1735,10 @@ async function boot(): Promise<void> {
     const show = selected?.kind === "change-review" && current !== undefined;
     reviewFeedbackSection.toggleAttribute("hidden", !show);
     reviewFeedbackList.replaceChildren();
+    if (feedbackDraft?.line === undefined) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackSection.append(reviewFeedbackComposer);
+    }
     if (!show || !current) {
       closeFeedbackComposer();
       return;
@@ -1705,11 +1757,13 @@ async function boot(): Promise<void> {
         edit.className = "action";
         edit.textContent = "edit";
         edit.setAttribute("aria-label", `Edit feedback on ${feedbackAnchorLabel(item)}`);
+        edit.setAttribute("aria-label", `Edit feedback on ${feedbackAnchorLabel(item)}`);
         edit.addEventListener("click", () => {
           openFeedbackComposer({
             path: item.path,
             ...(item.hunkId === undefined ? {} : { hunkId: item.hunkId }),
             ...(item.line === undefined ? {} : { line: item.line }),
+            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
             ...(item.side === undefined ? {} : { side: item.side }),
           }, item);
         });
@@ -1717,6 +1771,7 @@ async function boot(): Promise<void> {
         remove.type = "button";
         remove.className = "action";
         remove.textContent = "remove";
+        remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
         remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
         remove.addEventListener("click", () => {
           feedbackItems = removeReviewDraftFeedback({
@@ -1728,6 +1783,7 @@ async function boot(): Promise<void> {
           }
           persistCurrentReviewDraft(current);
           renderFeedbackPanel(current);
+          renderChangeReview();
         });
         row.append(edit, remove);
       }
@@ -1770,6 +1826,7 @@ async function boot(): Promise<void> {
       );
       persistCurrentReviewDraft(current);
       renderFeedbackPanel(current);
+      renderChangeReview();
     }
   }
 
@@ -1823,6 +1880,10 @@ async function boot(): Promise<void> {
     const pendingReview = state.selectedId
       ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
       : undefined;
+    const requests = state.reviewRequests.filter(
+      (request) => request.documentId === state.selectedId,
+    );
+    const currentReview = pendingReview ?? requests[0];
     const heading = document.createElement("header");
     heading.className = "change-file-heading";
     const path = document.createElement("strong");
@@ -1854,8 +1915,12 @@ async function boot(): Promise<void> {
       emptyHunk.className = "change-empty";
       emptyHunk.textContent = "No text changes. This is a binary or mode-only change.";
       changeDiffStage.append(emptyHunk);
+      restoreDetachedFeedbackComposer();
       return;
     }
+    const inlineFeedback = currentReview?.status === "pending"
+      ? feedbackItems
+      : currentReview?.response?.items ?? [];
     for (const hunk of file.hunks) {
       const region = document.createElement("section");
       region.className = "change-region";
@@ -1882,20 +1947,78 @@ async function boot(): Promise<void> {
             renderDiffCell(row.new, file.path, hunk.id, "new"),
           );
           table.append(rowElement);
+          appendInlineFeedback(table, [
+            ...(row.old?.line === null || row.old?.line === undefined
+              ? []
+              : feedbackEndingAtLine(inlineFeedback, {
+                  path: file.path,
+                  hunkId: hunk.id,
+                  line: row.old.line,
+                  side: "old",
+                })),
+            ...(row.new?.line === null || row.new?.line === undefined
+              ? []
+              : feedbackEndingAtLine(inlineFeedback, {
+                  path: file.path,
+                  hunkId: hunk.id,
+                  line: row.new.line,
+                  side: "new",
+                })),
+          ], currentReview?.status === "pending");
+          appendInlineComposer(table, [
+            ...(row.old?.line === null || row.old?.line === undefined
+              ? []
+              : [{ line: row.old.line, side: "old" as const }]),
+            ...(row.new?.line === null || row.new?.line === undefined
+              ? []
+              : [{ line: row.new.line, side: "new" as const }]),
+          ], file.path, hunk.id);
         }
       } else {
         for (const row of webDiffRows(hunk)) {
           if (row.old?.kind === "context") {
-            table.append(renderUnifiedCell(
+            table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path, hunk.id));
+            appendInlineFeedback(table, unifiedLineFeedback(
+              inlineFeedback,
               row.old,
               row.new?.line ?? null,
               file.path,
               hunk.id,
-            ));
+            ), currentReview?.status === "pending");
+            appendInlineComposer(table, [
+              ...(row.old.line === null
+                ? []
+                : [{ line: row.old.line, side: "old" as const }]),
+              ...(row.new?.line === null || row.new?.line === undefined
+                ? []
+                : [{ line: row.new.line, side: "new" as const }]),
+            ], file.path, hunk.id);
           } else {
-            if (row.old) table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
+            if (row.old) {
+              table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
+              appendInlineFeedback(table, unifiedLineFeedback(
+                inlineFeedback,
+                row.old,
+                null,
+                file.path,
+                hunk.id,
+              ), currentReview?.status === "pending");
+              appendInlineComposer(table, row.old.line === null ? [] : [
+                { line: row.old.line, side: "old" },
+              ], file.path, hunk.id);
+            }
             if (row.new) {
               table.append(renderUnifiedCell(row.new, row.new.line, file.path, hunk.id));
+              appendInlineFeedback(table, unifiedLineFeedback(
+                inlineFeedback,
+                row.new,
+                row.new.line,
+                file.path,
+                hunk.id,
+              ), currentReview?.status === "pending");
+              appendInlineComposer(table, row.new.line === null ? [] : [
+                { line: row.new.line, side: "new" },
+              ], file.path, hunk.id);
             }
           }
         }
@@ -1903,6 +2026,109 @@ async function boot(): Promise<void> {
       region.append(table);
       changeDiffStage.append(region);
     }
+    restoreDetachedFeedbackComposer();
+  }
+
+  function restoreDetachedFeedbackComposer(): void {
+    if (feedbackDraft && !reviewFeedbackComposer.isConnected) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackSection.append(reviewFeedbackComposer);
+    }
+  }
+
+  function unifiedLineFeedback(
+    items: readonly ReviewFeedbackItem[],
+    cell: WebDiffCell,
+    newLine: number | null,
+    path: string,
+    hunkId: string,
+  ): ReviewFeedbackItem[] {
+    const oldLine = cell.kind === "addition" ? null : cell.line;
+    const matches = [
+      ...(oldLine === null
+        ? []
+        : feedbackEndingAtLine(items, { path, hunkId, line: oldLine, side: "old" })),
+      ...(newLine === null
+        ? []
+        : feedbackEndingAtLine(items, { path, hunkId, line: newLine, side: "new" })),
+    ];
+    return matches.filter(
+      (item, index) => matches.findIndex((candidate) => candidate.id === item.id) === index,
+    );
+  }
+
+  function appendInlineFeedback(
+    parent: HTMLElement,
+    items: readonly ReviewFeedbackItem[],
+    editable: boolean,
+  ): void {
+    for (const item of items) {
+      const block = document.createElement("div");
+      block.className = "diff-inline-feedback";
+      const content = document.createElement("div");
+      const label = document.createElement("strong");
+      label.textContent = `comment · ${feedbackAnchorLabel(item)}`;
+      const message = document.createElement("p");
+      message.textContent = item.message;
+      content.append(label, message);
+      block.append(content);
+      if (editable) {
+        const actions = document.createElement("div");
+        actions.className = "diff-inline-feedback-actions";
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "action";
+        edit.textContent = "edit";
+        edit.addEventListener("click", () => openFeedbackComposer({
+          path: item.path,
+          ...(item.hunkId === undefined ? {} : { hunkId: item.hunkId }),
+          ...(item.line === undefined ? {} : { line: item.line }),
+          ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          ...(item.side === undefined ? {} : { side: item.side }),
+        }, item));
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "action";
+        remove.textContent = "remove";
+        remove.addEventListener("click", () => {
+          feedbackItems = removeReviewDraftFeedback({
+            message: reviewResponse.value,
+            items: feedbackItems,
+          }, item.id).items;
+          if (feedbackEditingId === item.id) closeFeedbackComposer();
+          persistCurrentReviewDraft();
+          if (state.selectedId) {
+            renderFeedbackPanel(pendingReviewForDocument(
+              state.reviewRequests,
+              state.selectedId,
+            ));
+          }
+          renderChangeReview();
+        });
+        actions.append(edit, remove);
+        block.append(actions);
+      }
+      parent.append(block);
+    }
+  }
+
+  function appendInlineComposer(
+    parent: HTMLElement,
+    endpoints: ReadonlyArray<{ line: number; side: "old" | "new" }>,
+    path: string,
+    hunkId: string,
+  ): void {
+    if (
+      feedbackDraft?.line === undefined ||
+      feedbackDraft.path !== path ||
+      feedbackDraft.hunkId !== hunkId ||
+      !endpoints.some(({ line, side }) =>
+        line === (feedbackDraft?.endLine ?? feedbackDraft?.line) &&
+        side === feedbackDraft?.side
+      )
+    ) return;
+    reviewFeedbackComposer.classList.add("diff-inline-composer");
+    parent.append(reviewFeedbackComposer);
   }
 
   function renderDiffCell(
@@ -1965,15 +2191,41 @@ async function boot(): Promise<void> {
       model.feedbackMarker
     ) {
       value.type = "button";
-      value.title = model.feedbackLabel;
-      value.setAttribute("aria-label", model.feedbackLabel);
+      const clickedAnchor = { ...anchor, line } as Required<
+        Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">
+      >;
+      value.classList.toggle(
+        "selected-range",
+        feedbackDraft !== undefined &&
+          feedbackAnchorContainsLine(feedbackDraft, clickedAnchor),
+      );
+      const feedbackLabel = `${model.feedbackLabel}; Shift-click another line to select a range`;
+      value.title = feedbackLabel;
+      value.setAttribute("aria-label", feedbackLabel);
       const marker = document.createElement("span");
       marker.className = "diff-line-feedback-marker";
       marker.setAttribute("aria-hidden", "true");
       marker.textContent = model.feedbackMarker;
       value.append(marker);
-      value.addEventListener("click", () => {
-        openFeedbackComposer({ ...anchor, line });
+      value.addEventListener("click", (event) => {
+        const rangeStart = feedbackRangeStart;
+        if (
+          event.shiftKey &&
+          rangeStart?.line !== undefined &&
+          rangeStart.path === clickedAnchor.path &&
+          rangeStart.hunkId === clickedAnchor.hunkId &&
+          rangeStart.side === clickedAnchor.side
+        ) {
+          const start = Math.min(rangeStart.line, line);
+          const end = Math.max(rangeStart.line, line);
+          openFeedbackComposer({
+            ...clickedAnchor,
+            line: start,
+            ...(end === start ? {} : { endLine: end }),
+          }, undefined, rangeStart, true);
+          return;
+        }
+        openFeedbackComposer(clickedAnchor, undefined, clickedAnchor);
       });
     }
     return value;
@@ -2333,6 +2585,7 @@ async function boot(): Promise<void> {
       closeFeedbackComposer();
       render();
       renderReviewPanel(state.selectedId);
+      renderChangeReview();
     } catch (error) {
       reviewError.textContent =
         error instanceof Error ? error.message : "Could not submit response";
@@ -2529,7 +2782,10 @@ async function boot(): Promise<void> {
     void respondToReview("superseded"),
   );
   reviewFeedbackSave.addEventListener("click", saveFeedback);
-  reviewFeedbackCancel.addEventListener("click", closeFeedbackComposer);
+  reviewFeedbackCancel.addEventListener("click", () => {
+    closeFeedbackComposer();
+    renderChangeReview();
+  });
   reviewResponse.addEventListener("input", () => persistCurrentReviewDraft());
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
