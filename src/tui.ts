@@ -28,7 +28,12 @@ import {
   type ChangeReviewHunk,
   type ChangeReviewLine,
 } from "./change-review.js";
-import { highlightDiffLine, type WebSyntaxKind } from "./web-client.js";
+import {
+  feedbackAnchorLabel,
+  feedbackEndingAtLine,
+  highlightDiffLine,
+  type WebSyntaxKind,
+} from "./web-client.js";
 
 type TuiMode = "queue" | "reader";
 type StatusFilter = "all" | ReadingStatus;
@@ -51,6 +56,7 @@ interface TuiReader {
   changeFileIndex: number;
   changeHunkIndex: number;
   changeLineIndex: number;
+  changeRangeStartIndex?: number | undefined;
   feedbackItems: ReviewFeedbackItem[];
 }
 
@@ -66,6 +72,7 @@ interface TuiAnnotationComposer {
   path: string;
   hunkId?: string;
   line?: number;
+  endLine?: number;
   side?: "old" | "new";
   message: string;
 }
@@ -446,7 +453,7 @@ export function renderTui(
                     state.reviewRequests,
                     state.reader.document.id,
                   )
-                ? [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["o", "supersede"], ["b", "queue"]]
+                ? [["p/n", "file"], ["j/k", "line"], ["v", "range"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["o", "supersede"], ["b", "queue"]]
                 : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
             : pendingReviewForDocument(
                   state.reviewRequests,
@@ -966,6 +973,21 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         effects: [],
       };
     }
+    if (key === "v" && hunk && hunk.lines.length > 0) {
+      return {
+        state: {
+          ...state,
+          reader: {
+            ...reader,
+            changeRangeStartIndex: reader.changeRangeStartIndex === undefined
+              ? reader.changeLineIndex
+              : undefined,
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
     if ((key === "f" || key === "t") && file) {
       if (key === "f" && !hunk) {
         return { state, effects: [] };
@@ -974,10 +996,33 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       if (key === "f" && !line) {
         return { state, effects: [] };
       }
-      const lineNumber = line?.kind === "deletion" ? line.oldLine : line?.newLine;
+      const selectedLines = key === "f" && hunk && line
+        ? hunk.lines.slice(
+            Math.min(reader.changeRangeStartIndex ?? reader.changeLineIndex, reader.changeLineIndex),
+            Math.max(reader.changeRangeStartIndex ?? reader.changeLineIndex, reader.changeLineIndex) + 1,
+          )
+        : [];
+      const anchors = selectedLines.map(changeLineAnchor);
+      const side = anchors[0]?.side;
+      if (
+        key === "f" &&
+        (anchors.some((anchor) => anchor.line === null) ||
+          anchors.some((anchor) => anchor.side !== side))
+      ) {
+        return {
+          state: { ...state, message: "A feedback range must stay on one diff side." },
+          effects: [],
+        };
+      }
+      const lineNumbers = anchors.flatMap(({ line: value }) =>
+        value === null ? [] : [value]
+      );
+      const lineNumber = lineNumbers.length === 0 ? undefined : Math.min(...lineNumbers);
+      const endLine = lineNumbers.length === 0 ? undefined : Math.max(...lineNumbers);
       return {
         state: {
           ...state,
+          reader: { ...reader, changeRangeStartIndex: undefined },
           annotationComposer: {
             kind: "feedback",
             path: file.path,
@@ -985,7 +1030,8 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
             ...(line && lineNumber !== null && lineNumber !== undefined
               ? {
                   line: lineNumber,
-                  side: line.kind === "deletion" ? "old" as const : "new" as const,
+                  ...(endLine !== undefined && endLine > lineNumber ? { endLine } : {}),
+                  side: side ?? (line.kind === "deletion" ? "old" as const : "new" as const),
                 }
               : {}),
             message: "",
@@ -1246,6 +1292,7 @@ function handleAnnotationComposerKey(
       path: composer.path,
       ...(composer.hunkId === undefined ? {} : { hunkId: composer.hunkId }),
       ...(composer.line === undefined ? {} : { line: composer.line }),
+      ...(composer.endLine === undefined ? {} : { endLine: composer.endLine }),
       ...(composer.side === undefined ? {} : { side: composer.side }),
       message: composer.message.replaceAll("\r", "").trim(),
     };
@@ -1292,6 +1339,7 @@ function moveChangeFile(state: TuiState, amount: number): TuiTransition {
         changeFileIndex,
         changeHunkIndex: 0,
         changeLineIndex: 0,
+        changeRangeStartIndex: undefined,
       },
       scroll: 0,
     },
@@ -1345,6 +1393,9 @@ function moveChangeLine(state: TuiState, amount: number): TuiTransition {
         ...reader,
         changeHunkIndex: hunkIndex,
         changeLineIndex: lineIndex,
+        changeRangeStartIndex: hunkIndex === reader.changeHunkIndex
+          ? reader.changeRangeStartIndex
+          : undefined,
       },
       scroll: 0,
     },
@@ -2208,6 +2259,7 @@ function changeReviewReaderLines(
   const warnings = [...reader.warnings, ...review.warnings];
   const showFiles = width >= 96;
   const diffWidth = showFiles ? width - 29 : width;
+  const inlineFeedback = allReviewFeedbackItems(state);
   const body: string[] = [
     ...(warnings.map((warning) => theme.accent(`warning: ${sanitizeTerminalText(warning)}`))),
     ...(warnings.length > 0 ? [""] : []),
@@ -2226,6 +2278,8 @@ function changeReviewReaderLines(
             borders,
             file.path,
             reader.changeLineIndex,
+            reader.changeRangeStartIndex,
+            inlineFeedback,
           )
         : renderUnifiedHunk(
             hunk,
@@ -2233,6 +2287,8 @@ function changeReviewReaderLines(
             theme,
             file.path,
             reader.changeLineIndex,
+            reader.changeRangeStartIndex,
+            inlineFeedback,
           )
       : []),
     ...reviewFeedbackLines(state, file, hunk, theme),
@@ -2307,6 +2363,8 @@ function renderUnifiedHunk(
   theme: TuiTheme,
   path: string,
   selectedIndex: number,
+  rangeStartIndex: number | undefined,
+  feedbackItems: readonly ReviewFeedbackItem[],
 ): string[] {
   const lines: string[] = [];
   for (let index = 0; index < hunk.lines.length; index += 1) {
@@ -2327,7 +2385,10 @@ function renderUnifiedHunk(
         ),
         width,
         theme,
-        index === selectedIndex,
+        isSelectedChangeLine(index, selectedIndex, rangeStartIndex),
+      ));
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, line, width, theme,
       ));
       lines.push(formatUnifiedLine(
         next,
@@ -2340,7 +2401,10 @@ function renderUnifiedHunk(
         ),
         width,
         theme,
-        index + 1 === selectedIndex,
+        isSelectedChangeLine(index + 1, selectedIndex, rangeStartIndex),
+      ));
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, next, width, theme,
       ));
       index += 1;
       continue;
@@ -2350,7 +2414,10 @@ function renderUnifiedHunk(
       terminalDiffText(path, sanitizeTerminalText(line.text), theme),
       width,
       theme,
-      index === selectedIndex,
+      isSelectedChangeLine(index, selectedIndex, rangeStartIndex),
+    ));
+    lines.push(...terminalInlineFeedbackLines(
+      feedbackItems, path, hunk.id, line, width, theme,
     ));
   }
   return lines;
@@ -2383,6 +2450,8 @@ function renderSideBySideHunk(
   borders: TuiBorders,
   path: string,
   selectedIndex: number,
+  rangeStartIndex: number | undefined,
+  feedbackItems: readonly ReviewFeedbackItem[],
 ): string[] {
   const leftWidth = Math.max(12, Math.floor((width - 1) / 2));
   const rightWidth = Math.max(12, width - leftWidth - 1);
@@ -2434,18 +2503,32 @@ function renderSideBySideHunk(
       leftText,
       leftWidth,
       theme,
-      left !== undefined && hunk.lines.indexOf(left) === selectedIndex,
+      left !== undefined && isSelectedChangeLine(
+        hunk.lines.indexOf(left), selectedIndex, rangeStartIndex,
+      ),
     );
     const rightValue = formatSideBySideCell(
       right,
       rightText,
       rightWidth,
       theme,
-      right !== undefined && hunk.lines.indexOf(right) === selectedIndex,
+      right !== undefined && isSelectedChangeLine(
+        hunk.lines.indexOf(right), selectedIndex, rangeStartIndex,
+      ),
     );
     lines.push(
       `${fitLine(leftValue, leftWidth)}${theme.line(borders.vertical)}${fitLine(rightValue, rightWidth)}`,
     );
+    if (left) {
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, left, width, theme,
+      ));
+    }
+    if (right && right !== left) {
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, right, width, theme,
+      ));
+    }
   }
   return lines;
 }
@@ -2476,6 +2559,71 @@ function formatSideBySideCell(
   return selected ? theme.styles.underline(styled) : styled;
 }
 
+function isSelectedChangeLine(
+  index: number,
+  selectedIndex: number,
+  rangeStartIndex: number | undefined,
+): boolean {
+  return index >= Math.min(rangeStartIndex ?? selectedIndex, selectedIndex) &&
+    index <= Math.max(rangeStartIndex ?? selectedIndex, selectedIndex);
+}
+
+function changeLineAnchor(
+  line: ChangeReviewLine,
+): { line: number | null; side: "old" | "new" } {
+  return line.kind === "deletion"
+    ? { line: line.oldLine, side: "old" }
+    : { line: line.newLine, side: "new" };
+}
+
+function terminalInlineFeedbackLines(
+  items: readonly ReviewFeedbackItem[],
+  path: string,
+  hunkId: string,
+  line: ChangeReviewLine,
+  width: number,
+  theme: TuiTheme,
+): string[] {
+  const matches = [
+    ...(line.oldLine === null
+      ? []
+      : feedbackEndingAtLine(items, {
+          path, hunkId, line: line.oldLine, side: "old",
+        })),
+    ...(line.newLine === null
+      ? []
+      : feedbackEndingAtLine(items, {
+          path, hunkId, line: line.newLine, side: "new",
+        })),
+  ].filter(
+    (item, index, candidates) =>
+      candidates.findIndex((candidate) => candidate.id === item.id) === index,
+  );
+  const rendered: string[] = [];
+  for (const item of matches) {
+    const messageLines = sanitizeTerminalText(item.message).split("\n");
+    const first = messageLines.shift() ?? "";
+    rendered.push(theme.accent(fitLine(
+      `└─ COMMENT ${feedbackAnchorLabel(item)} · ${first}`,
+      width,
+    )));
+    for (const continuation of messageLines) {
+      rendered.push(theme.accent(fitLine(`   ${continuation}`, width)));
+    }
+  }
+  return rendered;
+}
+
+function allReviewFeedbackItems(state: TuiState): ReviewFeedbackItem[] {
+  const reader = state.reader;
+  if (!reader) return [];
+  const requests = state.reviewRequests.filter(
+    (request) => request.documentId === reader.document.id,
+  );
+  const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
+  return [...(request?.response?.items ?? []), ...reader.feedbackItems];
+}
+
 function reviewFeedbackLines(
   state: TuiState,
   file: ChangeReviewFile,
@@ -2495,19 +2643,11 @@ function reviewFeedbackLines(
   if (persisted.length > 0 || reader.feedbackItems.length > 0) {
     lines.push(theme.accent(theme.styles.bold("FEEDBACK")));
     for (const item of persisted) {
-      const anchor = item.line !== undefined && item.side !== undefined
-        ? `${item.path}:${item.line} (${item.side})`
-        : item.hunkId
-          ? `${item.path}#${item.hunkId}`
-          : item.path;
+      const anchor = feedbackAnchorLabel(item);
       lines.push(`- ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
     }
     for (const item of reader.feedbackItems) {
-      const anchor = item.line !== undefined && item.side !== undefined
-        ? `${item.path}:${item.line} (${item.side})`
-        : item.hunkId
-          ? `${item.path}#${item.hunkId}`
-          : item.path;
+      const anchor = feedbackAnchorLabel(item);
       lines.push(`[ ] ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
     }
     lines.push("");
@@ -2527,12 +2667,7 @@ function reviewFeedbackLines(
     );
   }
   if (state.annotationComposer) {
-    const anchor = state.annotationComposer.line !== undefined &&
-        state.annotationComposer.side !== undefined
-      ? `${state.annotationComposer.path}:${state.annotationComposer.line} (${state.annotationComposer.side})`
-      : state.annotationComposer.hunkId
-        ? `${state.annotationComposer.path}#${state.annotationComposer.hunkId}`
-        : state.annotationComposer.path;
+    const anchor = feedbackAnchorLabel(state.annotationComposer);
     lines.push(
       theme.accent(`${state.annotationComposer.kind.toUpperCase()} · ${sanitizeTerminalText(anchor)}`),
       ...sanitizeTerminalText(state.annotationComposer.message || "_").split("\n"),
@@ -2554,7 +2689,7 @@ function reviewFeedbackLines(
   }
   if (!state.annotationComposer && !state.reviewComposer && request?.status === "pending") {
     lines.push(theme.muted(
-      `j/k select line · f line feedback · t file feedback for ${file.path} · c general note + request changes · z undo note`,
+      `j/k select line · v mark range · f line/range feedback · t file feedback for ${file.path} · c general note + request changes · z undo note`,
     ));
   }
   return lines;

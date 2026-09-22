@@ -9,6 +9,9 @@ import {
   documentHistoryState,
   documentFragmentId,
   documentOutline,
+  feedbackAnchorContainsLine,
+  feedbackAnchorLabel,
+  feedbackEndingAtLine,
   filterQueue,
   groupQueue,
   highlightDiffLine,
@@ -515,6 +518,45 @@ test("builds native unified and side-by-side rows with intra-line changes", () =
   assert.equal(rows[0]?.old?.suffix, " expected;");
 });
 
+test("labels feedback ranges and locates their inline endpoint", () => {
+  const range = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-11111111111111111111",
+    line: 14,
+    endLine: 17,
+    side: "new" as const,
+    message: "Extract this validation block.",
+  };
+
+  assert.equal(feedbackAnchorLabel(range), "src/auth.ts:14-17 (new)");
+  assert.equal(feedbackAnchorContainsLine(range, {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "new",
+  }), true);
+  assert.equal(feedbackAnchorContainsLine(range, {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "old",
+  }), false);
+  assert.deepEqual(feedbackEndingAtLine([range], {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 17,
+    side: "new",
+  }), [range]);
+  assert.deepEqual(feedbackEndingAtLine([range], {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "new",
+  }), []);
+});
+
 test("syntax-highlights code diff lines without changing their text", () => {
   const source =
     'const request = await catalog.createReviewRequest({ kind: "change-decision", revision: 3 }); // durable';
@@ -751,6 +793,7 @@ test("round-trips revision-bound review drafts and removes empty drafts", () => 
     path: "src/auth.ts",
     hunkId: "hunk-22222222222222222222",
     line: 14,
+    endLine: 17,
     side: "new" as const,
     message: "Keep this comment after reload.",
   };
@@ -970,7 +1013,7 @@ test("makes pending line feedback an explicit visible action", () => {
   });
   assert.equal(
     WEB_LINE_FEEDBACK_HINT,
-    "Line feedback: click + beside a line number.",
+    "Line feedback: click + beside a line; Shift-click another same-side line for a range.",
   );
 });
 

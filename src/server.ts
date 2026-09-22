@@ -1489,7 +1489,7 @@ function workspaceHtml(pathname: string): string {
             <div id="review-feedback-section" class="review-feedback-section" hidden>
               <div class="review-feedback-heading">
                 <strong>Anchored feedback</strong>
-                <span>Use a file or line control in the native diff.</span>
+                <span>Click a line; Shift-click another line for a range.</span>
               </div>
               <div id="review-feedback-list" class="review-feedback-list"></div>
               <div id="review-feedback-composer" class="review-feedback-composer" hidden>

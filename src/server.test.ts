@@ -347,6 +347,7 @@ test("returns a bounded native diff model for change-review documents", async ()
       path: "src/auth.ts",
       hunkId: body.data.changeReview.files[0]?.hunks[0]?.id,
       line: 1,
+      endLine: 2,
       side: "new",
       message: "Use a constant-time comparison.",
     };
@@ -1430,7 +1431,10 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(app.headers.get("content-type") ?? "", /javascript/);
     const appText = await app.text();
     assert.match(appText, /mdmaid\.desk web client/);
-    assert.match(appText, /Line feedback: click \+ beside a line number\./);
+    assert.match(
+      appText,
+      /Line feedback: click \+ beside a line; Shift-click another same-side line for a range\./,
+    );
     assert.match(appText, /mdmaid-desk-review-draft:/);
     assert.match(appText, /update feedback/);
     assert.match(appText, /requestDocumentPrint\(window\)/);

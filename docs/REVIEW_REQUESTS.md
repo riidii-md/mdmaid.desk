@@ -108,8 +108,9 @@ Items are available for `approved` and `changes_requested` outcomes. On an
 approval they are non-blocking comments; on requested changes they identify
 work that must be addressed. A `feedback` item identifies a safe relative
 `path`, optionally a stable `hunkId`, and optionally a paired `line` plus
-`side` (`old` or `new`). A path-only feedback item is file-level; a line anchor
-must also identify its hunk. Legacy file-level `todo` items remain accepted.
+`side` (`old` or `new`). `endLine` extends a line anchor into an inclusive
+same-side range. A path-only feedback item is file-level; a line or range
+anchor must also identify its hunk. Legacy file-level `todo` items remain accepted.
 All items carry an ID and bounded plain-text message. Unknown
 fields, unknown enum values, unsafe paths or control data, malformed anchors,
 and oversized messages are rejected. The first valid response wins atomically.
@@ -127,6 +128,7 @@ a conflict.
       "path": "src/auth.ts",
       "hunkId": "hunk-44444444444444444444",
       "line": 14,
+      "endLine": 17,
       "side": "new",
       "message": "Use a constant-time comparison."
     },
@@ -166,9 +168,11 @@ unified/side-by-side layout, and `d` for the complete Markdown explanation.
 Both native viewers color common keywords, strings, comments, numbers,
 properties, types, and function calls according to the changed file extension
 while preserving the red/green line backgrounds and intra-line emphasis.
-Use `f` for feedback on the selected line, `t` for feedback on the current
-file, and `z` to undo the latest unsent note. The browser exposes equivalent
-controls: click the visible `+` beside a line number or **feedback on file**.
+Use `f` for feedback on the selected line, or press `v`, move with `j`/`k`, and
+press `f` for a same-side range. Use `t` for feedback on the current file and
+`z` to undo the latest unsent note. In the browser, click a visible `+` or
+Shift-click a second same-side line for a range. Line and range comments render
+inline after their anchor and remain in the feedback summary for management.
 Approve and Request Changes store all anchored notes as response `items` and
 keep the general note separate. Approval makes the notes non-blocking; Request
 Changes makes them required work. Browser drafts survive reload for the exact
