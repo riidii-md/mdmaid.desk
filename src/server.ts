@@ -1466,8 +1466,6 @@ function workspaceHtml(pathname: string): string {
               <div class="change-review-navigation">
                 <button id="change-file-previous" class="action" type="button">← file</button>
                 <button id="change-file-next" class="action" type="button">file →</button>
-                <button id="change-hunk-previous" class="action" type="button">← hunk</button>
-                <button id="change-hunk-next" class="action" type="button">hunk →</button>
               </div>
               <span id="change-position" class="change-position"></span>
               <button id="change-layout" class="action" type="button">side-by-side</button>
