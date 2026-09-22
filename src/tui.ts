@@ -2243,13 +2243,13 @@ function changeReviewReaderLines(
   const fileIndex = clamp(reader.changeFileIndex, 0, review.files.length - 1);
   const file = review.files[fileIndex]!;
   const hunkIndex = clamp(reader.changeHunkIndex, 0, Math.max(0, file.hunks.length - 1));
-  const hunk = file.hunks[hunkIndex];
+  const hunkLabel = `${file.hunks.length} ${file.hunks.length === 1 ? "hunk" : "hunks"}`;
   const header = [
     heading,
     spread(
       theme.muted(sanitizeTerminalText(meta)),
       theme.muted(
-        `${reader.changeLayout.toUpperCase()} · file ${fileIndex + 1}/${review.files.length} · hunk ${Math.min(hunkIndex + 1, file.hunks.length)}/${file.hunks.length}`,
+        `${reader.changeLayout.toUpperCase()} · file ${fileIndex + 1}/${review.files.length} · ${hunkLabel}`,
       ),
       width,
     ),
@@ -2260,6 +2260,31 @@ function changeReviewReaderLines(
   const showFiles = width >= 96;
   const diffWidth = showFiles ? width - 29 : width;
   const inlineFeedback = allReviewFeedbackItems(state);
+  const renderedHunks = file.hunks.flatMap((hunk, index) => [
+    theme.muted(sanitizeTerminalText(hunk.header)),
+    "",
+    ...(reader.changeLayout === "side-by-side"
+      ? renderSideBySideHunk(
+          hunk,
+          diffWidth,
+          theme,
+          borders,
+          file.path,
+          index === hunkIndex ? reader.changeLineIndex : -1,
+          index === hunkIndex ? reader.changeRangeStartIndex : undefined,
+          inlineFeedback,
+        )
+      : renderUnifiedHunk(
+          hunk,
+          diffWidth,
+          theme,
+          file.path,
+          index === hunkIndex ? reader.changeLineIndex : -1,
+          index === hunkIndex ? reader.changeRangeStartIndex : undefined,
+          inlineFeedback,
+        )),
+    ...(index === file.hunks.length - 1 ? [] : [""]),
+  ]);
   const body: string[] = [
     ...(warnings.map((warning) => theme.accent(`warning: ${sanitizeTerminalText(warning)}`))),
     ...(warnings.length > 0 ? [""] : []),
@@ -2267,31 +2292,10 @@ function changeReviewReaderLines(
     ...(file.previousPath
       ? [theme.muted(`renamed from ${sanitizeTerminalText(file.previousPath)}`)]
       : []),
-    hunk ? theme.muted(sanitizeTerminalText(hunk.header)) : theme.muted("No text hunks."),
-    "",
-    ...(hunk
-      ? reader.changeLayout === "side-by-side"
-        ? renderSideBySideHunk(
-            hunk,
-            diffWidth,
-            theme,
-            borders,
-            file.path,
-            reader.changeLineIndex,
-            reader.changeRangeStartIndex,
-            inlineFeedback,
-          )
-        : renderUnifiedHunk(
-            hunk,
-            diffWidth,
-            theme,
-            file.path,
-            reader.changeLineIndex,
-            reader.changeRangeStartIndex,
-            inlineFeedback,
-          )
-      : []),
-    ...reviewFeedbackLines(state, file, hunk, theme),
+    ...(renderedHunks.length > 0
+      ? renderedHunks
+      : [theme.muted("No text hunks."), ""]),
+    ...reviewFeedbackLines(state, file, theme),
   ];
   const available = Math.max(1, height - header.length);
   const maxScroll = Math.max(0, body.length - available);
@@ -2627,7 +2631,6 @@ function allReviewFeedbackItems(state: TuiState): ReviewFeedbackItem[] {
 function reviewFeedbackLines(
   state: TuiState,
   file: ChangeReviewFile,
-  hunk: ChangeReviewHunk | undefined,
   theme: TuiTheme,
 ): string[] {
   const reader = state.reader;

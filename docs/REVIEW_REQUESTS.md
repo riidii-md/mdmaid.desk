@@ -168,8 +168,8 @@ unified/side-by-side layout, and `d` for the complete Markdown explanation.
 Both native viewers color common keywords, strings, comments, numbers,
 properties, types, and function calls according to the changed file extension
 while preserving the red/green line backgrounds and intra-line emphasis.
-The browser shows the complete diff for the selected file in one continuous
-view; the file list controls which changed file is shown.
+The browser and TUI show the complete diff for the selected file in one
+continuous view; the file list controls which changed file is shown.
 Use `f` for feedback on the selected line, or press `v`, move with `j`/`k`, and
 press `f` for a same-side range. Use `t` for feedback on the current file and
 `z` to undo the latest unsent note. In the browser, click a visible `+` beside

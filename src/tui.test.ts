@@ -443,7 +443,7 @@ test("provides a dedicated Change Reviews space", () => {
   assert.match(blocked.message ?? "", /complete native diff/i);
 });
 
-test("navigates a native diff and returns multiple anchored feedback items", () => {
+test("renders a continuous native file diff and returns multiple anchored feedback items", () => {
   const changeReview: PublicDocument = {
     ...documents[0]!,
     id: "doc-44444444444444444444",
@@ -493,6 +493,9 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   assert.match(plainFrame, /src\/auth\.ts/);
   assert.match(plainFrame, /UNIFIED/);
   assert.match(plainFrame, /token === expected/);
+  assert.match(plainFrame, /secureFallback/);
+  assert.match(plainFrame, /2 hunks/);
+  assert.doesNotMatch(plainFrame, /hunk 1\/2/);
   assert.match(plainFrame, /f line feedback/);
   assert.match(frame, /\u001b\[[0-9;]*4m/);
   assert.match(frame, /\u001b\[48;2;/);
@@ -557,6 +560,8 @@ test("navigates a native diff and returns multiple anchored feedback items", () 
   assert.equal(state.reader?.changeLayout, "side-by-side");
   frame = renderTui(state, 130, 32);
   assert.match(frame, /OLD.*NEW/);
+  assert.match(stripVTControlCharacters(frame), /token === expected/);
+  assert.match(stripVTControlCharacters(frame), /secureFallback/);
 
   state = handleTuiKey(state, "f").state;
   assert.equal(state.annotationComposer?.kind, "feedback");
