@@ -389,7 +389,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   font-size: 11px;
   font-weight: 700;
 }
-.change-hunk-header {
+.change-region-header {
   padding: 8px 10px;
   border: 1px solid var(--line);
   background: var(--surface-2);
@@ -397,6 +397,7 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   font-size: 11px;
   white-space: pre-wrap;
 }
+.change-region + .change-region { margin-top: 18px; }
 .change-empty { color: var(--muted); }
 .native-diff {
   min-width: max-content;
