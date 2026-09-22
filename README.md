@@ -362,8 +362,8 @@ continues across hunk boundaries, so every displayed line can receive feedback.
 Changed spans inside paired removed and added lines are emphasized. Binary and
 mode-only files remain visible even when they have no text hunk.
 
-The browser shows the complete diff for the selected file in one continuous
-view. The file list controls which changed file is shown.
+The browser and TUI show the complete diff for the selected file in one
+continuous view. The file list controls which changed file is shown.
 
 The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
