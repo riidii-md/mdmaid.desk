@@ -19,6 +19,7 @@ import {
   isSourceMissing,
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
+  pendingDecisionCount,
   pendingReviewForDocument,
   projectQueueRoute,
   projectQueueSelection,
@@ -204,6 +205,31 @@ test("keeps content mode independent from the Actions intersection", () => {
     }, [pendingReview, changeReviewRequest]).map(({ id }) => id),
     [documents[3]!.id],
   );
+});
+
+test("counts every pending decision across document content types", () => {
+  const changeReviewRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    kind: "change-decision",
+  };
+  const completedRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-33333333333333333333",
+    status: "approved",
+    response: {
+      outcome: "approved",
+      message: "Approved.",
+      createdAt: "2026-08-19T11:00:00.000Z",
+    },
+  };
+
+  assert.equal(
+    pendingDecisionCount([pendingReview, changeReviewRequest, completedRequest]),
+    2,
+  );
+  assert.equal(pendingDecisionCount([completedRequest]), 0);
 });
 
 test("preserves Space, content mode, Actions, and fragments in workspace URLs", () => {

@@ -93,6 +93,8 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await expect(page.getByRole("button", { name: "Open Work plan" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Home notes" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Work implementation" })).toHaveCount(0);
+    await expect(page.locator("#pending-decisions")).toBeVisible();
+    await expect(page.locator("#pending-decisions")).toContainText("waiting for decision = 2");
     await page.locator("a.brand").focus();
     await page.keyboard.press("Tab");
     await expect(page.locator("#project-select")).toBeFocused();
@@ -111,6 +113,7 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await expect(page).toHaveURL(/space=work/);
     await expect(page.getByRole("button", { name: "Open Work plan" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Home notes" })).toHaveCount(0);
+    await expect(page.locator("#pending-decisions")).toContainText("waiting for decision = 2");
 
     await page.locator("#actions-filter").click();
     await expect(page.locator("#actions-filter")).toHaveAttribute("aria-pressed", "true");
@@ -128,6 +131,7 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
 
     await page.locator("#space-select").selectOption("home");
     await expect(page.locator("#document-queue")).not.toContainText("Work implementation");
+    await expect(page.locator("#pending-decisions")).toBeHidden();
     await page.locator("#docs-filter").click();
     await expect(page.getByRole("button", { name: "Open Home notes" })).toHaveCount(0);
     await page.locator('[data-status-filter="all"]').click();
@@ -145,7 +149,7 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await expect(page.locator("#change-reviews-filter")).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator("#actions-filter")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByRole("button", { name: "Open Work implementation" })).toBeVisible();
-    await expect(page.getByRole("status")).toContainText("Work");
+    await expect(page.locator("#live-status")).toContainText("Work");
 
     await page.getByRole("button", { name: "Open Work implementation" }).click();
     await page.locator("#copy-link").click();
@@ -159,7 +163,7 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await expect(page.locator("#document-queue")).not.toContainText("Work implementation");
     await expect(page.locator('#space-select option[value="work"]')).toHaveAttribute("disabled", "");
     await expect(page.locator('#space-select option[value="work"]')).toContainText("unavailable");
-    await expect(page.getByRole("status")).toContainText("space no longer exists");
+    await expect(page.locator("#live-status")).toContainText("space no longer exists");
     await page.locator("#space-select").selectOption("");
     await expect(page).not.toHaveURL(/space=/);
     await expect(page.getByRole("button", { name: "Open Work implementation" })).toBeVisible();

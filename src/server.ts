@@ -1613,6 +1613,7 @@ function workspaceHtml(pathname: string): string {
         </div>
       </nav>
       <div class="top-actions">
+        <span id="pending-decisions" class="pending-decisions" role="status" aria-live="polite" hidden>● waiting for decision = <span id="pending-decisions-count">0</span></span>
         <span id="live-status" class="live offline" role="status" aria-live="polite">○ connecting</span>
         <button id="theme-toggle" class="icon-button" type="button" aria-label="Toggle theme">◐</button>
       </div>

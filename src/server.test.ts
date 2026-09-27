@@ -296,7 +296,12 @@ test("serves top-level content and Space controls with strict query state", asyn
     assert.match(html, /id="change-reviews-filter"[^>]*aria-pressed="false"/);
     assert.match(html, /id="space-select"/);
     assert.match(html, /id="actions-filter"[^>]*aria-pressed="false"/);
+    assert.match(
+      html,
+      /id="pending-decisions"[^>]*role="status"[^>]*hidden[^>]*>[^<]*waiting for decision/,
+    );
     assert.match(html, /id="live-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.ok(html.indexOf('id="pending-decisions"') < html.indexOf('id="live-status"'));
     assert.ok(html.indexOf('id="project-select"') < html.indexOf('id="space-select"'));
     assert.ok(html.indexOf('id="space-select"') < html.indexOf('id="docs-filter"'));
     assert.match(

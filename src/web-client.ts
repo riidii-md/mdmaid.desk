@@ -745,6 +745,12 @@ export function pendingReviewForDocument(
   );
 }
 
+export function pendingDecisionCount(
+  reviewRequests: WebReviewRequest[],
+): number {
+  return reviewRequests.filter(({ status }) => status === "pending").length;
+}
+
 export function feedbackAnchorLabel(anchor: WebFeedbackAnchor): string {
   if (anchor.line !== undefined && anchor.side !== undefined) {
     const lines = anchor.endLine === undefined
@@ -1359,6 +1365,8 @@ async function boot(): Promise<void> {
   const changeReviewsCount = element("change-reviews-count");
   const actionsFilter = element("actions-filter") as HTMLButtonElement;
   const actionsCount = element("actions-count");
+  const pendingDecisions = element("pending-decisions");
+  const pendingDecisionsCount = element("pending-decisions-count");
   const spaceSelect = element("space-select") as HTMLSelectElement;
   const workspace = element("workspace");
   const sidebar = element("sidebar");
@@ -1659,6 +1667,12 @@ async function boot(): Promise<void> {
     }
   }
 
+  function renderPendingDecisions(): void {
+    const count = pendingDecisionCount(state.reviewRequests);
+    pendingDecisionsCount.textContent = String(count);
+    pendingDecisions.toggleAttribute("hidden", count === 0);
+  }
+
   function renderQueue(): void {
     queue.replaceChildren();
     const documents = filterQueue(
@@ -1769,6 +1783,7 @@ async function boot(): Promise<void> {
     sidebar.toggleAttribute("hidden", !readerOpen);
     renderProjects();
     renderStatusCounts();
+    renderPendingDecisions();
     renderGroupingControls();
     renderQueue();
   }

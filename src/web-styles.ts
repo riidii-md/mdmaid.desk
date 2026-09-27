@@ -17,6 +17,7 @@ export const WEB_STYLES = `
   --accent-soft: #ffe0d7;
   --reading: #3569e8;
   --done: #27825c;
+  --waiting: #cc3f82;
   --diff-add: #d4f1dc;
   --diff-add-emphasis: #8fd6a1;
   --diff-delete: #ffd7d0;
@@ -46,6 +47,7 @@ export const WEB_STYLES = `
   --accent-soft: #4a261e;
   --reading: #7ca0ff;
   --done: #69c69a;
+  --waiting: #ff7fba;
   --diff-add: #1e5239;
   --diff-add-emphasis: #347b55;
   --diff-delete: #5c262a;
@@ -158,6 +160,12 @@ button { color: inherit; }
 }
 .project-option[aria-selected="true"]::before { content: "✓ "; }
 .project-options-empty { color: var(--muted); }
+.pending-decisions {
+  color: var(--waiting);
+  font-size: 10px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
 .live { font-size: 10px; color: var(--done); text-transform: uppercase; }
 .live.offline { color: var(--accent); }
 
