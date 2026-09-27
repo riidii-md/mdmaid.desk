@@ -7,6 +7,9 @@ import type {
   ReviewOutcome,
   ReviewRequest,
   ReviewStatus,
+  RepositoryInventoryItem,
+  Space,
+  SpaceMatcher,
 } from "./domain.js";
 import type { ChangeReviewDiff } from "./change-review.js";
 
@@ -20,6 +23,9 @@ export type {
   ReviewStatus,
 };
 export type { ChangeReviewDiff } from "./change-review.js";
+export type PublicSpaceMatcher = SpaceMatcher;
+export type PublicSpace = Space;
+export type PublicRepository = RepositoryInventoryItem;
 
 export interface PublicDocument {
   id: string;
@@ -106,6 +112,7 @@ export interface HealthData {
   service: "mdmaid.desk";
   status: "ok";
   version: number;
+  capabilities?: string[];
 }
 
 export type RenderTarget = "web" | "terminal";

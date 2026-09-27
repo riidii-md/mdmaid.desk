@@ -111,6 +111,65 @@ test("adds a workspace, registers a document, and lists it", async () => {
   catalog.close();
 });
 
+test("manages Spaces from repeatable matcher flags and emits stable JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-spaces-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  await mkdir(workspace);
+  await run([
+    "workspace", "add", workspace, "--id", "example",
+    "--repository", "github.com/acme/product",
+    "--repository-name", "Product",
+  ], output(), output(), { statePath });
+
+  const created = output();
+  assert.equal(await run([
+    "space", "add", "work", "--name", "Work",
+    "--workspace", "example", "--tag", "urgent", "--json",
+  ], created, output(), { statePath }), 0);
+  assert.deepEqual(JSON.parse(created.text()), {
+    schemaVersion: 1,
+    data: {
+      id: "work",
+      name: "Work",
+      matchers: [
+        { kind: "repository", value: "github.com/acme/product" },
+        { kind: "tag", value: "urgent" },
+      ],
+    },
+  });
+
+  const listed = output();
+  assert.equal(await run(["space", "list", "--json"], listed, output(), { statePath }), 0);
+  assert.equal(JSON.parse(listed.text()).data[0].id, "work");
+  assert.equal(await run([
+    "space", "matchers", "set", "work", "--namespace", "github.com/acme",
+  ], output(), output(), { statePath }), 0);
+  assert.equal(await run([
+    "space", "rename", "work", "--name", "Office",
+  ], output(), output(), { statePath }), 0);
+  assert.equal(await run(["space", "delete", "work"], output(), output(), { statePath }), 0);
+});
+
+test("refuses a live daemon without Space capabilities without local fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-old-daemon-"));
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const client = {
+    requireCapabilities: async () => {
+      throw new Error("restart it after upgrading");
+    },
+  } as unknown as DeskApiClient;
+  const stderr = output();
+  assert.equal(await run(
+    ["space", "list"],
+    output(),
+    stderr,
+    { statePath, connectDaemon: async () => client },
+  ), 1);
+  assert.match(stderr.text(), /restart it after upgrading/);
+  await assert.rejects(readFile(statePath), /ENOENT/);
+});
+
 test("preflights Mermaid and returns every issue as JSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-validate-"));
   const documentPath = join(root, "review.md");

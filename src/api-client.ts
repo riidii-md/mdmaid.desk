@@ -5,6 +5,7 @@ import {
   REVIEW_OUTCOMES,
   REVIEW_STATUSES,
 } from "./domain.js";
+import type { ContentScope } from "./domain.js";
 import type {
   DocumentAction,
   DocumentImport,
@@ -12,7 +13,10 @@ import type {
   HealthData,
   PublicDocument,
   PublicProject,
+  PublicRepository,
   PublicReviewRequest,
+  PublicSpace,
+  PublicSpaceMatcher,
   PublicWorkspace,
   RenderTarget,
   TerminalRenderPreferences,
@@ -46,8 +50,16 @@ export class DeskApiError extends Error {
   }
 }
 
+export class DaemonHealthCompatibilityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonHealthCompatibilityError";
+  }
+}
+
+/** @deprecated Catalog invalidations now arrive as an empty object. */
 export interface CatalogEvent {
-  action: string;
+  action?: string;
   documentId?: string;
   revision?: number;
   reviewRequestId?: string;
@@ -83,32 +95,139 @@ export class DeskApiClient {
       authenticated: false,
       ...(signal === undefined ? {} : { signal }),
     });
-    if (!isHealth(value)) {
+    if (!isCoreHealth(value)) {
       throw new Error("Daemon returned an invalid health response");
     }
-    return value;
+    if (
+      value.capabilities !== undefined &&
+      (!Array.isArray(value.capabilities) ||
+        !value.capabilities.every((capability) => typeof capability === "string"))
+    ) {
+      throw new DaemonHealthCompatibilityError(
+        "The running mdmaid.desk daemon has incompatible capabilities; restart it after upgrading",
+      );
+    }
+    return {
+      service: "mdmaid.desk",
+      status: "ok",
+      version: value.version,
+      ...(value.capabilities === undefined
+        ? {}
+        : { capabilities: [...new Set(value.capabilities as string[])] }),
+    };
   }
 
-  async listDocuments(): Promise<PublicDocument[]> {
-    const value = await this.#request("/api/v1/documents");
+  async requireCapabilities(...required: string[]): Promise<void> {
+    const health = await this.health();
+    const capabilities = new Set(health.capabilities ?? []);
+    const missing = required.filter((capability) => !capabilities.has(capability));
+    if (missing.length > 0) {
+      throw new DaemonHealthCompatibilityError(
+        `The running mdmaid.desk daemon does not support ${missing.join(", ")}; restart it after upgrading`,
+      );
+    }
+  }
+
+  async listDocuments(scope: ContentScope = {}): Promise<PublicDocument[]> {
+    const query = new URLSearchParams();
+    if (scope.spaceId !== undefined) {
+      assertSpaceId(scope.spaceId);
+      query.set("space", scope.spaceId);
+    }
+    const suffix = query.size === 0 ? "" : `?${query.toString()}`;
+    const value = await this.#request(`/api/v1/documents${suffix}`);
     if (!Array.isArray(value) || !value.every(isPublicDocument)) {
       throw new Error("Daemon returned an invalid document list");
     }
     return value;
   }
 
-  async listWorkspaces(): Promise<PublicWorkspace[]> {
-    const value = await this.#request("/api/v1/workspaces");
+  async listWorkspaces(scope: ContentScope = {}): Promise<PublicWorkspace[]> {
+    const value = await this.#request(withScope("/api/v1/workspaces", scope));
     if (!Array.isArray(value) || !value.every(isPublicWorkspace)) {
       throw new Error("Daemon returned an invalid workspace list");
     }
     return value;
   }
 
-  async listProjects(): Promise<PublicProject[]> {
-    const value = await this.#request("/api/v1/projects");
+  async listProjects(scope: ContentScope = {}): Promise<PublicProject[]> {
+    const value = await this.#request(withScope("/api/v1/projects", scope));
     if (!Array.isArray(value) || !value.every(isPublicProject)) {
       throw new Error("Daemon returned an invalid project list");
+    }
+    return value;
+  }
+
+  async listSpaces(): Promise<PublicSpace[]> {
+    const value = await this.#request("/api/v1/spaces");
+    if (!Array.isArray(value) || !value.every(isPublicSpace)) {
+      throw new Error("Daemon returned an invalid Space list");
+    }
+    return value;
+  }
+
+  async getSpace(id: string): Promise<PublicSpace> {
+    assertSpaceId(id);
+    const value = await this.#request(`/api/v1/spaces/${encodeURIComponent(id)}`);
+    if (!isPublicSpace(value)) {
+      throw new Error("Daemon returned an invalid Space");
+    }
+    return value;
+  }
+
+  async createSpace(input: PublicSpace): Promise<PublicSpace> {
+    const value = await this.#request("/api/v1/spaces", {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicSpace(value)) {
+      throw new Error("Daemon returned an invalid Space");
+    }
+    return value;
+  }
+
+  async renameSpace(id: string, name: string): Promise<PublicSpace> {
+    assertSpaceId(id);
+    const value = await this.#request(`/api/v1/spaces/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { name },
+    });
+    if (!isPublicSpace(value)) {
+      throw new Error("Daemon returned an invalid Space");
+    }
+    return value;
+  }
+
+  async replaceSpaceMatchers(
+    id: string,
+    matchers: PublicSpaceMatcher[],
+  ): Promise<PublicSpace> {
+    assertSpaceId(id);
+    const value = await this.#request(
+      `/api/v1/spaces/${encodeURIComponent(id)}/matchers`,
+      { method: "PUT", body: { matchers } },
+    );
+    if (!isPublicSpace(value)) {
+      throw new Error("Daemon returned an invalid Space");
+    }
+    return value;
+  }
+
+  async deleteSpace(id: string): Promise<{ id: string }> {
+    assertSpaceId(id);
+    const value = await this.#request(`/api/v1/spaces/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+    if (!isRecord(value) || Object.keys(value).length !== 1 || value.id !== id) {
+      throw new Error("Daemon returned an invalid Space deletion response");
+    }
+    return { id };
+  }
+
+  async listRepositories(): Promise<PublicRepository[]> {
+    const value = await this.#request("/api/v1/repositories");
+    if (!Array.isArray(value) || !value.every(isPublicRepository)) {
+      throw new Error("Daemon returned an invalid repository list");
     }
     return value;
   }
@@ -148,6 +267,7 @@ export class DeskApiClient {
 
   async listReviewRequests(
     filters: { documentId?: string; status?: ReviewStatus } = {},
+    scope: ContentScope = {},
   ): Promise<PublicReviewRequest[]> {
     const query = new URLSearchParams();
     if (filters.documentId !== undefined) {
@@ -160,6 +280,7 @@ export class DeskApiClient {
       }
       query.set("status", filters.status);
     }
+    addScope(query, scope);
     const suffix = query.size === 0 ? "" : `?${query.toString()}`;
     const value = await this.#request(`/api/v1/review-requests${suffix}`);
     if (!Array.isArray(value) || !value.every(isPublicReviewRequest)) {
@@ -168,10 +289,13 @@ export class DeskApiClient {
     return value;
   }
 
-  async getReviewRequest(id: string): Promise<PublicReviewRequest> {
+  async getReviewRequest(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<PublicReviewRequest> {
     assertReviewRequestId(id);
     const value = await this.#request(
-      `/api/v1/review-requests/${encodeURIComponent(id)}`,
+      withScope(`/api/v1/review-requests/${encodeURIComponent(id)}`, scope),
     );
     if (!isPublicReviewRequest(value)) {
       throw new Error("Daemon returned an invalid review request");
@@ -181,8 +305,9 @@ export class DeskApiClient {
 
   async createReviewRequest(
     input: ReviewRequestRegistration,
+    scope: ContentScope = {},
   ): Promise<PublicReviewRequest> {
-    const value = await this.#request("/api/v1/review-requests", {
+    const value = await this.#request(withScope("/api/v1/review-requests", scope), {
       method: "POST",
       body: input,
     });
@@ -195,10 +320,14 @@ export class DeskApiClient {
   async respondToReviewRequest(
     id: string,
     input: ReviewRequestResponse,
+    scope: ContentScope = {},
   ): Promise<PublicReviewRequest> {
     assertReviewRequestId(id);
     const value = await this.#request(
-      `/api/v1/review-requests/${encodeURIComponent(id)}/respond`,
+      withScope(
+        `/api/v1/review-requests/${encodeURIComponent(id)}/respond`,
+        scope,
+      ),
       { method: "POST", body: input },
     );
     if (!isPublicReviewRequest(value)) {
@@ -212,17 +341,21 @@ export class DeskApiClient {
     target: "terminal",
     width?: number,
     preferences?: TerminalRenderPreferences,
+    scope?: ContentScope,
   ): Promise<TerminalRender>;
   async renderDocument(
     id: string,
     target: "web",
     width?: number,
+    preferences?: undefined,
+    scope?: ContentScope,
   ): Promise<WebRender>;
   async renderDocument(
     id: string,
     target: RenderTarget,
     width = 100,
     preferences: TerminalRenderPreferences = {},
+    scope: ContentScope = {},
   ): Promise<TerminalRender | WebRender> {
     assertDocumentId(id);
     if (!Number.isSafeInteger(width) || width < 20 || width > 1_000) {
@@ -238,6 +371,7 @@ export class DeskApiClient {
         query.set("unicode", String(preferences.unicode));
       }
     }
+    addScope(query, scope);
     const value = await this.#request(
       `/api/v1/documents/${encodeURIComponent(id)}/render?${query.toString()}`,
     );
@@ -250,11 +384,45 @@ export class DeskApiClient {
     throw new Error("Daemon returned an invalid render response");
   }
 
-  async act(id: string, action: DocumentAction): Promise<PublicDocument> {
+  async act(
+    id: string,
+    action: DocumentAction,
+    scope: ContentScope = {},
+  ): Promise<PublicDocument> {
     assertDocumentId(id);
     const value = await this.#request(
-      `/api/v1/documents/${encodeURIComponent(id)}/${action}`,
+      withScope(`/api/v1/documents/${encodeURIComponent(id)}/${action}`, scope),
       { method: "POST" },
+    );
+    if (!isPublicDocument(value)) {
+      throw new Error("Daemon returned an invalid document response");
+    }
+    return value;
+  }
+
+  async getDocument(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<PublicDocument> {
+    assertDocumentId(id);
+    const value = await this.#request(
+      withScope(`/api/v1/documents/${encodeURIComponent(id)}`, scope),
+    );
+    if (!isPublicDocument(value)) {
+      throw new Error("Daemon returned an invalid document response");
+    }
+    return value;
+  }
+
+  async setDocumentTags(
+    id: string,
+    tags: string[],
+    scope: ContentScope = {},
+  ): Promise<PublicDocument> {
+    assertDocumentId(id);
+    const value = await this.#request(
+      withScope(`/api/v1/documents/${encodeURIComponent(id)}/tags`, scope),
+      { method: "PUT", body: { tags } },
     );
     if (!isPublicDocument(value)) {
       throw new Error("Daemon returned an invalid document response");
@@ -316,7 +484,7 @@ export class DeskApiClient {
     options: {
       authenticated?: boolean;
       body?: unknown;
-      method?: "GET" | "POST";
+      method?: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
       signal?: AbortSignal;
     } = {},
   ): Promise<unknown> {
@@ -360,13 +528,45 @@ export class DeskApiClient {
   }
 }
 
-function isHealth(value: unknown): value is HealthData {
+function isCoreHealth(
+  value: unknown,
+): value is Omit<HealthData, "capabilities"> & { capabilities?: unknown } {
   return (
     isRecord(value) &&
     value.service === "mdmaid.desk" &&
     value.status === "ok" &&
     typeof value.version === "number"
   );
+}
+
+function isPublicSpaceMatcher(value: unknown): value is PublicSpaceMatcher {
+  return isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    (value.kind === "repository" ||
+      value.kind === "repository-namespace" ||
+      value.kind === "tag") &&
+    typeof value.value === "string";
+}
+
+function isPublicSpace(value: unknown): value is PublicSpace {
+  return isRecord(value) &&
+    Object.keys(value).length === 3 &&
+    typeof value.id === "string" &&
+    /^[a-z0-9][a-z0-9-]{0,63}$/.test(value.id) &&
+    typeof value.name === "string" &&
+    Array.isArray(value.matchers) &&
+    value.matchers.length > 0 &&
+    value.matchers.every(isPublicSpaceMatcher);
+}
+
+function isPublicRepository(value: unknown): value is PublicRepository {
+  return isRecord(value) &&
+    Object.keys(value).length === 4 &&
+    typeof value.key === "string" &&
+    typeof value.name === "string" &&
+    Array.isArray(value.workspaceIds) &&
+    value.workspaceIds.every((id) => typeof id === "string") &&
+    (value.kind === "remote" || value.kind === "local");
 }
 
 function isPublicWorkspace(value: unknown): value is PublicWorkspace {
@@ -594,7 +794,7 @@ function dispatchEventBlock(
     onReady?.();
     return;
   }
-  if (type !== "catalog") {
+  if (type !== "catalog-invalidated") {
     return;
   }
   let value: unknown;
@@ -603,60 +803,10 @@ function dispatchEventBlock(
   } catch {
     throw new Error("Daemon returned an invalid catalog event");
   }
-  const liveSourceAction =
-    isRecord(value) &&
-    (value.action === "source-changed" ||
-      value.action === "source-missing" ||
-      value.action === "source-restored");
-  if (
-    !isRecord(value) ||
-    !Object.keys(value).every((key) =>
-      [
-        "action",
-        "documentId",
-        "revision",
-        "reviewRequestId",
-        "workspaceId",
-      ].includes(key),
-    ) ||
-    typeof value.action !== "string" ||
-    (value.documentId !== undefined &&
-      (typeof value.documentId !== "string" ||
-        !/^doc-[a-f0-9]{20}$/.test(value.documentId))) ||
-    (value.workspaceId !== undefined &&
-      (typeof value.workspaceId !== "string" ||
-        !/^[a-z0-9][a-z0-9-]{0,63}$/.test(value.workspaceId))) ||
-    (value.reviewRequestId !== undefined &&
-      (typeof value.reviewRequestId !== "string" ||
-        !/^review-[a-f0-9]{20}$/.test(value.reviewRequestId))) ||
-    (value.revision !== undefined &&
-      (typeof value.revision !== "number" ||
-        !Number.isSafeInteger(value.revision) ||
-        value.revision < 1)) ||
-    (liveSourceAction &&
-      (value.documentId === undefined || value.revision === undefined)) ||
-    (!liveSourceAction && value.revision !== undefined) ||
-    (value.documentId === undefined &&
-      value.workspaceId === undefined &&
-      value.reviewRequestId === undefined)
-  ) {
+  if (!isRecord(value) || Object.keys(value).length !== 0) {
     throw new Error("Daemon returned an invalid catalog event");
   }
-  listener({
-    action: value.action,
-    ...(value.documentId === undefined
-      ? {}
-      : { documentId: value.documentId as string }),
-    ...(value.revision === undefined
-      ? {}
-      : { revision: value.revision as number }),
-    ...(value.workspaceId === undefined
-      ? {}
-      : { workspaceId: value.workspaceId as string }),
-    ...(value.reviewRequestId === undefined
-      ? {}
-      : { reviewRequestId: value.reviewRequestId as string }),
-  });
+  listener({});
 }
 
 function optionalString(value: unknown): boolean {
@@ -689,4 +839,30 @@ function assertReviewRequestId(id: string): void {
   if (!/^review-[a-f0-9]{20}$/.test(id)) {
     throw new Error("invalid review request id");
   }
+}
+
+function assertSpaceId(id: string): void {
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
+    throw new Error("invalid Space id");
+  }
+}
+
+function addScope(query: URLSearchParams, scope: ContentScope): void {
+  if (
+    !isRecord(scope) ||
+    !Object.keys(scope).every((key) => key === "spaceId") ||
+    (scope.spaceId !== undefined && typeof scope.spaceId !== "string")
+  ) {
+    throw new Error("invalid content scope");
+  }
+  if (scope.spaceId !== undefined) {
+    assertSpaceId(scope.spaceId);
+    query.set("space", scope.spaceId);
+  }
+}
+
+function withScope(path: string, scope: ContentScope): string {
+  const url = new URL(path, "http://mdmaid.desk.localhost");
+  addScope(url.searchParams, scope);
+  return `${url.pathname}${url.search}${url.hash}`;
 }

@@ -118,7 +118,12 @@ test("serves health publicly and protects catalog APIs", async () => {
     const health = await fetch(new URL("/api/v1/health", value.server.url));
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), {
-      data: { service: "mdmaid.desk", status: "ok", version: 1 },
+      data: {
+        service: "mdmaid.desk",
+        status: "ok",
+        version: 1,
+        capabilities: ["spaces-v1", "scoped-content-v1"],
+      },
     });
 
     const unauthorized = await fetch(
@@ -128,6 +133,191 @@ test("serves health publicly and protects catalog APIs", async () => {
     assert.deepEqual(await unauthorized.json(), {
       error: { code: "unauthorized", message: "Authentication required" },
     });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("manages Spaces and exposes only sanitized repository inventory", async () => {
+  const value = await fixture();
+  try {
+    const created = await authorized(value, "/api/v1/spaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "client",
+        name: "Client",
+        matchers: [
+          { kind: "repository-namespace", value: "github.com/riidii-md" },
+          { kind: "tag", value: "architecture" },
+        ],
+      }),
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.headers.get("location"), "/api/v1/spaces/client");
+    assert.deepEqual(await created.json(), {
+      data: {
+        id: "client",
+        name: "Client",
+        matchers: [
+          { kind: "repository-namespace", value: "github.com/riidii-md" },
+          { kind: "tag", value: "architecture" },
+        ],
+      },
+    });
+
+    const renamed = await authorized(value, "/api/v1/spaces/client", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Work" }),
+    });
+    assert.equal(renamed.status, 200);
+    assert.equal(((await renamed.json()) as { data: { name: string } }).data.name, "Work");
+
+    const replaced = await authorized(value, "/api/v1/spaces/client/matchers", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        matchers: [{ kind: "repository", value: "github.com/riidii-md/eywizards" }],
+      }),
+    });
+    assert.equal(replaced.status, 200);
+
+    const listed = await authorized(value, "/api/v1/spaces");
+    assert.equal(listed.status, 200);
+    assert.equal(((await listed.json()) as { data: unknown[] }).data.length, 1);
+
+    const repositories = await authorized(value, "/api/v1/repositories");
+    assert.deepEqual(await repositories.json(), {
+      data: [{
+        key: "github.com/riidii-md/eywizards",
+        name: "EyWizards",
+        workspaceIds: ["example"],
+        kind: "remote",
+      }],
+    });
+    assert.doesNotMatch(JSON.stringify(await (await authorized(value, "/api/v1/repositories")).json()), new RegExp(value.root));
+
+    const invalid = await authorized(value, "/api/v1/spaces/client", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bad", extra: true }),
+    });
+    assert.equal(invalid.status, 422);
+    assert.equal(((await invalid.json()) as { error: { code: string } }).error.code, "validation_error");
+
+    const removed = await authorized(value, "/api/v1/spaces/client", {
+      method: "DELETE",
+    });
+    assert.deepEqual(await removed.json(), { data: { id: "client" } });
+    const missing = await authorized(value, "/api/v1/spaces/client");
+    assert.equal(missing.status, 404);
+    assert.equal(((await missing.json()) as { error: { code: string } }).error.code, "space_not_found");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("applies Space scope uniformly and contains out-of-scope resources", async () => {
+  const value = await fixture();
+  try {
+    value.catalog.createSpace({
+      id: "empty",
+      name: "Empty",
+      matchers: [{ kind: "tag", value: "not-present" }],
+    });
+    const review = await value.catalog.createReviewRequest({
+      documentId: value.document.id,
+      kind: "plan-decision",
+      requestMessage: "Review",
+    });
+    for (const path of [
+      "/api/v1/documents?space=empty",
+      "/api/v1/workspaces?space=empty",
+      "/api/v1/projects?space=empty",
+      "/api/v1/review-requests?space=empty",
+    ]) {
+      const response = await authorized(value, path);
+      assert.equal(response.status, 200, path);
+      assert.deepEqual(await response.json(), { data: [] }, path);
+    }
+    const sourceId = value.document.sourceLinks[0]?.id;
+    assert.ok(sourceId);
+    const reads = [
+      `/api/v1/documents/${value.document.id}?space=empty`,
+      `/api/v1/documents/${value.document.id}/render?target=web&space=empty`,
+      `/d/${value.document.id}/source/${sourceId}?space=empty`,
+      `/api/v1/review-requests/${review.id}?space=empty`,
+    ];
+    for (const path of reads) {
+      const response = await authorized(value, path);
+      assert.equal(response.status, 404, path);
+    }
+    const opened = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/opened?space=empty`,
+      { method: "POST" },
+    );
+    assert.equal(opened.status, 404);
+    assert.equal(value.catalog.getDocument(value.document.id)?.status, "unread");
+
+    const unknown = await authorized(value, "/api/v1/documents?space=missing");
+    assert.equal(unknown.status, 404);
+    assert.equal(((await unknown.json()) as { error: { code: string } }).error.code, "space_not_found");
+    const duplicate = await authorized(value, "/api/v1/documents?space=empty&space=empty");
+    assert.equal(duplicate.status, 400);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("serves top-level content and Space controls with strict query state", async () => {
+  const value = await fixture();
+  try {
+    value.catalog.createSpace({
+      id: "work",
+      name: "Work",
+      matchers: [{ kind: "tag", value: "architecture" }],
+    });
+    const page = await authorized(
+      value,
+      "/?space=work&view=docs&actions=1",
+    );
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /<a class="brand" href="\/">\s*<strong>mdmaid\.desk<\/strong>/);
+    assert.match(
+      html,
+      /id="project-select"[^>]*type="search"[^>]*role="combobox"[^>]*aria-controls="project-options"/,
+    );
+    assert.match(html, /id="project-options"[^>]*role="listbox"/);
+    assert.match(html, /id="project-select"[^>]*placeholder="Search projects…"/);
+    assert.match(html, /id="docs-filter"[^>]*aria-pressed="true"/);
+    assert.match(html, /id="change-reviews-filter"[^>]*aria-pressed="false"/);
+    assert.match(html, /id="space-select"/);
+    assert.match(html, /id="actions-filter"[^>]*aria-pressed="false"/);
+    assert.match(
+      html,
+      /id="pending-decisions"[^>]*role="status"[^>]*hidden[^>]*>[^<]*waiting for decision/,
+    );
+    assert.match(html, /id="live-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.ok(html.indexOf('id="pending-decisions"') < html.indexOf('id="live-status"'));
+    assert.ok(html.indexOf('id="project-select"') < html.indexOf('id="space-select"'));
+    assert.ok(html.indexOf('id="space-select"') < html.indexOf('id="docs-filter"'));
+    assert.match(
+      html,
+      /class="status-filters"[^>]*>[\s\S]*id="actions-filter"[\s\S]*data-status-filter="done"/,
+    );
+    assert.doesNotMatch(html, /class="actions-nav"/);
+
+    for (const path of [
+      "/?view=other",
+      "/?view=docs&view=docs",
+      "/?actions=0",
+      "/?space=work&space=work",
+    ]) {
+      assert.equal((await authorized(value, path)).status, 400, path);
+    }
   } finally {
     await closeFixture(value);
   }
@@ -460,7 +650,7 @@ test("serves authenticated local source links without exposing filesystem paths"
     const unauthorized = await fetch(new URL(route, value.server.url));
     assert.equal(unauthorized.status, 401);
 
-    const response = await authorized(value, `${route}#L2`);
+    const response = await authorized(value, `${route}?view=change-reviews&actions=1#L2`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type") ?? "", /text\/html/);
     const html = await response.text();
@@ -468,6 +658,11 @@ test("serves authenticated local source links without exposing filesystem paths"
     assert.match(html, /id="L2"/);
     assert.match(html, /&lt;script&gt;alert\(&#39;no&#39;\)&lt;\/script&gt;/);
     assert.match(html, new RegExp(`/d/${value.document.id}`));
+    assert.match(html, /<a class="brand" href="\/">/);
+    assert.match(
+      html,
+      new RegExp(`/d/${value.document.id}\\?view=change-reviews(?:&amp;|&)actions=1`),
+    );
     assert.doesNotMatch(html, new RegExp(value.root));
 
     const unknown = await authorized(
@@ -1378,7 +1573,7 @@ test("serves the browser workspace and local visual assets", async () => {
 
     const page = await fetch(new URL("/", value.server.url), { headers });
     const html = await page.text();
-    assert.match(html, /data-testid="project-nav"/);
+    assert.match(html, /data-testid="project-select"/);
     assert.match(html, /data-testid="document-queue"/);
     assert.match(html, /aria-label="Group documents"/);
     assert.match(html, /data-grouping="project"[^>]*>projects<\/button>/);

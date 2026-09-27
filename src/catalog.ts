@@ -33,12 +33,14 @@ import {
   presentReviewRequest,
   projectDisplayName,
   type Attention,
+  type ContentScope,
   type Document,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
   type Project,
+  type RepositoryInventoryItem,
   type RepositoryIdentity,
   type ReviewKind,
   type ReviewFeedbackItem,
@@ -48,6 +50,8 @@ import {
   type ReviewResponse,
   type StoredReviewRequest,
   type StoredDocument,
+  type Space,
+  type SpaceMatcher,
   type Workspace,
 } from "./domain.js";
 import { SqliteCatalogStorage } from "./sqlite-storage.js";
@@ -67,6 +71,7 @@ export type {
   DocumentKind,
   DocumentSourceLink,
   DocumentStorage,
+  ContentScope,
   ReadingStatus,
   ReviewKind,
   ReviewFeedbackItem,
@@ -77,6 +82,9 @@ export type {
   ReviewStatus,
   Workspace,
   Project,
+  RepositoryInventoryItem,
+  Space,
+  SpaceMatcher,
 } from "./domain.js";
 
 export const CATALOG_SCHEMA_VERSION = 1;
@@ -91,6 +99,7 @@ const MAX_REVIEW_MESSAGE_LENGTH = 16 * 1024;
 const MAX_REVIEW_FEEDBACK_ITEMS = 32;
 const MAX_REVIEW_FEEDBACK_MESSAGE_LENGTH = 512;
 const MAX_REVIEW_FEEDBACK_PATH_LENGTH = 1_024;
+const MAX_SPACE_MATCHERS = 64;
 const TAG_PATTERN = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
 const WORKSPACE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -124,6 +133,21 @@ export interface AddWorkspaceInput {
   artifactRoots: string[];
   repository?: string;
   repositoryName?: string;
+}
+
+export interface SpaceMatcherInput {
+  kind: string;
+  value: string;
+}
+
+export interface CreateSpaceInput {
+  id: string;
+  name: string;
+  matchers: SpaceMatcherInput[];
+}
+
+export interface ReplaceSpaceMatchersInput {
+  matchers: SpaceMatcherInput[];
 }
 
 export interface RegisterDocumentInput {
@@ -219,6 +243,20 @@ export class ReviewConflictError extends Error {
   }
 }
 
+export class SpaceNotFoundError extends Error {
+  constructor(readonly spaceId: string) {
+    super(`unknown space ${spaceId}`);
+    this.name = "SpaceNotFoundError";
+  }
+}
+
+export class SpaceConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpaceConflictError";
+  }
+}
+
 export class Catalog {
   readonly #storage: CatalogStorage;
   readonly #maxDocumentBytes: number;
@@ -227,6 +265,7 @@ export class Catalog {
     string,
     Promise<ReferenceDocumentReconciliation>
   >();
+  readonly #invalidationListeners = new Set<() => void>();
 
   private constructor(
     storage: CatalogStorage,
@@ -277,21 +316,129 @@ export class Catalog {
     this.#storage.close();
   }
 
-  listWorkspaces(): Workspace[] {
-    return structuredClone(this.#storage.listWorkspaces());
+  subscribeInvalidation(listener: () => void): () => void {
+    this.#invalidationListeners.add(listener);
+    return () => this.#invalidationListeners.delete(listener);
   }
 
-  listDocuments(filters: DocumentFilters = {}): Document[] {
+  #emitInvalidation(): void {
+    for (const listener of this.#invalidationListeners) {
+      try {
+        listener();
+      } catch {
+        // A notification observer must not change the mutation outcome.
+      }
+    }
+  }
+
+  listSpaces(): Space[] {
+    return structuredClone(this.#storage.listSpaces());
+  }
+
+  getSpace(id: string): Space | undefined {
+    validateSpaceId(id);
+    const space = this.#storage.getSpace(id);
+    return space ? structuredClone(space) : undefined;
+  }
+
+  createSpace(input: CreateSpaceInput): Space {
+    const space = normalizeSpaceInput(input);
+    if (this.#storage.getSpace(space.id)) {
+      throw new SpaceConflictError(`space ${space.id} already exists`);
+    }
+    this.#storage.saveSpace(space);
+    this.#emitInvalidation();
+    return structuredClone(space);
+  }
+
+  renameSpace(id: string, name: string): Space {
+    validateSpaceId(id);
+    const existing = this.#storage.getSpace(id);
+    if (!existing) {
+      throw new SpaceNotFoundError(id);
+    }
+    const updated = { ...existing, name: normalizeSpaceName(name) };
+    if (updated.name === existing.name) {
+      return structuredClone(existing);
+    }
+    this.#storage.saveSpace(updated);
+    this.#emitInvalidation();
+    return structuredClone(updated);
+  }
+
+  replaceSpaceMatchers(
+    id: string,
+    input: ReplaceSpaceMatchersInput,
+  ): Space {
+    validateSpaceId(id);
+    if (!isRecord(input) || !hasOnlyKeys(input, ["matchers"])) {
+      throw new Error("invalid Space matcher replacement");
+    }
+    const existing = this.#storage.getSpace(id);
+    if (!existing) {
+      throw new SpaceNotFoundError(id);
+    }
+    const updated = {
+      ...existing,
+      matchers: normalizeSpaceMatchers(input.matchers),
+    };
+    if (sameSpaceMatchers(updated.matchers, existing.matchers)) {
+      return structuredClone(existing);
+    }
+    this.#storage.saveSpace(updated);
+    this.#emitInvalidation();
+    return structuredClone(updated);
+  }
+
+  deleteSpace(id: string): { id: string } {
+    validateSpaceId(id);
+    if (!this.#storage.deleteSpace(id)) {
+      throw new SpaceNotFoundError(id);
+    }
+    this.#emitInvalidation();
+    return { id };
+  }
+
+  listRepositories(): RepositoryInventoryItem[] {
+    return structuredClone(this.#storage.listRepositories());
+  }
+
+  listWorkspaces(scope: ContentScope = {}): Workspace[] {
+    return structuredClone(this.#storage.listWorkspaces(this.#resolveScope(scope)));
+  }
+
+  listDocuments(
+    filters: DocumentFilters = {},
+    scope: ContentScope = {},
+  ): Document[] {
     const validated = validateFilters(filters);
     return this.#storage
-      .listDocuments(validated)
+      .listDocuments(validated, this.#resolveScope(scope))
       .map((document) => presentDocument(document));
   }
 
-  getDocument(id: string): Document | undefined {
+  getDocument(id: string, scope: ContentScope = {}): Document | undefined {
     validateDocumentId(id);
-    const document = this.#storage.getDocument(id);
+    const document = this.#storage.getDocument(id, this.#resolveScope(scope));
     return document ? presentDocument(document) : undefined;
+  }
+
+  #resolveScope(scope: ContentScope): ContentScope {
+    if (
+      !isRecord(scope) ||
+      !hasOnlyKeys(scope, ["spaceId"]) ||
+      (scope.spaceId !== undefined && typeof scope.spaceId !== "string")
+    ) {
+      throw new Error("invalid content scope");
+    }
+    if (scope.spaceId === undefined) {
+      return {};
+    }
+    validateSpaceId(scope.spaceId);
+    if (!this.#storage.getSpace(scope.spaceId)) {
+      throw new SpaceNotFoundError(scope.spaceId);
+    }
+    return { spaceId: scope.spaceId };
   }
 
   async #inspectStoredDocument(
@@ -316,24 +463,36 @@ export class Catalog {
 
   listReviewRequests(
     filters: ReviewRequestFilters = {},
+    scope: ContentScope = {},
   ): ReviewRequest[] {
     const validated = validateReviewRequestFilters(filters);
     return this.#storage
-      .listReviewRequests(validated)
+      .listReviewRequests(validated, this.#resolveScope(scope))
       .map((request) => presentReviewRequest(request));
   }
 
-  getReviewRequest(id: string): ReviewRequest | undefined {
+  getReviewRequest(
+    id: string,
+    scope: ContentScope = {},
+  ): ReviewRequest | undefined {
     validateReviewRequestId(id);
-    const request = this.#storage.getReviewRequest(id);
+    const request = this.#storage.getReviewRequest(
+      id,
+      this.#resolveScope(scope),
+    );
     return request ? presentReviewRequest(request) : undefined;
   }
 
   async createReviewRequest(
     input: CreateReviewRequestInput,
+    scope: ContentScope = {},
   ): Promise<ReviewRequest> {
     const validated = validateCreateReviewRequestInput(input);
-    const initialDocument = this.#storage.getDocument(validated.documentId);
+    const resolvedScope = this.#resolveScope(scope);
+    const initialDocument = this.#storage.getDocument(
+      validated.documentId,
+      resolvedScope,
+    );
     if (!initialDocument) {
       throw new Error(`unknown document ${validated.documentId}`);
     }
@@ -375,8 +534,14 @@ export class Catalog {
         "document content changed; re-register before requesting review",
       );
     }
-    return this.#storage.transaction(() => {
-      const document = this.#storage.getDocument(validated.documentId);
+    const result = this.#storage.transaction((): {
+      request: ReviewRequest;
+      changed: boolean;
+    } => {
+      const document = this.#storage.getDocument(
+        validated.documentId,
+        resolvedScope,
+      );
       if (!document) {
         throw new Error(`unknown document ${validated.documentId}`);
       }
@@ -393,7 +558,7 @@ export class Catalog {
       const pending = this.#storage.listReviewRequests({
         documentId: document.id,
         status: "pending",
-      })[0];
+      }, resolvedScope)[0];
       if (pending) {
         if (
           pending.documentRevision === document.revision &&
@@ -401,7 +566,7 @@ export class Catalog {
           pending.kind === validated.kind &&
           pending.requestMessage === validated.requestMessage
         ) {
-          return presentReviewRequest(pending);
+          return { request: presentReviewRequest(pending), changed: false };
         }
         throw new ReviewConflictError(
           "document already has a pending review request",
@@ -425,18 +590,24 @@ export class Catalog {
         createdAt: new Date().toISOString(),
       };
       this.#storage.saveReviewRequest(request);
-      return presentReviewRequest(request);
+      return { request: presentReviewRequest(request), changed: true };
     });
+    if (result.changed) {
+      this.#emitInvalidation();
+    }
+    return result.request;
   }
 
   async respondToReviewRequest(
     id: string,
     input: RespondToReviewRequestInput,
+    scope: ContentScope = {},
   ): Promise<ReviewRequest> {
     validateReviewRequestId(id);
     const validated = validateRespondToReviewRequestInput(input);
+    const resolvedScope = this.#resolveScope(scope);
 
-    const initial = this.#storage.getReviewRequest(id);
+    const initial = this.#storage.getReviewRequest(id, resolvedScope);
     if (!initial) {
       throw new Error(`unknown review request ${id}`);
     }
@@ -454,32 +625,42 @@ export class Catalog {
     if (initial.status === "stale") {
       throw new ReviewConflictError("review request is stale");
     }
-    const initialDocument = this.#storage.getDocument(initial.documentId);
+    const initialDocument = this.#storage.getDocument(
+      initial.documentId,
+      resolvedScope,
+    );
+    if (!initialDocument) {
+      throw new Error(`unknown review request ${id}`);
+    }
     if (
-      !initialDocument ||
       initialDocument.revision !== initial.documentRevision ||
       initialDocument.contentHash !== initial.documentContentHash ||
       initialDocument.missingAt !== null
     ) {
-      this.#storage.staleReviewRequest(id, new Date().toISOString());
+      this.#staleReviewRequest(id, resolvedScope);
       throw new ReviewConflictError("review request is stale");
     }
     try {
       const inspected = await this.#inspectStoredDocument(initialDocument);
       if (inspected.contentHash !== initial.documentContentHash) {
-        this.#storage.staleReviewRequest(id, new Date().toISOString());
+        this.#staleReviewRequest(id, resolvedScope);
         throw new ReviewConflictError("review request is stale");
       }
     } catch (error) {
       if (error instanceof ReviewConflictError) {
         throw error;
       }
-      this.#storage.staleReviewRequest(id, new Date().toISOString());
+      if (error instanceof Error && error.message.startsWith("unknown review request")) {
+        throw error;
+      }
+      this.#staleReviewRequest(id, resolvedScope);
       throw new ReviewConflictError("review request is stale");
     }
 
-    return this.#storage.transaction(() => {
-      const request = this.#storage.getReviewRequest(id);
+    const result = this.#storage.transaction(():
+      | { kind: "responded"; request: ReviewRequest; changed: boolean }
+      | { kind: "stale"; changed: boolean } => {
+      const request = this.#storage.getReviewRequest(id, resolvedScope);
       if (!request) {
         throw new Error(`unknown review request ${id}`);
       }
@@ -488,7 +669,11 @@ export class Catalog {
           request.response.outcome === validated.outcome &&
           sameReviewResponse(request.response, validated)
         ) {
-          return presentReviewRequest(request);
+          return {
+            kind: "responded",
+            request: presentReviewRequest(request),
+            changed: false,
+          };
         }
         throw new ReviewConflictError(
           "review request already has a different response",
@@ -497,15 +682,23 @@ export class Catalog {
       if (request.status === "stale") {
         throw new ReviewConflictError("review request is stale");
       }
-      const document = this.#storage.getDocument(request.documentId);
+      const document = this.#storage.getDocument(
+        request.documentId,
+        resolvedScope,
+      );
       if (
         !document ||
         document.revision !== request.documentRevision ||
         document.contentHash !== request.documentContentHash ||
         document.missingAt !== null
       ) {
-        this.#storage.staleReviewRequest(id, new Date().toISOString());
-        throw new ReviewConflictError("review request is stale");
+        if (!document) {
+          throw new Error(`unknown review request ${id}`);
+        }
+        return {
+          kind: "stale",
+          changed: this.#storage.staleReviewRequest(id, new Date().toISOString()),
+        };
       }
       const responded: StoredReviewRequest = {
         ...request,
@@ -518,14 +711,22 @@ export class Catalog {
         },
       };
       if (this.#storage.completeReviewRequest(responded)) {
-        return presentReviewRequest(responded);
+        return {
+          kind: "responded",
+          request: presentReviewRequest(responded),
+          changed: true,
+        };
       }
       const winner = this.#storage.getReviewRequest(id);
       if (
         winner?.response?.outcome === validated.outcome &&
         sameReviewResponse(winner.response, validated)
       ) {
-        return presentReviewRequest(winner);
+        return {
+          kind: "responded",
+          request: presentReviewRequest(winner),
+          changed: false,
+        };
       }
       throw new ReviewConflictError(
         winner?.status === "stale"
@@ -533,18 +734,42 @@ export class Catalog {
           : "review request already has a different response",
       );
     });
+    if (result.kind === "stale") {
+      if (result.changed) {
+        this.#emitInvalidation();
+      }
+      throw new ReviewConflictError("review request is stale");
+    }
+    if (result.changed) {
+      this.#emitInvalidation();
+    }
+    return result.request;
+  }
+
+  #staleReviewRequest(id: string, scope: ContentScope): void {
+    const changed = this.#storage.transaction(() => {
+      if (!this.#storage.getReviewRequest(id, scope)) {
+        throw new Error(`unknown review request ${id}`);
+      }
+      return this.#storage.staleReviewRequest(id, new Date().toISOString());
+    });
+    if (changed) {
+      this.#emitInvalidation();
+    }
   }
 
   async readDocument(
     id: string,
+    scope: ContentScope = {},
   ): Promise<{ content: string; document: Document }> {
     validateDocumentId(id);
-    const stored = this.#storage.getDocument(id);
+    const resolvedScope = this.#resolveScope(scope);
+    const stored = this.#storage.getDocument(id, resolvedScope);
     if (!stored) {
       throw new Error(`unknown document ${id}`);
     }
     if (stored.storage === "reference") {
-      const reconciled = await this.reconcileReferenceDocument(id);
+      const reconciled = await this.reconcileReferenceDocument(id, resolvedScope);
       if (reconciled.document.missingAt !== null || reconciled.content === null) {
         throw new DocumentSourceMissingError(reconciled.document);
       }
@@ -561,14 +786,18 @@ export class Catalog {
         isNodeError(error) &&
         (error.code === "ENOENT" || error.code === "ENOTDIR")
       ) {
-        const missing = await this.markDocumentMissing(id);
+        const missing = await this.markDocumentMissing(id, resolvedScope);
         throw new DocumentSourceMissingError(missing);
       }
       throw error;
     }
-    const document = stored.missingAt === null
-      ? presentDocument(stored)
-      : await this.markDocumentPresent(id);
+    const current = this.#storage.getDocument(id, resolvedScope);
+    if (!current) {
+      throw new Error(`unknown document ${id}`);
+    }
+    const document = current.missingAt === null
+      ? presentDocument(current)
+      : await this.markDocumentPresent(id, resolvedScope);
     return {
       content: inspected.content.toString("utf8"),
       document,
@@ -577,27 +806,31 @@ export class Catalog {
 
   async reconcileReferenceDocument(
     id: string,
+    scope: ContentScope = {},
   ): Promise<ReferenceDocumentReconciliation> {
     validateDocumentId(id);
-    const previous = this.#referenceReconciliations.get(id);
+    const resolvedScope = this.#resolveScope(scope);
+    const reconciliationKey = `${id}\0${resolvedScope.spaceId ?? ""}`;
+    const previous = this.#referenceReconciliations.get(reconciliationKey);
     const operation = (previous ?? Promise.resolve())
       .catch(() => undefined)
-      .then(() => this.#reconcileReferenceDocument(id));
-    this.#referenceReconciliations.set(id, operation);
+      .then(() => this.#reconcileReferenceDocument(id, resolvedScope));
+    this.#referenceReconciliations.set(reconciliationKey, operation);
     try {
       return await operation;
     } finally {
-      if (this.#referenceReconciliations.get(id) === operation) {
-        this.#referenceReconciliations.delete(id);
+      if (this.#referenceReconciliations.get(reconciliationKey) === operation) {
+        this.#referenceReconciliations.delete(reconciliationKey);
       }
     }
   }
 
   async #reconcileReferenceDocument(
     id: string,
+    scope: ContentScope,
   ): Promise<ReferenceDocumentReconciliation> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const initial = this.#storage.getDocument(id);
+      const initial = this.#storage.getDocument(id, scope);
       if (!initial) {
         throw new Error(`unknown document ${id}`);
       }
@@ -622,7 +855,7 @@ export class Catalog {
           (error.code === "ENOENT" || error.code === "ENOTDIR")
         ) {
           const missing = this.#storage.transaction(() => {
-            const current = this.#storage.getDocument(id);
+            const current = this.#storage.getDocument(id, scope);
             if (!current || !sameReconciliationVersion(current, initial)) {
               return undefined;
             }
@@ -647,6 +880,9 @@ export class Catalog {
             };
           });
           if (missing) {
+            if (missing.action !== "unchanged") {
+              this.#emitInvalidation();
+            }
             return missing;
           }
           continue;
@@ -662,7 +898,7 @@ export class Catalog {
         workspaceRoot: workspace.root,
       });
       const reconciled = this.#storage.transaction(() => {
-        const current = this.#storage.getDocument(id);
+        const current = this.#storage.getDocument(id, scope);
         if (!current || !sameReconciliationVersion(current, initial)) {
           return undefined;
         }
@@ -692,6 +928,9 @@ export class Catalog {
         };
       });
       if (reconciled) {
+        if (reconciled.action !== "unchanged") {
+          this.#emitInvalidation();
+        }
         return reconciled;
       }
     }
@@ -701,10 +940,12 @@ export class Catalog {
   async readDocumentSource(
     documentId: string,
     sourceLinkId: string,
+    scope: ContentScope = {},
   ): Promise<DocumentSource> {
     validateDocumentId(documentId);
     validateSourceLinkId(sourceLinkId);
-    const stored = this.#storage.getDocument(documentId);
+    const resolvedScope = this.#resolveScope(scope);
+    const stored = this.#storage.getDocument(documentId, resolvedScope);
     const sourceLink = stored?.sourceLinks.find(({ id }) => id === sourceLinkId);
     if (!stored || !sourceLink) {
       throw new DocumentSourceLinkNotFoundError();
@@ -736,9 +977,16 @@ export class Catalog {
         `linked source exceeds ${MAX_LINKED_SOURCE_LINES} lines`,
       );
     }
+    const current = this.#storage.getDocument(documentId, resolvedScope);
+    const currentSourceLink = current?.sourceLinks.find(
+      ({ id }) => id === sourceLinkId,
+    );
+    if (!current || !currentSourceLink) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
     return {
       content,
-      document: presentDocument(stored),
+      document: presentDocument(current),
       name: basename(source.path),
     };
   }
@@ -746,10 +994,12 @@ export class Catalog {
   async readDocumentMedia(
     documentId: string,
     sourceLinkId: string,
+    scope: ContentScope = {},
   ): Promise<DocumentMedia> {
     validateDocumentId(documentId);
     validateSourceLinkId(sourceLinkId);
-    const stored = this.#storage.getDocument(documentId);
+    const resolvedScope = this.#resolveScope(scope);
+    const stored = this.#storage.getDocument(documentId, resolvedScope);
     const sourceLink = stored?.sourceLinks.find(({ id }) => id === sourceLinkId);
     if (!stored || !sourceLink) {
       throw new DocumentSourceLinkNotFoundError();
@@ -769,17 +1019,28 @@ export class Catalog {
       );
     }
     assertSvgDocument(media.content);
+    const current = this.#storage.getDocument(documentId, resolvedScope);
+    const currentSourceLink = current?.sourceLinks.find(
+      ({ id }) => id === sourceLinkId,
+    );
+    if (!current || !currentSourceLink) {
+      throw new DocumentSourceLinkNotFoundError();
+    }
     return {
       content: media.content,
       contentType: "image/svg+xml",
-      document: presentDocument(stored),
+      document: presentDocument(current),
       name: basename(media.path),
     };
   }
 
-  resolveDocumentSourceTargets(documentId: string): Map<string, string> {
+  resolveDocumentSourceTargets(
+    documentId: string,
+    scope: ContentScope = {},
+  ): Map<string, string> {
     validateDocumentId(documentId);
-    const stored = this.#storage.getDocument(documentId);
+    const resolvedScope = this.#resolveScope(scope);
+    const stored = this.#storage.getDocument(documentId, resolvedScope);
     if (!stored) {
       throw new Error(`unknown document ${documentId}`);
     }
@@ -797,6 +1058,7 @@ export class Catalog {
       const targetId = this.#storage.getReferenceDocumentIdByPath(
         stored.workspaceId,
         targetPath,
+        resolvedScope,
       );
       if (targetId !== undefined) {
         targets.set(sourceLink.id, targetId);
@@ -853,7 +1115,27 @@ export class Catalog {
         input.repositoryName === undefined && existingRepository
       ? existingRepository
       : repositoryIdentity(input, root);
+    if (
+      existingRepository &&
+      this.#storage.workspaceHasDocuments(workspace.id) &&
+      (repository.key !== existingRepository.key ||
+        repository.name !== existingRepository.name)
+    ) {
+      throw new Error(
+        "repository identity cannot change after documents exist",
+      );
+    }
+    if (
+      existing &&
+      existingRepository &&
+      sameWorkspace(existing, workspace) &&
+      existingRepository.key === repository.key &&
+      existingRepository.name === repository.name
+    ) {
+      return structuredClone(existing);
+    }
     this.#storage.saveWorkspace(workspace, repository);
+    this.#emitInvalidation();
     return structuredClone(workspace);
   }
 
@@ -920,7 +1202,11 @@ export class Catalog {
       updatedAt: now,
     };
 
+    const changed = existing === undefined || !sameDocumentState(existing, document);
     this.#storage.saveDocument(document);
+    if (changed) {
+      this.#emitInvalidation();
+    }
     return presentDocument(document);
   }
 
@@ -999,7 +1285,11 @@ export class Catalog {
       updatedAt: now,
     };
 
+    const changed = existing === undefined || !sameDocumentState(existing, document);
     this.#storage.saveDocument(document);
+    if (changed) {
+      this.#emitInvalidation();
+    }
     return presentDocument(document);
   }
 
@@ -1025,87 +1315,137 @@ export class Catalog {
     });
   }
 
-  async markDocumentOpened(id: string): Promise<Document> {
+  async markDocumentOpened(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       openedRevision: document.revision,
-    }));
+    }), scope);
   }
 
-  async markDocumentRead(id: string): Promise<Document> {
+  async markDocumentRead(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       completedRevision: document.revision,
-    }));
+    }), scope);
   }
 
-  async markDocumentUnread(id: string): Promise<Document> {
+  async markDocumentUnread(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       openedRevision: null,
       completedRevision: null,
-    }));
+    }), scope);
   }
 
-  async setDocumentTags(id: string, tags: string[]): Promise<Document> {
+  async setDocumentTags(
+    id: string,
+    tags: string[],
+    scope: ContentScope = {},
+  ): Promise<Document> {
     const normalized = normalizeTags(tags);
     return this.#updateDocument(id, (document) => ({
       ...document,
       tags: normalized,
-    }));
+    }), scope);
   }
 
-  async archiveDocument(id: string): Promise<Document> {
+  async archiveDocument(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     validateDocumentId(id);
-    return this.#storage.transaction(() => {
+    const resolvedScope = this.#resolveScope(scope);
+    const result = this.#storage.transaction(() => {
       if (
-        this.#storage.listReviewRequests({ documentId: id, status: "pending" })
+        this.#storage.listReviewRequests(
+          { documentId: id, status: "pending" },
+          resolvedScope,
+        )
           .length > 0
       ) {
         throw new ReviewConflictError(
           "document has a pending review request",
         );
       }
-      return this.#updateDocument(id, (document) => ({
+      return this.#updateDocumentResult(id, (document) => ({
         ...document,
         archivedAt: document.archivedAt ?? new Date().toISOString(),
-      }));
+      }), resolvedScope);
     });
+    if (result.changed) {
+      this.#emitInvalidation();
+    }
+    return result.document;
   }
 
-  async restoreDocument(id: string): Promise<Document> {
+  async restoreDocument(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       archivedAt: null,
-    }));
+    }), scope);
   }
 
-  async markDocumentMissing(id: string): Promise<Document> {
+  async markDocumentMissing(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       missingAt: document.missingAt ?? new Date().toISOString(),
-    }));
+    }), scope);
   }
 
-  async markDocumentPresent(id: string): Promise<Document> {
+  async markDocumentPresent(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<Document> {
     return this.#updateDocument(id, (document) => ({
       ...document,
       missingAt: null,
-    }));
+    }), scope);
   }
 
   #updateDocument(
     id: string,
     update: (document: StoredDocument) => StoredDocument,
+    scope: ContentScope = {},
   ): Document {
+    const result = this.#updateDocumentResult(id, update, scope);
+    if (result.changed) {
+      this.#emitInvalidation();
+    }
+    return result.document;
+  }
+
+  #updateDocumentResult(
+    id: string,
+    update: (document: StoredDocument) => StoredDocument,
+    scope: ContentScope = {},
+  ): { document: Document; changed: boolean } {
     validateDocumentId(id);
-    const existing = this.#storage.getDocument(id);
+    const resolvedScope = this.#resolveScope(scope);
+    const existing = this.#storage.getDocument(id, resolvedScope);
     if (!existing) {
       throw new Error(`unknown document ${id}`);
     }
     const updated = update(existing);
+    if (sameDocumentState(existing, updated)) {
+      return { document: presentDocument(existing), changed: false };
+    }
     this.#storage.saveDocument(updated);
-    return presentDocument(updated);
+    return { document: presentDocument(updated), changed: true };
   }
 
   async #migrateLegacyState(legacyStatePath: string): Promise<void> {
@@ -1295,6 +1635,143 @@ function validateAddWorkspaceInput(input: AddWorkspaceInput): void {
   ) {
     throw new Error("invalid workspace input");
   }
+}
+
+function normalizeSpaceInput(input: CreateSpaceInput): Space {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, ["id", "name", "matchers"]) ||
+    typeof input.id !== "string"
+  ) {
+    throw new Error("invalid Space input");
+  }
+  validateSpaceId(input.id);
+  return {
+    id: input.id,
+    name: normalizeSpaceName(input.name),
+    matchers: normalizeSpaceMatchers(input.matchers),
+  };
+}
+
+function validateSpaceId(id: string): void {
+  if (typeof id !== "string" || !WORKSPACE_ID_PATTERN.test(id)) {
+    throw new Error("invalid Space id");
+  }
+}
+
+function normalizeSpaceName(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new Error("invalid Space name");
+  }
+  const name = value.trim();
+  if (
+    name === "" ||
+    name.length > MAX_CONTEXT_LENGTH ||
+    /[\u0000-\u001f\u007f]/.test(name)
+  ) {
+    throw new Error("invalid Space name");
+  }
+  return name;
+}
+
+function sameSpaceMatchers(
+  left: readonly SpaceMatcher[],
+  right: readonly SpaceMatcher[],
+): boolean {
+  return left.length === right.length && left.every((matcher, index) =>
+    matcher.kind === right[index]?.kind && matcher.value === right[index]?.value
+  );
+}
+
+function sameWorkspace(left: Workspace, right: Workspace): boolean {
+  return left.id === right.id &&
+    left.name === right.name &&
+    left.root === right.root &&
+    left.artifactRoots.length === right.artifactRoots.length &&
+    left.artifactRoots.every((root, index) => root === right.artifactRoots[index]);
+}
+
+function sameDocumentState(
+  left: StoredDocument,
+  right: StoredDocument,
+): boolean {
+  const { updatedAt: _leftUpdatedAt, ...leftState } = left;
+  const { updatedAt: _rightUpdatedAt, ...rightState } = right;
+  return JSON.stringify(leftState) === JSON.stringify(rightState);
+}
+
+function normalizeSpaceMatchers(value: unknown): SpaceMatcher[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > MAX_SPACE_MATCHERS
+  ) {
+    throw new Error(
+      `a Space requires at least one matcher and at most ${MAX_SPACE_MATCHERS}`,
+    );
+  }
+  const normalized = value.map((candidate): SpaceMatcher => {
+    if (
+      !isRecord(candidate) ||
+      !hasOnlyKeys(candidate, ["kind", "value"]) ||
+      typeof candidate.kind !== "string" ||
+      typeof candidate.value !== "string"
+    ) {
+      throw new Error("invalid Space matcher");
+    }
+    if (
+      candidate.kind !== "repository" &&
+      candidate.kind !== "repository-namespace" &&
+      candidate.kind !== "tag"
+    ) {
+      throw new Error(`unknown Space matcher kind ${candidate.kind}`);
+    }
+    if (candidate.kind === "tag") {
+      return { kind: "tag", value: normalizeTags([candidate.value])[0]! };
+    }
+    return {
+      kind: candidate.kind,
+      value: normalizeSpaceRepositoryMatcher(
+        candidate.value,
+        candidate.kind === "repository-namespace",
+      ),
+    };
+  });
+  const unique = new Map<string, SpaceMatcher>();
+  for (const matcher of normalized) {
+    unique.set(`${matcher.kind}\0${matcher.value}`, matcher);
+  }
+  return [...unique.values()].sort(compareSpaceMatchers);
+}
+
+function normalizeSpaceRepositoryMatcher(
+  value: string,
+  namespace: boolean,
+): string {
+  const trimmed = value.trim().toLowerCase();
+  if (/^local:[a-f0-9]{64}$/.test(trimmed)) {
+    if (namespace) {
+      throw new Error("repository namespace cannot use a local repository key");
+    }
+    return trimmed;
+  }
+  const key = normalizeRepositoryKey(value);
+  if (key.split("/").filter(Boolean).length < 2) {
+    throw new Error(
+      namespace
+        ? "repository namespace must include host and owner"
+        : "invalid repository matcher",
+    );
+  }
+  return key;
+}
+
+function compareSpaceMatchers(left: SpaceMatcher, right: SpaceMatcher): number {
+  return compareText(left.kind, right.kind) || compareText(left.value, right.value);
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function validateRegisterDocumentInput(

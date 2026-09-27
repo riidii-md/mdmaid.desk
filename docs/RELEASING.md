@@ -55,6 +55,69 @@ The smoke test packs the exact publish allowlist, installs the tarball into an
 isolated prefix, checks `--help` and `--version`, creates a real SQLite catalog,
 starts the installed web daemon, and waits for its health endpoint.
 
+## Schema 9 backup and downgrade recovery
+
+Opening a schema-8 catalog with a release that contains Spaces upgrades it to
+schema 9. Older binaries cannot open schema 9, and there is no supported
+in-place downgrade. Before the first schema-9 start, stop every writer and make
+one verified, non-overwriting sibling backup:
+
+```bash
+mdmaid-desk daemon stop
+desk_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/mdmaid.desk"
+catalog_path="$desk_state_dir/catalog.sqlite3"
+backup_path="$desk_state_dir/catalog.sqlite3.schema-8.backup"
+test "$(mdmaid-desk daemon status)" = "daemon stopped"
+test ! -e "$desk_state_dir/daemon.json"
+test -f "$catalog_path"
+test ! -e "$backup_path"
+test "$(stat -f '%Lp' "$catalog_path" 2>/dev/null || stat -c '%a' "$catalog_path")" = 600
+sqlite3 -readonly "$catalog_path" 'PRAGMA user_version; PRAGMA integrity_check;'
+sqlite3 -readonly "$catalog_path" \
+  'SELECT "workspaces", count(*) FROM workspaces UNION ALL SELECT "documents", count(*) FROM documents UNION ALL SELECT "review_requests", count(*) FROM review_requests;'
+umask 077
+cp -p "$catalog_path" "$backup_path"
+chmod 600 "$backup_path"
+shasum -a 256 "$catalog_path" "$backup_path"
+test "$(stat -f '%Lp' "$backup_path" 2>/dev/null || stat -c '%a' "$backup_path")" = 600
+sqlite3 -readonly "$backup_path" 'PRAGMA user_version; PRAGMA integrity_check;'
+```
+
+The first `PRAGMA user_version` must report `8`, both integrity checks must
+report `ok`, both digests must match, and the source and backup must have mode
+`0600`. The stopped status and absent descriptor are the quiescence check; also
+stop any separately launched CLI, service manager, or test process that can
+write this catalog.
+Record the three table counts with the release evidence. Start the new release,
+then verify that the live catalog reports version 9, `ok`, and the same counts.
+
+To roll back, stop all writers again, keep the schema-9 file for diagnosis,
+restore the verified backup to the canonical path, and verify it before starting
+the older binary:
+
+```bash
+mdmaid-desk daemon stop
+desk_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/mdmaid.desk"
+catalog_path="$desk_state_dir/catalog.sqlite3"
+backup_path="$desk_state_dir/catalog.sqlite3.schema-8.backup"
+test "$(mdmaid-desk daemon status)" = "daemon stopped"
+test ! -e "$desk_state_dir/daemon.json"
+test -f "$backup_path"
+test ! -e "$catalog_path.schema-9.failed"
+backup_digest="$(shasum -a 256 "$backup_path" | awk '{print $1}')"
+mv "$catalog_path" "$catalog_path.schema-9.failed"
+cp -p "$backup_path" "$catalog_path"
+chmod 600 "$catalog_path"
+test "$(stat -f '%Lp' "$catalog_path" 2>/dev/null || stat -c '%a' "$catalog_path")" = 600
+test "$(shasum -a 256 "$catalog_path" | awk '{print $1}')" = "$backup_digest"
+sqlite3 -readonly "$catalog_path" 'PRAGMA user_version; PRAGMA integrity_check;'
+sqlite3 -readonly "$catalog_path" \
+  'SELECT "workspaces", count(*) FROM workspaces UNION ALL SELECT "documents", count(*) FROM documents UNION ALL SELECT "review_requests", count(*) FROM review_requests;'
+```
+
+The restored catalog must report version 8, `ok`, and the recorded pre-upgrade
+counts. Without the verified schema-8 backup, downgrade is unsupported.
+
 ## Homebrew follow-up
 
 After `mdmaid-desk@0.1.0` exists on npm, create a dedicated

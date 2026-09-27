@@ -13,11 +13,13 @@ import {
   feedbackAnchorLabel,
   feedbackEndingAtLine,
   filterQueue,
+  filterProjectChoices,
   groupQueue,
   highlightDiffLine,
   isSourceMissing,
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
+  pendingDecisionCount,
   pendingReviewForDocument,
   projectQueueRoute,
   projectQueueSelection,
@@ -42,6 +44,8 @@ import {
   webDiffRows,
   webLoadFailure,
   visibleWorkspaces,
+  workspaceQueryState,
+  workspaceRouteWithState,
   upsertReviewDraftFeedback,
   type ReviewDraftStorage,
   type WebDocument,
@@ -157,6 +161,103 @@ test("filters the browser queue by workspace, status, and search", () => {
   ]);
 });
 
+test("matches project choices by case-insensitive text anywhere in the name", () => {
+  const projects: PublicWorkspace[] = [
+    {
+      id: "project-a",
+      name: "EyWizards SA-2203 Safe Edit Confirmation",
+      documentCount: 1,
+      route: "/p/project-a",
+    },
+    {
+      id: "project-b",
+      name: "Audits / SA-3365 (AI service identity)",
+      documentCount: 2,
+      route: "/p/project-b",
+    },
+  ];
+
+  assert.deepEqual(filterProjectChoices(projects, "2203 safe"), [projects[0]]);
+  assert.deepEqual(filterProjectChoices(projects, "SERVICE IDENTITY"), [projects[1]]);
+  assert.deepEqual(filterProjectChoices(projects, "  sa-33  "), [projects[1]]);
+  assert.deepEqual(filterProjectChoices(projects, ""), projects);
+  assert.deepEqual(filterProjectChoices(projects, "missing"), []);
+});
+
+test("keeps content mode independent from the Actions intersection", () => {
+  const changeReviewRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    kind: "change-decision",
+  };
+  assert.deepEqual(
+    filterQueue(documents, {
+      contentMode: "docs",
+      actionsOnly: true,
+    }, [pendingReview, changeReviewRequest]).map(({ id }) => id),
+    [documents[0]!.id],
+  );
+  assert.deepEqual(
+    filterQueue(documents, {
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    }, [pendingReview, changeReviewRequest]).map(({ id }) => id),
+    [documents[3]!.id],
+  );
+});
+
+test("counts every pending decision across document content types", () => {
+  const changeReviewRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    kind: "change-decision",
+  };
+  const completedRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-33333333333333333333",
+    status: "approved",
+    response: {
+      outcome: "approved",
+      message: "Approved.",
+      createdAt: "2026-08-19T11:00:00.000Z",
+    },
+  };
+
+  assert.equal(
+    pendingDecisionCount([pendingReview, changeReviewRequest, completedRequest]),
+    2,
+  );
+  assert.equal(pendingDecisionCount([completedRequest]), 0);
+});
+
+test("preserves Space, content mode, Actions, and fragments in workspace URLs", () => {
+  assert.equal(
+    workspaceRouteWithState("/d/doc-11111111111111111111#details", {
+      selectedSpace: "work",
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    }),
+    "/d/doc-11111111111111111111?space=work&view=change-reviews&actions=1#details",
+  );
+});
+
+test("restores orthogonal workspace query state", () => {
+  assert.deepEqual(
+    workspaceQueryState("?space=work&view=change-reviews&actions=1"),
+    {
+      selectedSpace: "work",
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    },
+  );
+  assert.deepEqual(workspaceQueryState("?view=docs"), {
+    contentMode: "docs",
+    actionsOnly: false,
+  });
+});
+
 test("filters the queue by logical project across workspaces", () => {
   const sharedProject = "project-11111111111111111111";
   const otherProject = "project-22222222222222222222";
@@ -194,8 +295,8 @@ test("selects a project queue and leaves document-only spaces", () => {
       workspaceId: project.id,
       status: "reading",
       search: "migration",
-      actionsOnly: false,
-      changeReviewsOnly: false,
+      actionsOnly: true,
+      changeReviewsOnly: true,
     },
     route: project.route,
   });

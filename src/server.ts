@@ -18,6 +18,8 @@ import sanitizeHtml from "sanitize-html";
 import {
   type AddWorkspaceInput,
   type Catalog,
+  type ContentScope,
+  type CreateSpaceInput,
   type Document,
   type DocumentFilters,
   DocumentSourceLinkNotFoundError,
@@ -26,6 +28,9 @@ import {
   LinkedSourceUnavailableError,
   type RegisterDocumentInput,
   ReviewConflictError,
+  type ReplaceSpaceMatchersInput,
+  SpaceConflictError,
+  SpaceNotFoundError,
   type ReviewRequest,
   type Workspace,
 } from "./catalog.js";
@@ -168,6 +173,9 @@ export async function startDeskServer(
   const webClient = await (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))();
 
   const events = new EventHub();
+  const unsubscribeInvalidation = options.catalog.subscribeInvalidation(() => {
+    events.publish("catalog-invalidated", {});
+  });
   let liveSources: LiveSourceCoordinator | undefined;
   const server = createServer((request, response) => {
     void handleRequest(
@@ -207,10 +215,11 @@ export async function startDeskServer(
     liveSources = (dependencies.startLiveSources ?? startLiveSourceCoordinator)(
       options.catalog,
       {
-        onEvent: (event) => events.publish("catalog", event),
+        onEvent: () => undefined,
       },
     );
   } catch (error) {
+    unsubscribeInvalidation();
     events.close();
     await closeServer(server);
     throw error;
@@ -227,6 +236,7 @@ export async function startDeskServer(
     url,
     webUrl: `${publicOrigin ?? url}/?token=${encodeURIComponent(token)}`,
     close: async () => {
+      unsubscribeInvalidation();
       await liveSources?.close();
       events.close();
       await closeServer(server);
@@ -256,7 +266,12 @@ async function handleRequest(
     url.pathname === "/api/v1/health"
   ) {
     sendJson(response, 200, {
-      data: { service: "mdmaid.desk", status: "ok", version: API_VERSION },
+      data: {
+        service: "mdmaid.desk",
+        status: "ok",
+        version: API_VERSION,
+        capabilities: ["spaces-v1", "scoped-content-v1"],
+      },
     });
     return;
   }
@@ -274,7 +289,8 @@ async function handleRequest(
       throw new HttpError(401, "unauthorized", "Authentication required");
     }
     response.statusCode = 303;
-    response.setHeader("location", url.pathname);
+    url.searchParams.delete("token");
+    response.setHeader("location", `${url.pathname}${url.search}${url.hash}`);
     response.setHeader(
       "set-cookie",
       `${sessionCookie}=${encodeURIComponent(token)}; HttpOnly;${securePublicOrigin ? " Secure;" : ""} SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}`,
@@ -294,14 +310,21 @@ async function handleRequest(
   );
   if (request.method === "GET" && sourceMatch) {
     try {
+      const scope = parseWorkspaceQueryState(url.searchParams, catalog);
       const source = await catalog.readDocumentSource(
         sourceMatch[1] ?? "",
         sourceMatch[2] ?? "",
+        scope,
       );
       sendHtml(
         response,
         200,
-        sourceViewerHtml(source.document.id, source.name, source.content),
+        sourceViewerHtml(
+          source.document.id,
+          source.name,
+          source.content,
+          workspaceQuerySuffix(url.searchParams, scope),
+        ),
       );
     } catch (error) {
       throw mapCatalogError(error);
@@ -314,9 +337,11 @@ async function handleRequest(
   );
   if (request.method === "GET" && mediaMatch) {
     try {
+      const scope = parseContentScope(url.searchParams, catalog);
       const media = await catalog.readDocumentMedia(
         mediaMatch[1] ?? "",
         mediaMatch[2] ?? "",
+        scope,
       );
       sendDocumentMedia(response, media.contentType, media.content);
     } catch (error) {
@@ -332,6 +357,7 @@ async function handleRequest(
       /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
       /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname))
   ) {
+    parseWorkspaceQueryState(url.searchParams, catalog);
     sendHtml(response, 200, workspaceHtml(url.pathname));
     return;
   }
@@ -346,10 +372,100 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/v1/spaces") {
+    sendJson(response, 200, { data: catalog.listSpaces() });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/spaces") {
+    const body = await readJson(request);
+    if (!isSpaceRegistration(body)) {
+      throw new HttpError(422, "validation_error", "Invalid Space");
+    }
+    try {
+      const space = catalog.createSpace(body);
+      response.setHeader("location", `/api/v1/spaces/${space.id}`);
+      sendJson(response, 201, { data: space });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  const spaceMatchersMatch = url.pathname.match(
+    /^\/api\/v1\/spaces\/([^/]+)\/matchers$/,
+  );
+  if (request.method === "PUT" && spaceMatchersMatch) {
+    const body = await readJson(request);
+    if (!isSpaceMatcherReplacement(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid Space matcher replacement",
+      );
+    }
+    try {
+      sendJson(response, 200, {
+        data: catalog.replaceSpaceMatchers(spaceMatchersMatch[1] ?? "", body),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  const spaceMatch = url.pathname.match(/^\/api\/v1\/spaces\/([^/]+)$/);
+  if (request.method === "GET" && spaceMatch) {
+    try {
+      const space = catalog.getSpace(spaceMatch[1] ?? "");
+      if (!space) {
+        throw new SpaceNotFoundError(spaceMatch[1] ?? "");
+      }
+      sendJson(response, 200, { data: space });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+  if (request.method === "PATCH" && spaceMatch) {
+    const body = await readJson(request);
+    if (
+      !isRecord(body) ||
+      !hasOnlyKeys(body, ["name"]) ||
+      typeof body.name !== "string"
+    ) {
+      throw new HttpError(422, "validation_error", "Invalid Space rename");
+    }
+    try {
+      sendJson(response, 200, {
+        data: catalog.renameSpace(spaceMatch[1] ?? "", body.name),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+  if (request.method === "DELETE" && spaceMatch) {
+    try {
+      sendJson(response, 200, {
+        data: catalog.deleteSpace(spaceMatch[1] ?? ""),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/v1/repositories") {
+    sendJson(response, 200, { data: catalog.listRepositories() });
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/v1/workspaces") {
-    const documents = catalog.listDocuments();
+    const scope = parseContentScope(url.searchParams, catalog);
+    const documents = catalog.listDocuments({}, scope);
     sendJson(response, 200, {
-      data: catalog.listWorkspaces().flatMap((workspace) => {
+      data: catalog.listWorkspaces(scope).flatMap((workspace) => {
         const documentCount = documents.filter(
           ({ workspaceId }) => workspaceId === workspace.id,
         ).length;
@@ -362,11 +478,12 @@ async function handleRequest(
   }
 
   if (request.method === "GET" && url.pathname === "/api/v1/projects") {
+    const scope = parseContentScope(url.searchParams, catalog);
     const projects = new Map<
       string,
       { id: string; name: string; documentCount: number; route: string }
     >();
-    for (const document of catalog.listDocuments()) {
+    for (const document of catalog.listDocuments({}, scope)) {
       const current = projects.get(document.projectId);
       if (current) {
         current.documentCount += 1;
@@ -396,10 +513,6 @@ async function handleRequest(
       const workspace = await catalog.addWorkspace(body);
       response.setHeader("location", `/api/v1/workspaces/${workspace.id}`);
       sendJson(response, 201, { data: publicWorkspace(workspace, 0) });
-      events.publish("catalog", {
-        action: "workspace-added",
-        workspaceId: workspace.id,
-      });
     } catch (error) {
       if (error instanceof Error) {
         throw new HttpError(
@@ -415,8 +528,9 @@ async function handleRequest(
 
   if (request.method === "GET" && url.pathname === "/api/v1/documents") {
     const filters = parseDocumentFilters(url.searchParams);
+    const scope = parseContentScope(url.searchParams, catalog);
     sendJson(response, 200, {
-      data: catalog.listDocuments(filters).map(publicDocument),
+      data: catalog.listDocuments(filters, scope).map(publicDocument),
     });
     return;
   }
@@ -435,7 +549,6 @@ async function handleRequest(
       liveSources?.refresh();
       response.setHeader("location", `/api/v1/documents/${document.id}`);
       sendJson(response, 201, { data: publicDocument(document) });
-      events.publish("catalog", { action: "registered", documentId: document.id });
     } catch (error) {
       if (error instanceof MermaidValidationError) {
         throw new HttpError(
@@ -470,7 +583,6 @@ async function handleRequest(
       const document = await catalog.importDocument(body);
       response.setHeader("location", `/api/v1/documents/${document.id}`);
       sendJson(response, 201, { data: publicDocument(document) });
-      events.publish("catalog", { action: "imported", documentId: document.id });
     } catch (error) {
       if (error instanceof MermaidValidationError) {
         throw new HttpError(
@@ -493,6 +605,7 @@ async function handleRequest(
   }
 
   if (request.method === "GET" && url.pathname === "/api/v1/review-requests") {
+    const scope = parseContentScope(url.searchParams, catalog);
     const documentId = url.searchParams.get("document") ?? undefined;
     const status = url.searchParams.get("status") ?? undefined;
     try {
@@ -503,7 +616,7 @@ async function handleRequest(
             ...(status === undefined
               ? {}
               : { status: status as ReviewRequest["status"] }),
-          })
+          }, scope)
           .map(publicReviewRequest),
       });
     } catch (error) {
@@ -513,6 +626,7 @@ async function handleRequest(
   }
 
   if (request.method === "POST" && url.pathname === "/api/v1/review-requests") {
+    const scope = parseContentScope(url.searchParams, catalog);
     const body = await readJson(request);
     if (!isReviewRequestRegistration(body)) {
       throw new HttpError(
@@ -522,17 +636,12 @@ async function handleRequest(
       );
     }
     try {
-      const reviewRequest = await catalog.createReviewRequest(body);
+      const reviewRequest = await catalog.createReviewRequest(body, scope);
       response.setHeader(
         "location",
         `/api/v1/review-requests/${reviewRequest.id}`,
       );
       sendJson(response, 201, { data: publicReviewRequest(reviewRequest) });
-      events.publish("catalog", {
-        action: "review-created",
-        documentId: reviewRequest.documentId,
-        reviewRequestId: reviewRequest.id,
-      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -543,7 +652,11 @@ async function handleRequest(
     /^\/api\/v1\/review-requests\/(review-[a-f0-9]{20})$/,
   );
   if (request.method === "GET" && reviewRequestMatch) {
-    const reviewRequest = catalog.getReviewRequest(reviewRequestMatch[1] ?? "");
+    const scope = parseContentScope(url.searchParams, catalog);
+    const reviewRequest = catalog.getReviewRequest(
+      reviewRequestMatch[1] ?? "",
+      scope,
+    );
     if (!reviewRequest) {
       throw new HttpError(404, "not_found", "Review request not found");
     }
@@ -555,6 +668,7 @@ async function handleRequest(
     /^\/api\/v1\/review-requests\/(review-[a-f0-9]{20})\/respond$/,
   );
   if (request.method === "POST" && reviewResponseMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
     const body = await readJson(request);
     if (!isReviewRequestResponse(body)) {
       throw new HttpError(
@@ -567,13 +681,9 @@ async function handleRequest(
       const reviewRequest = await catalog.respondToReviewRequest(
         reviewResponseMatch[1] ?? "",
         body,
+        scope,
       );
       sendJson(response, 200, { data: publicReviewRequest(reviewRequest) });
-      events.publish("catalog", {
-        action: "review-responded",
-        documentId: reviewRequest.documentId,
-        reviewRequestId: reviewRequest.id,
-      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -584,7 +694,8 @@ async function handleRequest(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})$/,
   );
   if (request.method === "GET" && documentMatch) {
-    const document = catalog.getDocument(documentMatch[1] ?? "");
+    const scope = parseContentScope(url.searchParams, catalog);
+    const document = catalog.getDocument(documentMatch[1] ?? "", scope);
     if (!document) {
       throw new HttpError(404, "not_found", "Document not found");
     }
@@ -596,12 +707,14 @@ async function handleRequest(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/render$/,
   );
   if (request.method === "GET" && renderMatch) {
+    const scope = parseWorkspaceQueryState(url.searchParams, catalog);
+    const querySuffix = workspaceQuerySuffix(url.searchParams, scope);
     const id = renderMatch[1] ?? "";
     const target = url.searchParams.get("target");
     if (target !== "web" && target !== "terminal") {
       throw new HttpError(400, "invalid_target", "Unknown render target");
     }
-    const { content, document } = await readDocument(catalog, id);
+    const { content, document } = await readDocument(catalog, id, scope);
     const changeReview = document.kind === "change-review"
       ? parseChangeReviewDiffs(content)
       : undefined;
@@ -609,15 +722,21 @@ async function handleRequest(
       ? changeReviewNarrative(content)
       : content;
     if (target === "web") {
-      const documentTargets = catalog.resolveDocumentSourceTargets(document.id);
+      const renderedMarkdown = await renderMarkdown(narrative, { sanitize: false });
+      const current = catalog.getDocument(id, scope);
+      if (!current) {
+        throw new HttpError(404, "not_found", "Document not found");
+      }
+      const documentTargets = catalog.resolveDocumentSourceTargets(current.id, scope);
       const rendered = sanitizeRenderedHtml(
-        await renderMarkdown(narrative, { sanitize: false }),
-        document,
+        renderedMarkdown,
+        current,
         documentTargets,
+        querySuffix,
       );
       sendJson(response, 200, {
         data: {
-          document: publicDocument(document),
+          document: publicDocument(current),
           target,
           content: rendered,
           ...(changeReview === undefined ? {} : { changeReview }),
@@ -638,9 +757,13 @@ async function handleRequest(
       unicode,
       width,
     });
+    const current = catalog.getDocument(id, scope);
+    if (!current) {
+      throw new HttpError(404, "not_found", "Document not found");
+    }
     sendJson(response, 200, {
       data: {
-        document: publicDocument(document),
+        document: publicDocument(current),
         target,
         content: sanitizeTerminalText(rendered.output, { preserveSgr: true }),
         backend: rendered.backend,
@@ -655,16 +778,17 @@ async function handleRequest(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/(opened|read|unread|archive|restore|missing|present)$/,
   );
   if (request.method === "POST" && actionMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
     const id = actionMatch[1] ?? "";
     const action = actionMatch[2] ?? "";
     const actions: Record<string, () => Promise<Document>> = {
-      opened: () => catalog.markDocumentOpened(id),
-      read: () => catalog.markDocumentRead(id),
-      unread: () => catalog.markDocumentUnread(id),
-      archive: () => catalog.archiveDocument(id),
-      restore: () => catalog.restoreDocument(id),
-      missing: () => catalog.markDocumentMissing(id),
-      present: () => catalog.markDocumentPresent(id),
+      opened: () => catalog.markDocumentOpened(id, scope),
+      read: () => catalog.markDocumentRead(id, scope),
+      unread: () => catalog.markDocumentUnread(id, scope),
+      archive: () => catalog.archiveDocument(id, scope),
+      restore: () => catalog.restoreDocument(id, scope),
+      missing: () => catalog.markDocumentMissing(id, scope),
+      present: () => catalog.markDocumentPresent(id, scope),
     };
     const operation = actions[action];
     if (!operation) {
@@ -676,10 +800,6 @@ async function handleRequest(
         liveSources?.refresh();
       }
       sendJson(response, 200, { data: publicDocument(document) });
-      events.publish("catalog", {
-        action,
-        documentId: document.id,
-      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -690,6 +810,7 @@ async function handleRequest(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/tags$/,
   );
   if (request.method === "PUT" && tagsMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
     const body = await readJson(request);
     if (
       !isRecord(body) ||
@@ -703,12 +824,9 @@ async function handleRequest(
       const document = await catalog.setDocumentTags(
         tagsMatch[1] ?? "",
         body.tags,
+        scope,
       );
       sendJson(response, 200, { data: publicDocument(document) });
-      events.publish("catalog", {
-        action: "tags",
-        documentId: document.id,
-      });
     } catch (error) {
       throw mapCatalogError(error);
     }
@@ -821,6 +939,7 @@ function parseDocumentFilters(search: URLSearchParams): DocumentFilters {
     "attention",
     "archived",
     "missing",
+    "space",
   ]);
   for (const key of search.keys()) {
     if (!allowed.has(key)) {
@@ -899,15 +1018,22 @@ function parseRenderBoolean(
 async function readDocument(
   catalog: Catalog,
   id: string,
+  scope: ContentScope,
 ): ReturnType<Catalog["readDocument"]> {
   try {
-    return await catalog.readDocument(id);
+    return await catalog.readDocument(id, scope);
   } catch (error) {
     throw mapCatalogError(error);
   }
 }
 
 function mapCatalogError(error: unknown): HttpError {
+  if (error instanceof SpaceNotFoundError) {
+    return new HttpError(404, "space_not_found", error.message);
+  }
+  if (error instanceof SpaceConflictError) {
+    return new HttpError(409, "space_conflict", error.message);
+  }
   if (error instanceof MermaidValidationError) {
     return new HttpError(
       422,
@@ -952,6 +1078,65 @@ function mapCatalogError(error: unknown): HttpError {
     return new HttpError(422, "validation_error", error.message);
   }
   return new HttpError(500, "internal_error", "Internal server error");
+}
+
+function parseContentScope(
+  parameters: URLSearchParams,
+  catalog: Catalog,
+): ContentScope {
+  const values = parameters.getAll("space");
+  if (values.length > 1) {
+    throw new HttpError(400, "validation_error", "space may be specified once");
+  }
+  const spaceId = values[0];
+  if (spaceId === undefined) {
+    return {};
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(spaceId)) {
+    throw new HttpError(400, "validation_error", "invalid Space id");
+  }
+  if (!catalog.getSpace(spaceId)) {
+    throw new HttpError(404, "space_not_found", `unknown space ${spaceId}`);
+  }
+  return { spaceId };
+}
+
+function parseWorkspaceQueryState(
+  parameters: URLSearchParams,
+  catalog: Catalog,
+): ContentScope {
+  const scope = parseContentScope(parameters, catalog);
+  const view = parameters.getAll("view");
+  if (
+    view.length > 1 ||
+    (view[0] !== undefined && view[0] !== "docs" && view[0] !== "change-reviews")
+  ) {
+    throw new HttpError(400, "validation_error", "invalid view");
+  }
+  const actions = parameters.getAll("actions");
+  if (actions.length > 1 || (actions[0] !== undefined && actions[0] !== "1")) {
+    throw new HttpError(400, "validation_error", "invalid actions filter");
+  }
+  return scope;
+}
+
+function workspaceQuerySuffix(
+  parameters: URLSearchParams,
+  scope: ContentScope,
+): string {
+  const query = new URLSearchParams();
+  if (scope.spaceId !== undefined) {
+    query.set("space", scope.spaceId);
+  }
+  const view = parameters.get("view");
+  if (view === "docs" || view === "change-reviews") {
+    query.set("view", view);
+  }
+  if (parameters.get("actions") === "1") {
+    query.set("actions", "1");
+  }
+  const value = query.toString();
+  return value === "" ? "" : `?${value}`;
 }
 
 function publicDocument(document: Document): Record<string, unknown> {
@@ -999,6 +1184,7 @@ function sanitizeRenderedHtml(
   content: string,
   document: Document,
   documentTargets: ReadonlyMap<string, string>,
+  querySuffix: string,
 ): string {
   const sourceLinks = new Map(
     document.sourceLinks.map((link) => [link.href, link]),
@@ -1046,8 +1232,8 @@ function sanitizeRenderedHtml(
             ? {
                 ...attribs,
                 href: targetDocumentId
-                  ? registeredDocumentRoute(targetDocumentId, link.href)
-                  : documentSourceRoute(document.id, link),
+                  ? registeredDocumentRoute(targetDocumentId, link.href, querySuffix)
+                  : documentSourceRoute(document.id, link, querySuffix),
               }
             : attribs,
         };
@@ -1061,7 +1247,7 @@ function sanitizeRenderedHtml(
           attribs: media
             ? {
                 ...attribs,
-                src: documentMediaRoute(document.id, media),
+                src: documentMediaRoute(document.id, media, querySuffix),
               }
             : attribs,
         };
@@ -1070,31 +1256,38 @@ function sanitizeRenderedHtml(
   });
 }
 
-function registeredDocumentRoute(documentId: string, href: string): string {
+function registeredDocumentRoute(
+  documentId: string,
+  href: string,
+  querySuffix: string,
+): string {
   const fragmentIndex = href.indexOf("#");
   const fragment = fragmentIndex === -1 ? "" : href.slice(fragmentIndex);
-  return `/d/${documentId}${fragment}`;
+  return `/d/${documentId}${querySuffix}${fragment}`;
 }
 
 function documentSourceRoute(
   documentId: string,
   link: Document["sourceLinks"][number],
+  querySuffix: string,
 ): string {
   const line = link.href.match(/#(L[1-9][0-9]*)$/)?.[1];
-  return `/d/${documentId}/source/${link.id}${line ? `#${line}` : ""}`;
+  return `/d/${documentId}/source/${link.id}${querySuffix}${line ? `#${line}` : ""}`;
 }
 
 function documentMediaRoute(
   documentId: string,
   link: Document["sourceLinks"][number],
+  querySuffix: string,
 ): string {
-  return `/d/${documentId}/media/${link.id}`;
+  return `/d/${documentId}/media/${link.id}${querySuffix}`;
 }
 
 function sourceViewerHtml(
   documentId: string,
   name: string,
   content: string,
+  querySuffix: string,
 ): string {
   const lines = content.endsWith("\n")
     ? content.slice(0, -1).split("\n")
@@ -1118,11 +1311,11 @@ function sourceViewerHtml(
   </head>
   <body class="source-page">
     <header class="topbar">
-      <div class="brand">
+      <a class="brand" href="/">
         <strong>mdmaid.desk</strong>
         <span>workspace source</span>
-      </div>
-      <a class="action" href="/d/${documentId}">← document</a>
+      </a>
+      <a class="action" href="/d/${documentId}${querySuffix}">← document</a>
     </header>
     <main class="source-viewer">
       <span class="eyebrow">linked source</span>
@@ -1191,6 +1384,31 @@ function isDocumentRegistration(value: unknown): value is RegisterDocumentInput 
       (Array.isArray(value.tags) &&
         value.tags.every((tag) => typeof tag === "string")))
   );
+}
+
+function isSpaceMatcher(value: unknown): boolean {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ["kind", "value"]) &&
+    typeof value.kind === "string" &&
+    typeof value.value === "string";
+}
+
+function isSpaceRegistration(value: unknown): value is CreateSpaceInput {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ["id", "name", "matchers"]) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    Array.isArray(value.matchers) &&
+    value.matchers.every(isSpaceMatcher);
+}
+
+function isSpaceMatcherReplacement(
+  value: unknown,
+): value is ReplaceSpaceMatchersInput {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ["matchers"]) &&
+    Array.isArray(value.matchers) &&
+    value.matchers.every(isSpaceMatcher);
 }
 
 function isWorkspaceRegistration(value: unknown): value is AddWorkspaceInput {
@@ -1371,31 +1589,37 @@ function workspaceHtml(pathname: string): string {
   </head>
   <body data-document-id="${documentId}" data-workspace-id="${workspaceId}" data-project-id="${projectId}">
     <header class="topbar">
-      <div class="brand">
+      <a class="brand" href="/">
         <strong>mdmaid.desk</strong>
         <span>reading + change review workspace</span>
-      </div>
+      </a>
+      <nav class="global-filters" aria-label="Workspace filters">
+        <label class="filter-picker" for="project-select">
+          <span>project</span>
+          <span class="project-combobox">
+            <input id="project-select" data-testid="project-select" type="search" role="combobox" aria-label="Project" aria-autocomplete="list" aria-controls="project-options" aria-expanded="false" autocomplete="off" spellcheck="false" placeholder="Search projects…" value="All projects">
+            <span id="project-options" class="project-options" role="listbox" hidden></span>
+          </span>
+        </label>
+        <label class="space-picker" for="space-select">
+          <span>space</span>
+          <select id="space-select"><option value="">All</option></select>
+        </label>
+        <div class="content-mode-switch" aria-label="Content type">
+          <button id="docs-filter" class="content-mode active" type="button" aria-pressed="true">docs</button>
+          <button id="change-reviews-filter" class="content-mode" type="button" aria-pressed="false">
+            change reviews <span id="change-reviews-count" class="count">0</span>
+          </button>
+        </div>
+      </nav>
       <div class="top-actions">
-        <span id="live-status" class="live offline">○ connecting</span>
+        <span id="pending-decisions" class="pending-decisions" role="status" aria-live="polite" hidden>● waiting for decision = <span id="pending-decisions-count">0</span></span>
+        <span id="live-status" class="live offline" role="status" aria-live="polite">○ connecting</span>
         <button id="theme-toggle" class="icon-button" type="button" aria-label="Toggle theme">◐</button>
       </div>
     </header>
-    <div class="workspace">
-      <aside class="sidebar">
-        <h2>projects</h2>
-        <nav id="project-nav" class="project-nav" data-testid="project-nav"></nav>
-        <section class="actions-nav" aria-labelledby="spaces-title">
-          <h2 id="spaces-title">spaces</h2>
-          <button id="change-reviews-filter" class="project-button" type="button">
-            <span>change reviews</span><span id="change-reviews-count" class="count">0</span>
-          </button>
-        </section>
-        <section class="actions-nav" aria-labelledby="actions-title">
-          <h2 id="actions-title">actions</h2>
-          <button id="actions-filter" class="project-button" type="button">
-            <span>waiting for you</span><span id="actions-count" class="count">0</span>
-          </button>
-        </section>
+    <div id="workspace" class="workspace">
+      <aside id="sidebar" class="sidebar" hidden>
         <nav id="reader-toc" class="reader-toc" aria-labelledby="reader-toc-title" data-testid="reader-toc" hidden>
           <h2 id="reader-toc-title">contents</h2>
           <ol id="reader-toc-list" class="toc-list"></ol>
@@ -1420,11 +1644,12 @@ function workspaceHtml(pathname: string): string {
             </div>
             <div class="controls">
               <input id="search" class="search" type="search" placeholder="search title, task, tag, producer…" autocomplete="off">
-              <div class="status-filters" aria-label="Reading status">
-                <button class="status-filter active" type="button" data-status-filter="all">all <span class="count">0</span></button>
-                <button class="status-filter" type="button" data-status-filter="unread">unread <span class="count">0</span></button>
-                <button class="status-filter" type="button" data-status-filter="reading">reading <span class="count">0</span></button>
-                <button class="status-filter" type="button" data-status-filter="done">done <span class="count">0</span></button>
+              <div class="status-filters" role="group" aria-label="Queue status">
+                <button class="status-filter active" type="button" data-status-filter="all" aria-pressed="true">all <span class="count">0</span></button>
+                <button id="actions-filter" class="status-filter" type="button" aria-pressed="false">waiting for you <span id="actions-count" class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="unread" aria-pressed="false">unread <span class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="reading" aria-pressed="false">reading <span class="count">0</span></button>
+                <button class="status-filter" type="button" data-status-filter="done" aria-pressed="false">done <span class="count">0</span></button>
               </div>
             </div>
             <div class="grouping-switch" role="group" aria-label="Group documents">

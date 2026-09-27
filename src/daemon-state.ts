@@ -10,7 +10,10 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
-import { DeskApiClient } from "./api-client.js";
+import {
+  DaemonHealthCompatibilityError,
+  DeskApiClient,
+} from "./api-client.js";
 import { syncDirectory } from "./fs-durability.js";
 import { normalizePublicUrl, type RunningDeskServer } from "./server.js";
 
@@ -195,14 +198,19 @@ export async function connectToDaemonInfo(
   try {
     const health = await client.health(AbortSignal.timeout(1_000));
     if (health.version !== descriptor.protocolVersion) {
-      throw new Error("Daemon protocol version does not match its descriptor");
+      throw new DaemonHealthCompatibilityError(
+        "The running mdmaid.desk daemon protocol does not match its descriptor; restart it after upgrading",
+      );
     }
     return {
       client,
       descriptor,
       url: `http://${host}:${descriptor.port}`,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof DaemonHealthCompatibilityError) {
+      throw error;
+    }
     await removeDaemonDescriptor(path, descriptor);
     return undefined;
   }

@@ -17,6 +17,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { Catalog, DocumentSourceMissingError } from "./catalog.js";
+import { SqliteCatalogStorage } from "./sqlite-storage.js";
 
 async function fixture(): Promise<{
   catalog: Catalog;
@@ -294,6 +295,518 @@ test("supports SSH repository identity, ticketless projects, and late AI naming"
     }),
     /invalid repository name/,
   );
+  catalog.close();
+});
+
+test("manages normalized Spaces and sanitized repository inventory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-spaces-"));
+  const firstRoot = join(root, "first");
+  const secondRoot = join(root, "second");
+  await mkdir(firstRoot);
+  await mkdir(secondRoot);
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "first",
+    name: "First workspace",
+    root: firstRoot,
+    artifactRoots: [firstRoot],
+    repository: "https://github.com/Acme/App.git",
+    repositoryName: "Zulu",
+  });
+  await catalog.addWorkspace({
+    id: "second",
+    name: "Second workspace",
+    root: secondRoot,
+    artifactRoots: [secondRoot],
+    repository: "git@github.com:acme/app.git",
+    repositoryName: "Alpha",
+  });
+
+  assert.deepEqual(catalog.listRepositories(), [
+    {
+      key: "github.com/acme/app",
+      name: "Alpha",
+      workspaceIds: ["first", "second"],
+      kind: "remote",
+    },
+  ]);
+
+  const work = catalog.createSpace({
+    id: "work",
+    name: " Work ",
+    matchers: [
+      { kind: "repository", value: "https://github.com/Acme/App.git" },
+      { kind: "repository", value: "git@github.com:acme/app.git" },
+      { kind: "repository-namespace", value: "GitHub.com/Acme" },
+      { kind: "tag", value: " Client-Work " },
+    ],
+  });
+  assert.deepEqual(work, {
+    id: "work",
+    name: "Work",
+    matchers: [
+      { kind: "repository", value: "github.com/acme/app" },
+      { kind: "repository-namespace", value: "github.com/acme" },
+      { kind: "tag", value: "client-work" },
+    ],
+  });
+  catalog.createSpace({
+    id: "home",
+    name: "Home",
+    matchers: [{ kind: "tag", value: "home" }],
+  });
+  assert.deepEqual(catalog.listSpaces().map(({ id }) => id), ["home", "work"]);
+
+  assert.deepEqual(catalog.renameSpace("work", "Client work").name, "Client work");
+  assert.deepEqual(
+    catalog.replaceSpaceMatchers("work", {
+      matchers: [{ kind: "repository", value: "github.com/acme/app" }],
+    }).matchers,
+    [{ kind: "repository", value: "github.com/acme/app" }],
+  );
+  assert.throws(
+    () => catalog.replaceSpaceMatchers("work", { matchers: [] }),
+    /at least one matcher/,
+  );
+  assert.deepEqual(catalog.getSpace("work")?.matchers, [
+    { kind: "repository", value: "github.com/acme/app" },
+  ]);
+
+  assert.throws(
+    () => catalog.createSpace({ id: "work", name: "Again", matchers: [
+      { kind: "tag", value: "again" },
+    ] }),
+    /space work already exists/,
+  );
+  assert.deepEqual(catalog.deleteSpace("home"), { id: "home" });
+  assert.equal(catalog.getSpace("home"), undefined);
+  assert.throws(() => catalog.deleteSpace("home"), /unknown space home/);
+  catalog.close();
+});
+
+test("rejects invalid Space matcher values atomically", async () => {
+  const { catalog } = await fixture();
+  const original = catalog.createSpace({
+    id: "work",
+    name: "Work",
+    matchers: [{ kind: "tag", value: "work" }],
+  });
+
+  for (const matcher of [
+    { kind: "repository-namespace", value: "github.com" },
+    { kind: "repository-namespace", value: "local:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+    { kind: "repository", value: "not a repository?secret=yes" },
+    { kind: "tag", value: "unsafe tag" },
+    { kind: "unknown", value: "work" },
+  ]) {
+    assert.throws(
+      () => catalog.replaceSpaceMatchers("work", { matchers: [matcher] }),
+      /invalid|unknown|namespace|tag/,
+    );
+    assert.deepEqual(catalog.getSpace("work"), original);
+  }
+  catalog.close();
+});
+
+test("derives scoped documents, workspaces, and reviews from current facts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-space-scope-"));
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  const workspaceInputs = [
+    ["acme", "github.com/acme/app"],
+    ["acme-labs", "github.com/acme-labs/app"],
+    ["partner", "github.com/partner/tool"],
+  ] as const;
+  for (const [id, repository] of workspaceInputs) {
+    const workspaceRoot = join(root, id);
+    await mkdir(workspaceRoot);
+    await catalog.addWorkspace({
+      id,
+      name: id,
+      root: workspaceRoot,
+      artifactRoots: [workspaceRoot],
+      repository,
+    });
+    await writeFile(join(workspaceRoot, "plan.md"), `# ${id}\n`, "utf8");
+  }
+  const acme = await catalog.registerDocument({
+    workspaceId: "acme",
+    kind: "plan",
+    title: "Acme",
+    path: join(root, "acme", "plan.md"),
+    attention: "approval",
+    tags: ["client"],
+  });
+  await catalog.registerDocument({
+    workspaceId: "acme-labs",
+    kind: "plan",
+    title: "Acme Labs",
+    path: join(root, "acme-labs", "plan.md"),
+    attention: "none",
+  });
+  const partner = await catalog.registerDocument({
+    workspaceId: "partner",
+    kind: "plan",
+    title: "Partner",
+    path: join(root, "partner", "plan.md"),
+    attention: "none",
+    tags: ["client"],
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: acme.id,
+    kind: "plan-decision",
+    requestMessage: "Review Acme",
+  });
+
+  catalog.createSpace({
+    id: "acme-org",
+    name: "Acme org",
+    matchers: [{ kind: "repository-namespace", value: "github.com/acme" }],
+  });
+  catalog.createSpace({
+    id: "clients",
+    name: "Clients",
+    matchers: [{ kind: "tag", value: "client" }],
+  });
+  catalog.createSpace({
+    id: "partner",
+    name: "Partner",
+    matchers: [{ kind: "repository", value: "github.com/partner/tool" }],
+  });
+
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "acme-org" }).map(({ title }) => title),
+    ["Acme"],
+  );
+  assert.deepEqual(
+    catalog.listWorkspaces({ spaceId: "acme-org" }).map(({ id }) => id),
+    ["acme"],
+  );
+  assert.equal(catalog.getDocument(partner.id, { spaceId: "acme-org" }), undefined);
+  assert.deepEqual(
+    catalog.listReviewRequests({}, { spaceId: "acme-org" }).map(({ id }) => id),
+    [review.id],
+  );
+  assert.equal(
+    catalog.getReviewRequest(review.id, { spaceId: "partner" }),
+    undefined,
+  );
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "clients" }).map(({ title }) => title).sort(),
+    ["Acme", "Partner"],
+  );
+
+  await catalog.setDocumentTags(partner.id, []);
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "clients" }).map(({ title }) => title),
+    ["Acme"],
+  );
+  const futurePath = join(root, "partner", "future.md");
+  await writeFile(futurePath, "# Future\n", "utf8");
+  const future = await catalog.registerDocument({
+    workspaceId: "partner",
+    kind: "brief",
+    title: "Future",
+    path: futurePath,
+    attention: "none",
+  });
+  assert.equal(catalog.getDocument(future.id, { spaceId: "partner" })?.title, "Future");
+
+  assert.throws(
+    () => catalog.listDocuments({}, { spaceId: "missing" }),
+    /unknown space missing/,
+  );
+  assert.throws(
+    () => catalog.listDocuments({}, { spaceId: "Invalid Space" }),
+    /invalid Space id/,
+  );
+  assert.equal(catalog.listDocuments().length, 4);
+  catalog.close();
+});
+
+test("keeps derived Space membership indexed and query-count constant at scale", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-scope-plan-"));
+  const statePath = join(root, "catalog.sqlite3");
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const documentIds: string[] = [];
+  const reviewIds: string[] = [];
+  for (let workspaceIndex = 0; workspaceIndex < 32; workspaceIndex += 1) {
+    const workspaceId = `workspace-${workspaceIndex}`;
+    const workspaceRoot = join(root, workspaceId);
+    await mkdir(workspaceRoot);
+    await catalog.addWorkspace({
+      id: workspaceId,
+      name: `Workspace ${workspaceIndex}`,
+      root: workspaceRoot,
+      artifactRoots: [workspaceRoot],
+      repository: `https://github.com/org-${workspaceIndex % 4}/repo-${workspaceIndex}.git`,
+      repositoryName: `Repo ${workspaceIndex}`,
+    });
+    for (let documentIndex = 0; documentIndex < 8; documentIndex += 1) {
+      const path = join(workspaceRoot, `document-${documentIndex}.md`);
+      await writeFile(path, `# ${workspaceId} document ${documentIndex}\n`, "utf8");
+      const document = await catalog.registerDocument({
+        workspaceId,
+        taskId: `TASK-${documentIndex}`,
+        kind: documentIndex === 0 ? "review" : "plan",
+        title: `${workspaceId} document ${documentIndex}`,
+        path,
+        attention: "review",
+        tags: [
+          `tag-${documentIndex % 4}`,
+          `team-${workspaceIndex % 4}`,
+          `row-${documentIndex}`,
+          "shared",
+        ],
+      });
+      documentIds.push(document.id);
+      if (documentIndex === 0) {
+        const review = await catalog.createReviewRequest({
+          documentId: document.id,
+          kind: "plan-decision",
+          requestMessage: "Review at scale",
+        });
+        reviewIds.push(review.id);
+      }
+    }
+  }
+  catalog.createSpace({
+    id: "scope-small",
+    name: "Small",
+    matchers: [
+      { kind: "repository", value: "github.com/org-0/repo-0" },
+      { kind: "repository", value: "github.com/org-1/repo-1" },
+      { kind: "repository-namespace", value: "github.com/unused-0" },
+      { kind: "repository-namespace", value: "github.com/unused-1" },
+      { kind: "tag", value: "unused-0" },
+      { kind: "tag", value: "unused-1" },
+      { kind: "tag", value: "unused-2" },
+      { kind: "tag", value: "unused-3" },
+    ],
+  });
+  catalog.createSpace({
+    id: "scope-full",
+    name: "Full",
+    matchers: [
+      { kind: "repository-namespace", value: "github.com/org-0" },
+      { kind: "repository-namespace", value: "github.com/org-1" },
+      { kind: "repository-namespace", value: "github.com/org-2" },
+      { kind: "repository-namespace", value: "github.com/org-3" },
+      { kind: "tag", value: "tag-0" },
+      { kind: "tag", value: "tag-1" },
+      { kind: "tag", value: "tag-2" },
+      { kind: "tag", value: "tag-3" },
+    ],
+  });
+  for (let index = 0; index < 10; index += 1) {
+    catalog.createSpace({
+      id: `scope-extra-${index}`,
+      name: `Extra ${index}`,
+      matchers: Array.from({ length: 8 }, (_, matcherIndex) => ({
+        kind: "tag" as const,
+        value: `extra-${index}-${matcherIndex}`,
+      })),
+    });
+  }
+  assert.equal(catalog.listDocuments().length, 256);
+  catalog.close();
+
+  const database = new Database(statePath);
+  const membership = `EXISTS (
+    SELECT 1 FROM space_matchers sm
+    WHERE sm.space_id = ? AND (
+      (sm.kind = 'repository' AND sm.value = wr.repository_key)
+      OR (sm.kind = 'repository-namespace'
+        AND substr(wr.repository_key, 1, length(sm.value) + 1) = sm.value || '/')
+      OR (sm.kind = 'tag' AND EXISTS (
+        SELECT 1 FROM document_tags scope_tags
+        WHERE scope_tags.document_id = d.id AND scope_tags.tag_name = sm.value
+      ))
+    )
+  )`;
+  const documentSelect = `SELECT d.id FROM documents d
+    JOIN document_projects dp ON dp.document_id = d.id
+    JOIN projects p ON p.id = dp.project_id
+    JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id`;
+  const queryShapes: Array<{ sql: string; parameters: string[] }> = [
+    { sql: `${documentSelect} WHERE d.archived_at IS NULL AND ${membership}`, parameters: ["scope-full"] },
+    { sql: `${documentSelect} WHERE d.id = ? AND ${membership}`, parameters: [documentIds[0]!, "scope-full"] },
+    { sql: `SELECT rr.id FROM review_requests rr JOIN documents d ON d.id = rr.document_id JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE ${membership}`, parameters: ["scope-full"] },
+    { sql: `SELECT rr.id FROM review_requests rr JOIN documents d ON d.id = rr.document_id JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE rr.id = ? AND ${membership}`, parameters: [reviewIds[0]!, "scope-full"] },
+    { sql: `SELECT w.id FROM workspaces w WHERE EXISTS (SELECT 1 FROM documents d JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE d.workspace_id = w.id AND d.archived_at IS NULL AND ${membership})`, parameters: ["scope-full"] },
+  ];
+  const planDetails = queryShapes.flatMap(({ sql, parameters }) =>
+    database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...parameters)
+      .map((row) => String((row as { detail: string }).detail)),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH sm(?: EXISTS)? USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH scope_tags USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH wr USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  for (const relation of ["sm", "scope_tags", "wr"]) {
+    assert.equal(
+      planDetails.some((detail) => new RegExp(`(?:^| )SCAN ${relation}(?: |$)`).test(detail)),
+      false,
+      planDetails.join("\n"),
+    );
+  }
+
+  const matcherIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect} WHERE d.archived_at IS NULL AND ${membership.replace(
+      "space_matchers sm",
+      "space_matchers sm NOT INDEXED",
+    )}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(matcherIndexDisabledPlan.some((detail) => /SCAN sm(?: |$)/.test(detail)));
+
+  const tagIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect} WHERE d.archived_at IS NULL AND ${membership.replace(
+      "document_tags scope_tags",
+      "document_tags scope_tags NOT INDEXED",
+    )}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(tagIndexDisabledPlan.some((detail) => /SCAN scope_tags(?: |$)/.test(detail)));
+
+  const repositoryIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect.replace(
+      "JOIN workspace_repositories wr ON",
+      "JOIN workspace_repositories wr NOT INDEXED ON",
+    )} WHERE d.archived_at IS NULL AND ${membership}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(repositoryIndexDisabledPlan.some((detail) => /SCAN wr(?: |$)/.test(detail)));
+
+  database.close();
+
+  const observedQueries: string[] = [];
+  const measuredStorage = SqliteCatalogStorage.open(statePath, {
+    onQuery: (sql) => observedQueries.push(sql),
+  });
+  const refreshQueryCount = (spaceId: string): number => {
+    observedQueries.length = 0;
+    measuredStorage.listDocuments({}, { spaceId });
+    measuredStorage.listReviewRequests({}, { spaceId });
+    measuredStorage.listWorkspaces({ spaceId });
+    return observedQueries.filter((sql) => /^\s*SELECT\b/i.test(sql)).length;
+  };
+  const smallQueryCount = refreshQueryCount("scope-small");
+  const fullQueryCount = refreshQueryCount("scope-full");
+  assert.equal(
+    fullQueryCount,
+    smallQueryCount,
+    `small=${smallQueryCount}, full=${fullQueryCount}`,
+  );
+  assert.ok(fullQueryCount <= 8, `full=${fullQueryCount}`);
+  measuredStorage.close();
+});
+
+test("contains direct reads, mutations, reviews, and reference targets by Space", async () => {
+  const { catalog, workspace } = await fixture();
+  const inPath = join(workspace, "reports", "in-scope.md");
+  const outPath = join(workspace, "reports", "out-of-scope.md");
+  await writeFile(
+    inPath,
+    "# In scope\n\n[Registered target](./out-of-scope.md)\n",
+    "utf8",
+  );
+  await writeFile(outPath, "# Out of scope\n", "utf8");
+  const inScope = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "In scope",
+    path: inPath,
+    attention: "approval",
+    tags: ["client"],
+  });
+  const outOfScope = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Out of scope",
+    path: outPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: outOfScope.id,
+    kind: "plan-decision",
+    requestMessage: "Must stay outside",
+  });
+  catalog.createSpace({
+    id: "client",
+    name: "Client",
+    matchers: [{ kind: "tag", value: "client" }],
+  });
+  const scope = { spaceId: "client" };
+
+  await assert.rejects(catalog.readDocument(outOfScope.id, scope), /unknown document/);
+  await assert.rejects(catalog.markDocumentOpened(outOfScope.id, scope), /unknown document/);
+  await assert.rejects(
+    catalog.respondToReviewRequest(review.id, { outcome: "approved", message: "" }, scope),
+    /unknown review request/,
+  );
+  assert.deepEqual(catalog.resolveDocumentSourceTargets(inScope.id, scope), new Map());
+
+  const removed = await catalog.setDocumentTags(inScope.id, [], scope);
+  assert.deepEqual(removed.tags, []);
+  assert.equal(catalog.getDocument(inScope.id, scope), undefined);
+  await assert.rejects(catalog.readDocument(inScope.id, scope), /unknown document/);
+  catalog.close();
+});
+
+test("publishes metadata-free invalidation once for committed catalog changes", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "transactional-invalidation.md");
+  await writeFile(documentPath, "# Transactional invalidation\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Transactional invalidation",
+    path: documentPath,
+    attention: "approval",
+  });
+  const events: Array<Record<string, never>> = [];
+  catalog.subscribeInvalidation(() => {
+    throw new Error("observer failure");
+  });
+  const unsubscribe = catalog.subscribeInvalidation(() => events.push({}));
+
+  const space = catalog.createSpace({
+    id: "work",
+    name: "Work",
+    matchers: [{ kind: "tag", value: "work" }],
+  });
+  assert.deepEqual(events, [{}]);
+  catalog.renameSpace(space.id, "Work");
+  catalog.replaceSpaceMatchers(space.id, { matchers: space.matchers });
+  assert.equal(events.length, 1);
+  catalog.renameSpace(space.id, "Office");
+  assert.equal(events.length, 2);
+  assert.throws(
+    () => catalog.replaceSpaceMatchers(space.id, { matchers: [] }),
+    /at least one matcher/,
+  );
+  assert.equal(events.length, 2);
+  catalog.deleteSpace(space.id);
+  assert.equal(events.length, 3);
+
+  const archived = await catalog.archiveDocument(document.id);
+  assert.notEqual(archived.archivedAt, null);
+  assert.notEqual(catalog.getDocument(document.id)?.archivedAt, null);
+  assert.equal(events.length, 4);
+
+  unsubscribe();
   catalog.close();
 });
 
@@ -1060,6 +1573,55 @@ test("rejects workspace updates that would orphan registered documents", async (
   );
 });
 
+test("freezes workspace repository identity after the first document", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "identity.md");
+  await writeFile(documentPath, "# Identity\n", "utf8");
+
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example before registration",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "github.com/acme/original",
+    repositoryName: "Original",
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Identity",
+    path: documentPath,
+    attention: "none",
+  });
+  const beforeWorkspace = catalog.listWorkspaces();
+  const beforeDocuments = catalog.listDocuments();
+
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "example",
+      name: "Must not persist",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/acme/replacement",
+      repositoryName: "Replacement",
+    }),
+    /repository identity cannot change after documents exist/,
+  );
+  assert.deepEqual(catalog.listWorkspaces(), beforeWorkspace);
+  assert.deepEqual(catalog.listDocuments(), beforeDocuments);
+  assert.equal(catalog.getDocument(document.id)?.projectId, document.projectId);
+
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Allowed metadata rename",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "git@github.com:acme/original.git",
+    repositoryName: "Original",
+  });
+  assert.equal(catalog.listWorkspaces()[0]?.name, "Allowed metadata rename");
+});
+
 test("tracks reading progress by content revision", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "status.md");
@@ -1724,6 +2286,9 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const versionOne = new Database(databasePath);
   versionOne.exec("ALTER TABLE documents DROP COLUMN source_path");
   versionOne.exec("ALTER TABLE documents DROP COLUMN storage_kind");
+  versionOne.exec(
+    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+  );
   versionOne.pragma("user_version = 1");
   versionOne.close();
   const migrated = await Catalog.open(databasePath, { legacyStatePath: false });
@@ -1731,6 +2296,9 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
 
   const versionTwo = new Database(databasePath);
   versionTwo.exec("DROP TABLE document_source_links");
+  versionTwo.exec(
+    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+  );
   versionTwo.pragma("user_version = 2");
   versionTwo.close();
   const migratedAgain = await Catalog.open(databasePath, {
@@ -1741,6 +2309,9 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const versionThree = new Database(databasePath);
   versionThree.exec("DROP TABLE review_responses");
   versionThree.exec("DROP TABLE review_requests");
+  versionThree.exec(
+    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+  );
   versionThree.pragma("user_version = 3");
   versionThree.close();
   const migratedReviews = await Catalog.open(databasePath, {
@@ -1749,7 +2320,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 8);
+  assert.equal(database.pragma("user_version", { simple: true }), 9);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -1773,6 +2344,8 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       "projects",
       "review_requests",
       "review_responses",
+      "space_matchers",
+      "spaces",
       "tags",
       "workspace_artifact_roots",
       "workspace_repositories",
@@ -1780,6 +2353,32 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
     ],
   );
   database.close();
+
+  const constraints = new Database(databasePath);
+  constraints
+    .prepare("INSERT INTO spaces (id, name) VALUES (?, ?)")
+    .run("work", "Work");
+  constraints
+    .prepare(
+      "INSERT INTO space_matchers (space_id, kind, value) VALUES (?, ?, ?)",
+    )
+    .run("work", "tag", "client-work");
+  assert.throws(
+    () => constraints
+      .prepare(
+        "INSERT INTO space_matchers (space_id, kind, value) VALUES (?, ?, ?)",
+      )
+      .run("work", "tag", "client-work"),
+    /UNIQUE constraint failed/,
+  );
+  constraints.prepare("DELETE FROM spaces WHERE id = ?").run("work");
+  assert.equal(
+    constraints
+      .prepare<[], { count: number }>("SELECT count(*) AS count FROM space_matchers")
+      .get()?.count,
+    0,
+  );
+  constraints.close();
 
   const futurePath = join(root, "future.sqlite3");
   const future = new Database(futurePath);
@@ -1789,6 +2388,45 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
     Catalog.open(futurePath, { legacyStatePath: false }),
     /unsupported SQLite catalog schema 99/,
   );
+});
+
+test("rolls back a failed version nine migration", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "preserved.md");
+  await writeFile(documentPath, "# Preserved\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Preserved",
+    path: documentPath,
+    attention: "none",
+  });
+  catalog.close();
+
+  const broken = new Database(statePath);
+  broken.exec("DROP TABLE space_matchers; DROP TABLE spaces");
+  broken.exec("CREATE TABLE spaces (broken TEXT) STRICT");
+  broken.pragma("user_version = 8");
+  broken.close();
+
+  await assert.rejects(
+    Catalog.open(statePath, { legacyStatePath: false }),
+    /table spaces already exists/,
+  );
+
+  const inspected = new Database(statePath, { readonly: true });
+  assert.equal(inspected.pragma("user_version", { simple: true }), 8);
+  assert.equal(
+    inspected
+      .prepare<[string], { title: string }>("SELECT title FROM documents WHERE id = ?")
+      .get(document.id)?.title,
+    "Preserved",
+  );
+  assert.deepEqual(
+    inspected.prepare<[], { name: string }>("PRAGMA table_info(spaces)").all(),
+    [{ cid: 0, name: "broken", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 }],
+  );
+  inspected.close();
 });
 
 test("migrates version four review requests without losing decisions", async () => {
@@ -1814,6 +2452,9 @@ test("migrates version four review requests without losing decisions", async () 
   catalog.close();
 
   const versionFour = new Database(statePath);
+  versionFour.exec(
+    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+  );
   versionFour.pragma("user_version = 4");
   versionFour.close();
 
@@ -1826,7 +2467,7 @@ test("migrates version four review requests without losing decisions", async () 
   migrated.close();
 
   const database = new Database(statePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 8);
+  assert.equal(database.pragma("user_version", { simple: true }), 9);
   const schema = database
     .prepare<[], { sql: string }>(
       "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",
