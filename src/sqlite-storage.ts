@@ -10,24 +10,29 @@ import {
   isReviewKind,
   isReviewOutcome,
   isReviewStatus,
+  isSpaceMatcherKind,
   projectDisplayName,
   type Attention,
+  type ContentScope,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
   type Project,
   type RepositoryIdentity,
+  type RepositoryInventoryItem,
   type ReviewRequestFilters,
   type ReviewFeedbackItem,
   type ReviewResponse,
   type StoredDocument,
   type StoredReviewRequest,
+  type Space,
+  type SpaceMatcher,
   type Workspace,
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 8;
+export const SQLITE_SCHEMA_VERSION = 9;
 
 interface WorkspaceRow {
   id: string;
@@ -39,9 +44,31 @@ interface ArtifactRootRow {
   path: string;
 }
 
+interface WorkspaceArtifactRootRow extends ArtifactRootRow {
+  workspace_id: string;
+}
+
+export interface SqliteCatalogStorageOptions {
+  onQuery?: (sql: string) => void;
+}
+
 interface WorkspaceRepositoryRow {
   repository_key: string;
   repository_name: string;
+}
+
+interface WorkspaceRepositoryInventoryRow extends WorkspaceRepositoryRow {
+  workspace_id: string;
+}
+
+interface SpaceRow {
+  id: string;
+  name: string;
+}
+
+interface SpaceMatcherRow {
+  kind: string;
+  value: string;
 }
 
 interface ProjectRow {
@@ -83,10 +110,18 @@ interface TagRow {
   name: string;
 }
 
+interface DocumentTagRow extends TagRow {
+  document_id: string;
+}
+
 interface SourceLinkRow {
   id: string;
   href: string;
   workspace_path: string;
+}
+
+interface DocumentSourceLinkRow extends SourceLinkRow {
+  document_id: string;
 }
 
 interface DocumentIdRow {
@@ -110,6 +145,10 @@ interface ReviewResponseRow {
   message: string;
   items_json: string | null;
   created_at: string;
+}
+
+interface ReviewResponseWithIdRow extends ReviewResponseRow {
+  review_request_id: string;
 }
 
 const INITIAL_SCHEMA = `
@@ -208,12 +247,28 @@ const INITIAL_SCHEMA = `
     PRIMARY KEY (document_id, tag_name)
   ) STRICT;
 
+  CREATE TABLE spaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE space_matchers (
+    space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('repository', 'repository-namespace', 'tag')),
+    value TEXT NOT NULL,
+    PRIMARY KEY (space_id, kind, value)
+  ) STRICT;
+
   CREATE INDEX documents_workspace_idx ON documents(workspace_id);
   CREATE INDEX documents_task_idx ON documents(task_id);
   CREATE INDEX documents_kind_idx ON documents(kind);
   CREATE INDEX documents_attention_idx ON documents(attention);
   CREATE INDEX documents_updated_idx ON documents(updated_at DESC);
   CREATE INDEX document_tags_tag_idx ON document_tags(tag_name);
+  CREATE INDEX workspace_repositories_key_idx
+    ON workspace_repositories(repository_key);
+  CREATE INDEX space_matchers_lookup_idx
+    ON space_matchers(space_id, kind, value);
   CREATE UNIQUE INDEX review_requests_pending_document_idx
     ON review_requests(document_id) WHERE status = 'pending';
   CREATE INDEX review_requests_document_idx
@@ -229,7 +284,27 @@ const DOCUMENT_SELECT = `SELECT d.*,
   p.feature_name AS project_feature_name
   FROM documents d
   JOIN document_projects dp ON dp.document_id = d.id
-  JOIN projects p ON p.id = dp.project_id`;
+  JOIN projects p ON p.id = dp.project_id
+  JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id`;
+
+const SPACE_MEMBERSHIP_PREDICATE = `EXISTS (
+  SELECT 1 FROM space_matchers sm
+  WHERE sm.space_id = ? AND (
+    (sm.kind = 'repository' AND sm.value = wr.repository_key)
+    OR (
+      sm.kind = 'repository-namespace'
+      AND substr(wr.repository_key, 1, length(sm.value) + 1) = sm.value || '/'
+    )
+    OR (
+      sm.kind = 'tag'
+      AND EXISTS (
+        SELECT 1 FROM document_tags scope_tags
+        WHERE scope_tags.document_id = d.id
+          AND scope_tags.tag_name = sm.value
+      )
+    )
+  )
+)`;
 
 export class SqliteCatalogStorage implements CatalogStorage {
   readonly #database: Database.Database;
@@ -238,7 +313,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
     this.#database = database;
   }
 
-  static open(databasePath: string): SqliteCatalogStorage {
+  static open(
+    databasePath: string,
+    options: SqliteCatalogStorageOptions = {},
+  ): SqliteCatalogStorage {
     const canonicalPath = resolve(databasePath);
     mkdirSync(dirname(canonicalPath), { recursive: true, mode: 0o700 });
     try {
@@ -252,7 +330,18 @@ export class SqliteCatalogStorage implements CatalogStorage {
       }
     }
 
-    const database = new Database(canonicalPath);
+    const database = new Database(
+      canonicalPath,
+      options.onQuery === undefined
+        ? undefined
+        : {
+            verbose: (message: unknown) => {
+              if (typeof message === "string") {
+                options.onQuery?.(message);
+              }
+            },
+          },
+    );
     try {
       chmodSync(canonicalPath, 0o600);
       database.pragma("foreign_keys = ON");
@@ -275,7 +364,9 @@ export class SqliteCatalogStorage implements CatalogStorage {
   isEmpty(): boolean {
     const row = this.#database
       .prepare<[], { count: number }>(
-        "SELECT (SELECT count(*) FROM workspaces) + (SELECT count(*) FROM documents) AS count",
+        `SELECT (SELECT count(*) FROM workspaces) +
+                (SELECT count(*) FROM documents) +
+                (SELECT count(*) FROM spaces) AS count`,
       )
       .get();
     return row?.count === 0;
@@ -285,20 +376,128 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return this.#database.transaction(operation)();
   }
 
-  listWorkspaces(): Workspace[] {
+  listSpaces(): Space[] {
     const rows = this.#database
-      .prepare<[], WorkspaceRow>("SELECT id, name, root FROM workspaces ORDER BY id")
+      .prepare<[], SpaceRow>("SELECT id, name FROM spaces")
       .all();
-    const roots = this.#database.prepare<
-      [string],
-      ArtifactRootRow
-    >(
-      "SELECT path FROM workspace_artifact_roots WHERE workspace_id = ? ORDER BY path",
+    const matchers = this.#database.prepare<[string], SpaceMatcherRow>(
+      `SELECT kind, value FROM space_matchers
+       WHERE space_id = ? ORDER BY kind, value`,
     );
+    return rows
+      .map((row) => validateSpaceRow(row, matchers.all(row.id)))
+      .sort(compareSpaces);
+  }
+
+  getSpace(id: string): Space | undefined {
+    const row = this.#database
+      .prepare<[string], SpaceRow>("SELECT id, name FROM spaces WHERE id = ?")
+      .get(id);
+    if (!row) {
+      return undefined;
+    }
+    const matchers = this.#database
+      .prepare<[string], SpaceMatcherRow>(
+        `SELECT kind, value FROM space_matchers
+         WHERE space_id = ? ORDER BY kind, value`,
+      )
+      .all(id);
+    return validateSpaceRow(row, matchers);
+  }
+
+  saveSpace(space: Space): void {
+    this.transaction(() => {
+      this.#database
+        .prepare(
+          `INSERT INTO spaces (id, name) VALUES (?, ?)
+           ON CONFLICT(id) DO UPDATE SET name = excluded.name`,
+        )
+        .run(space.id, space.name);
+      this.#database
+        .prepare("DELETE FROM space_matchers WHERE space_id = ?")
+        .run(space.id);
+      const insert = this.#database.prepare(
+        `INSERT INTO space_matchers (space_id, kind, value)
+         VALUES (?, ?, ?)`,
+      );
+      for (const matcher of space.matchers) {
+        insert.run(space.id, matcher.kind, matcher.value);
+      }
+    });
+  }
+
+  deleteSpace(id: string): boolean {
+    return this.#database.prepare("DELETE FROM spaces WHERE id = ?").run(id)
+      .changes === 1;
+  }
+
+  listRepositories(): RepositoryInventoryItem[] {
+    const rows = this.#database
+      .prepare<[], WorkspaceRepositoryInventoryRow>(
+        `SELECT workspace_id, repository_key, repository_name
+         FROM workspace_repositories
+         ORDER BY repository_key, repository_name, workspace_id`,
+      )
+      .all();
+    const grouped = new Map<
+      string,
+      { names: string[]; workspaceIds: string[] }
+    >();
+    for (const row of rows) {
+      const current = grouped.get(row.repository_key) ?? {
+        names: [],
+        workspaceIds: [],
+      };
+      if (!current.names.includes(row.repository_name)) {
+        current.names.push(row.repository_name);
+      }
+      current.workspaceIds.push(row.workspace_id);
+      grouped.set(row.repository_key, current);
+    }
+    return [...grouped.entries()].map(([key, value]) => ({
+      key,
+      name: value.names.sort(compareText)[0] ?? key,
+      workspaceIds: value.workspaceIds.sort(compareText),
+      kind: key.startsWith("local:") ? "local" : "remote",
+    }));
+  }
+
+  listWorkspaces(scope: ContentScope = {}): Workspace[] {
+    const scopedWhere = scope.spaceId === undefined
+      ? ""
+      : ` WHERE EXISTS (
+          SELECT 1 FROM documents d
+          JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+          WHERE d.workspace_id = workspaces.id
+            AND d.archived_at IS NULL
+            AND ${SPACE_MEMBERSHIP_PREDICATE}
+        )`;
+    const rows = this.#database
+      .prepare<string[], WorkspaceRow>(
+        `SELECT id, name, root FROM workspaces${scopedWhere} ORDER BY id`,
+      )
+      .all(...(scope.spaceId === undefined ? [] : [scope.spaceId]));
+    const rootsByWorkspace = new Map<string, string[]>();
+    if (rows.length > 0) {
+      const placeholders = rows.map(() => "?").join(", ");
+      const rootRows = this.#database
+        .prepare<string[], WorkspaceArtifactRootRow>(
+          `SELECT workspace_id, path
+           FROM workspace_artifact_roots
+           WHERE workspace_id IN (${placeholders})
+           ORDER BY workspace_id, path`,
+        )
+        .all(...rows.map(({ id }) => id));
+      for (const root of rootRows) {
+        const paths = rootsByWorkspace.get(root.workspace_id) ?? [];
+        paths.push(root.path);
+        rootsByWorkspace.set(root.workspace_id, paths);
+      }
+    }
     return rows.map((row) =>
       validateWorkspaceRow(
         row,
-        roots.all(row.id).map(({ path }) => path),
+        rootsByWorkspace.get(row.id) ?? [],
       ),
     );
   }
@@ -331,6 +530,14 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return row
       ? { key: row.repository_key, name: row.repository_name }
       : undefined;
+  }
+
+  workspaceHasDocuments(id: string): boolean {
+    return this.#database
+      .prepare<[string], { present: number }>(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE workspace_id = ?) AS present",
+      )
+      .get(id)?.present === 1;
   }
 
   saveWorkspace(
@@ -395,7 +602,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return mapProject(row);
   }
 
-  listDocuments(filters: DocumentFilters = {}): StoredDocument[] {
+  listDocuments(
+    filters: DocumentFilters = {},
+    scope: ContentScope = {},
+  ): StoredDocument[] {
     const clauses: string[] = [];
     const parameters: Array<string | number> = [];
 
@@ -437,6 +647,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
     if (filters.missing !== undefined) {
       clauses.push(filters.missing ? "d.missing_at IS NOT NULL" : "d.missing_at IS NULL");
     }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
 
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.#database
@@ -444,27 +658,42 @@ export class SqliteCatalogStorage implements CatalogStorage {
         `${DOCUMENT_SELECT}${where} ORDER BY d.updated_at DESC, d.id`,
       )
       .all(...parameters);
-    return rows.map((row) => this.#mapDocument(row));
+    return this.#mapDocuments(rows);
   }
 
-  getDocument(id: string): StoredDocument | undefined {
+  getDocument(id: string, scope: ContentScope = {}): StoredDocument | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
     const row = this.#database
-      .prepare<[string], DocumentRow>(`${DOCUMENT_SELECT} WHERE d.id = ?`)
-      .get(id);
+      .prepare<string[], DocumentRow>(
+        `${DOCUMENT_SELECT} WHERE d.id = ?${scoped}`,
+      )
+      .get(...parameters);
     return row ? this.#mapDocument(row) : undefined;
   }
 
   getReferenceDocumentIdByPath(
     workspaceId: string,
     path: string,
+    scope: ContentScope = {},
   ): string | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined
+      ? [workspaceId, path]
+      : [workspaceId, path, scope.spaceId];
     return this.#database
-      .prepare<[string, string], DocumentIdRow>(
-        `SELECT id
-         FROM documents
-         WHERE workspace_id = ? AND path = ? AND storage_kind = 'reference'`,
+      .prepare<string[], DocumentIdRow>(
+        `SELECT d.id
+         FROM documents d
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         WHERE d.workspace_id = ? AND d.path = ?
+           AND d.storage_kind = 'reference'${scoped}`,
       )
-      .get(workspaceId, path)?.id;
+      .get(...parameters)?.id;
   }
 
   saveDocument(document: StoredDocument): void {
@@ -584,32 +813,50 @@ export class SqliteCatalogStorage implements CatalogStorage {
 
   listReviewRequests(
     filters: ReviewRequestFilters = {},
+    scope: ContentScope = {},
   ): StoredReviewRequest[] {
     const clauses: string[] = [];
     const parameters: string[] = [];
     if (filters.documentId !== undefined) {
-      clauses.push("document_id = ?");
+      clauses.push("rr.document_id = ?");
       parameters.push(filters.documentId);
     }
     if (filters.status !== undefined) {
-      clauses.push("status = ?");
+      clauses.push("rr.status = ?");
       parameters.push(filters.status);
     }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
-    return this.#database
+    const rows = this.#database
       .prepare<string[], ReviewRequestRow>(
-        `SELECT * FROM review_requests${where} ORDER BY created_at DESC, id`,
+        `SELECT rr.* FROM review_requests rr
+         JOIN documents d ON d.id = rr.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         ${where} ORDER BY rr.created_at DESC, rr.id`,
       )
-      .all(...parameters)
-      .map((row) => this.#mapReviewRequest(row));
+      .all(...parameters);
+    return this.#mapReviewRequests(rows);
   }
 
-  getReviewRequest(id: string): StoredReviewRequest | undefined {
+  getReviewRequest(
+    id: string,
+    scope: ContentScope = {},
+  ): StoredReviewRequest | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
     const row = this.#database
-      .prepare<[string], ReviewRequestRow>(
-        "SELECT * FROM review_requests WHERE id = ?",
+      .prepare<string[], ReviewRequestRow>(
+        `SELECT rr.* FROM review_requests rr
+         JOIN documents d ON d.id = rr.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         WHERE rr.id = ?${scoped}`,
       )
-      .get(id);
+      .get(...parameters);
     return row ? this.#mapReviewRequest(row) : undefined;
   }
 
@@ -681,8 +928,58 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return result.changes === 1;
   }
 
-  #mapDocument(row: DocumentRow): StoredDocument {
-    const tags = this.#database
+  #mapDocuments(rows: DocumentRow[]): StoredDocument[] {
+    if (rows.length === 0) {
+      return [];
+    }
+    const documentIds = JSON.stringify(rows.map(({ id }) => id));
+    const tagsByDocument = new Map<string, string[]>();
+    const sourceLinksByDocument = new Map<string, DocumentSourceLink[]>();
+    const tagRows = this.#database
+      .prepare<[string], DocumentTagRow>(
+        `SELECT dt.document_id, t.name
+         FROM tags t
+         JOIN document_tags dt ON dt.tag_name = t.name
+         WHERE dt.document_id IN (SELECT value FROM json_each(?))
+         ORDER BY dt.document_id, t.name`,
+      )
+      .all(documentIds);
+    for (const { document_id: documentId, name } of tagRows) {
+      const tags = tagsByDocument.get(documentId) ?? [];
+      tags.push(name);
+      tagsByDocument.set(documentId, tags);
+    }
+    const sourceLinkRows = this.#database
+      .prepare<[string], DocumentSourceLinkRow>(
+        `SELECT document_id, id, href, workspace_path
+         FROM document_source_links
+         WHERE document_id IN (SELECT value FROM json_each(?))
+         ORDER BY document_id, href`,
+      )
+      .all(documentIds);
+    for (const {
+      document_id: documentId,
+      id,
+      href,
+      workspace_path: workspacePath,
+    } of sourceLinkRows) {
+      const links = sourceLinksByDocument.get(documentId) ?? [];
+      links.push({ id, href, workspacePath });
+      sourceLinksByDocument.set(documentId, links);
+    }
+    return rows.map((row) => this.#mapDocument(
+      row,
+      tagsByDocument.get(row.id) ?? [],
+      sourceLinksByDocument.get(row.id) ?? [],
+    ));
+  }
+
+  #mapDocument(
+    row: DocumentRow,
+    providedTags?: string[],
+    providedSourceLinks?: DocumentSourceLink[],
+  ): StoredDocument {
+    const tags = providedTags ?? this.#database
       .prepare<[string], TagRow>(
         `SELECT t.name
          FROM tags t
@@ -692,7 +989,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
       )
       .all(row.id)
       .map(({ name }) => name);
-    const sourceLinks = this.#database
+    const sourceLinks = providedSourceLinks ?? this.#database
       .prepare<[string], SourceLinkRow>(
         `SELECT id, href, workspace_path
          FROM document_source_links
@@ -738,13 +1035,37 @@ export class SqliteCatalogStorage implements CatalogStorage {
     };
   }
 
-  #mapReviewRequest(row: ReviewRequestRow): StoredReviewRequest {
-    const responseRow = this.#database
-      .prepare<[string], ReviewResponseRow>(
-        `SELECT outcome, message, items_json, created_at
-         FROM review_responses WHERE review_request_id = ?`,
+  #mapReviewRequests(rows: ReviewRequestRow[]): StoredReviewRequest[] {
+    if (rows.length === 0) {
+      return [];
+    }
+    const responseRows = this.#database
+      .prepare<[string], ReviewResponseWithIdRow>(
+        `SELECT review_request_id, outcome, message, items_json, created_at
+         FROM review_responses
+         WHERE review_request_id IN (SELECT value FROM json_each(?))`,
       )
-      .get(row.id);
+      .all(JSON.stringify(rows.map(({ id }) => id)));
+    const responses = new Map(
+      responseRows.map((response) => [response.review_request_id, response]),
+    );
+    return rows.map((row) =>
+      this.#mapReviewRequest(row, responses.get(row.id) ?? null),
+    );
+  }
+
+  #mapReviewRequest(
+    row: ReviewRequestRow,
+    providedResponseRow?: ReviewResponseRow | null,
+  ): StoredReviewRequest {
+    const responseRow = providedResponseRow === undefined
+      ? this.#database
+          .prepare<[string], ReviewResponseRow>(
+            `SELECT outcome, message, items_json, created_at
+             FROM review_responses WHERE review_request_id = ?`,
+          )
+          .get(row.id)
+      : providedResponseRow;
     const response: ReviewResponse | null = responseRow
       ? {
           outcome: responseRow.outcome as ReviewResponse["outcome"],
@@ -1006,6 +1327,61 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 8");
     })();
   }
+  if (rawVersion < 9) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE spaces (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE space_matchers (
+           space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+           kind TEXT NOT NULL CHECK (kind IN ('repository', 'repository-namespace', 'tag')),
+           value TEXT NOT NULL,
+           PRIMARY KEY (space_id, kind, value)
+         ) STRICT;
+         CREATE INDEX workspace_repositories_key_idx
+           ON workspace_repositories(repository_key);
+         CREATE INDEX space_matchers_lookup_idx
+           ON space_matchers(space_id, kind, value);`,
+      );
+      database.pragma("user_version = 9");
+    })();
+  }
+}
+
+function validateSpaceRow(
+  row: SpaceRow,
+  matcherRows: SpaceMatcherRow[],
+): Space {
+  if (
+    !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.id) ||
+    row.name.trim() === "" ||
+    row.name !== row.name.trim() ||
+    /[\u0000-\u001f\u007f]/.test(row.name) ||
+    matcherRows.length === 0 ||
+    matcherRows.some(
+      ({ kind, value }) =>
+        !isSpaceMatcherKind(kind) || value.trim() === "" || value !== value.trim(),
+    )
+  ) {
+    throw new Error(`invalid space row ${row.id}`);
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    matchers: matcherRows.map(({ kind, value }) => ({ kind, value }) as SpaceMatcher),
+  };
+}
+
+function compareSpaces(left: Space, right: Space): number {
+  const leftName = left.name.toLowerCase();
+  const rightName = right.name.toLowerCase();
+  return compareText(leftName, rightName) || compareText(left.id, right.id);
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function validateWorkspaceRow(

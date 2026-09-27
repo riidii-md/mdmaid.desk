@@ -360,13 +360,16 @@ Status: complete for registered Markdown sources.
 - filtered and debounced change, unlink, replacement, and restore
   reconciliation;
 - path re-authorization and atomic revision/link/review persistence;
-- document-scoped path-free events;
+- one metadata-free catalog invalidation after each committed change;
 - watcher reconstruction from persisted active references after restart.
 
 ### 5. Web and TUI Workspaces
 
-- task and workspace navigation;
-- attention queue;
+- global named Spaces with dynamic repository, namespace, and tag matchers;
+- a global project combobox with case-insensitive substring filtering;
+- independent Docs / Change reviews content mode;
+- “Waiting for you” as an intersecting Actions filter;
+- task, project, and workspace navigation within the selected Space;
 - recent documents;
 - title and task search;
 - missing and superseded states.

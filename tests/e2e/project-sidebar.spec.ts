@@ -59,42 +59,59 @@ async function fixture() {
   };
 }
 
-test("project sidebar leaves the reader and survives history and reload", async ({ page }) => {
+async function chooseProject(page: import("@playwright/test").Page, query: string) {
+  const picker = page.locator("#project-select");
+  await picker.click();
+  await picker.fill(query);
+  const options = page.locator('#project-options [role="option"]');
+  await expect(options).toHaveCount(1);
+  await options.first().click();
+}
+
+test("global project filter leaves the reader and survives history and reload", async ({ page }) => {
   const value = await fixture();
   try {
     await page.goto(`${value.server.url}/?token=browser-test-token`);
     await expect(page.getByRole("button", { name: "Open Doc A" })).toBeVisible();
 
-    await page.locator("#project-nav").getByRole("button", { name: /TEST-1/ }).click();
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentA.projectId}$`));
+    await chooseProject(page, "test-1");
+    await expect(page).toHaveURL(new RegExp(`/p/${value.documentA.projectId}\\?view=docs$`));
     await page.getByRole("button", { name: "Open Doc A" }).click();
-    await expect(page).toHaveURL(new RegExp(`/d/${value.documentA.id}$`));
+    await expect(page).toHaveURL(new RegExp(`/d/${value.documentA.id}\\?view=docs$`));
 
-    await page.locator("#project-nav").getByRole("button", { name: /TEST-2/ }).click();
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}$`));
+    await chooseProject(page, "TEST-2");
+    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}\\?view=docs$`));
     await expect(page.getByRole("button", { name: "Open Doc B" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Doc A" })).toHaveCount(0);
     await expect(page.locator("#document-reader")).toBeHidden();
 
     await page.goBack();
-    await expect(page).toHaveURL(new RegExp(`/d/${value.documentA.id}$`));
+    await expect(page).toHaveURL(new RegExp(`/d/${value.documentA.id}\\?view=docs$`));
     await expect(page.locator("#document-reader")).toBeVisible();
     await page.reload();
     await expect(page.locator("#reader-title")).toHaveText("Doc A");
     await page.locator("#reader-back").click();
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentA.projectId}$`));
+    await expect(page).toHaveURL(new RegExp(`/p/${value.documentA.projectId}\\?view=docs$`));
 
     await page.getByRole("button", { name: "Open Doc A" }).click();
     await expect(page.locator("#document-reader")).toBeVisible();
+    await page.locator("#reader-back").click();
     await page.locator("#actions-filter").click();
     await expect(page.locator("#document-reader")).toBeHidden();
     await page.reload();
     await expect(page.locator("#actions-filter")).toHaveClass(/active/);
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentA.projectId}$`));
+    await expect(page).toHaveURL(
+      new RegExp(`/p/${value.documentA.projectId}\\?view=docs&actions=1$`),
+    );
 
     await page.locator("#change-reviews-filter").click();
     await page.reload();
     await expect(page.locator("#change-reviews-filter")).toHaveClass(/active/);
+    await expect(page.locator("#project-select")).toHaveAttribute(
+      "data-project-id",
+      value.documentA.projectId,
+    );
+    await expect(page.locator("#project-select")).toHaveValue(/TEST-1/);
     await expect(page.locator("#queue-title")).toHaveText("Change Reviews");
 
     await page.goto(`${value.server.url}/w/alpha`);
@@ -132,8 +149,8 @@ test("late missing-source refresh cannot reopen the reader after a project click
     );
     await page.getByRole("button", { name: "Open Doc A" }).click();
     await refreshRequested;
-    await page.locator("#project-nav").getByRole("button", { name: /TEST-2/ }).click();
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}$`));
+    await chooseProject(page, "st-2");
+    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}\\?view=docs$`));
     const refreshCompleted = page.waitForResponse((response) =>
       response.url().endsWith("/api/v1/documents"),
     );
@@ -145,9 +162,9 @@ test("late missing-source refresh cannot reopen the reader after a project click
 
     await expect(page.locator("#document-reader")).toBeHidden();
     await expect(page.getByRole("button", { name: "Open Doc B" })).toBeVisible();
-    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}$`));
+    await expect(page).toHaveURL(new RegExp(`/p/${value.documentB.projectId}\\?view=docs$`));
     await page.goBack();
-    await expect(page).toHaveURL(value.server.url + "/");
+    await expect(page).toHaveURL(new RegExp(`${value.server.url}/(?:\\?view=docs)?$`));
     await expect(page.locator("#document-reader")).toBeHidden();
   } finally {
     await value.close();

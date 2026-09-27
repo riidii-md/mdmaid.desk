@@ -69,7 +69,60 @@ test("uses the versioned daemon API for terminal client operations", async () =>
 
   try {
     const client = new DeskApiClient(server.url, server.token);
-    assert.equal((await client.health()).status, "ok");
+    assert.deepEqual(await client.health(), {
+      service: "mdmaid.desk",
+      status: "ok",
+      version: 1,
+      capabilities: ["spaces-v1", "scoped-content-v1"],
+    });
+    assert.deepEqual(await client.listSpaces(), []);
+    const repositories = await client.listRepositories();
+    assert.equal(repositories.length, 1);
+    assert.match(repositories[0]?.key ?? "", /^local:[a-f0-9]{64}$/);
+    assert.deepEqual(repositories[0]?.workspaceIds, ["example"]);
+    assert.equal(repositories[0]?.kind, "local");
+    assert.deepEqual(await client.createSpace({
+      id: "terminal",
+      name: "Terminal",
+      matchers: [{ kind: "tag", value: "terminal" }],
+    }), {
+      id: "terminal",
+      name: "Terminal",
+      matchers: [{ kind: "tag", value: "terminal" }],
+    });
+    assert.deepEqual(
+      (await client.listDocuments({ spaceId: "terminal" })).map(({ id }) => id),
+      [document.id],
+    );
+    assert.deepEqual(
+      (await client.listWorkspaces({ spaceId: "terminal" })).map(({ id }) => id),
+      ["example"],
+    );
+    assert.equal((await client.getDocument(document.id, { spaceId: "terminal" })).id, document.id);
+    assert.match(
+      (await client.renderDocument(
+        document.id,
+        "terminal",
+        78,
+        {},
+        { spaceId: "terminal" },
+      )).content,
+      /Terminal plan/,
+    );
+    assert.equal((await client.getSpace("terminal")).name, "Terminal");
+    assert.equal((await client.renameSpace("terminal", "Work")).name, "Work");
+    assert.deepEqual(
+      (await client.replaceSpaceMatchers("terminal", [
+        { kind: "repository-namespace", value: "github.com/example" },
+      ])).matchers,
+      [{ kind: "repository-namespace", value: "github.com/example" }],
+    );
+    assert.deepEqual(await client.listDocuments({ spaceId: "terminal" }), []);
+    await assert.rejects(
+      client.getDocument(document.id, { spaceId: "terminal" }),
+      (error: unknown) => error instanceof DeskApiError && error.status === 404,
+    );
+    assert.deepEqual(await client.deleteSpace("terminal"), { id: "terminal" });
     assert.deepEqual(
       (await client.listDocuments()).map(({ id }) => id),
       [document.id],
@@ -113,10 +166,7 @@ test("uses the versioned daemon API for terminal client operations", async () =>
     });
     await readyEvent;
     await client.act(document.id, "unread");
-    assert.deepEqual(await catalogEvent, {
-      action: "unread",
-      documentId: document.id,
-    });
+    assert.deepEqual(await catalogEvent, {});
     controller.abort();
     await subscription;
   } finally {
@@ -307,11 +357,7 @@ test("receives validated path-free live source events with revisions", async () 
     await writeFile(documentPath, "# Changed\n", "utf8");
     assert.ok(emitChange);
     emitChange(basename(documentPath));
-    assert.deepEqual(await sourceEvent, {
-      action: "source-changed",
-      documentId: document.id,
-      revision: 2,
-    });
+    assert.deepEqual(await sourceEvent, {});
     assert.equal(catalog.getDocument(document.id)?.revision, 2);
     controller.abort();
     await subscription;
@@ -377,11 +423,7 @@ test("validates review requests and receives their live events", async () => {
     });
     assert.equal(request.status, "pending");
     assert.equal(request.requestMessage, "Please decide and explain.");
-    assert.deepEqual(await reviewEvent, {
-      action: "review-created",
-      documentId: document.id,
-      reviewRequestId: request.id,
-    });
+    assert.deepEqual(await reviewEvent, {});
     assert.deepEqual(await client.getReviewRequest(request.id), request);
     assert.deepEqual(
       (await client.listReviewRequests({ status: "pending" })).map(({ id }) => id),
@@ -498,19 +540,11 @@ test("routes producer workspace and document mutations through the daemon", asyn
     const client = new DeskApiClient(server.url, server.token);
     const controller = new AbortController();
     let ready!: () => void;
-    let received!: (value: {
-      action: string;
-      documentId?: string;
-      workspaceId?: string;
-    }) => void;
+    let received!: (value: CatalogEvent) => void;
     const readyEvent = new Promise<void>((resolve) => {
       ready = resolve;
     });
-    const workspaceEvent = new Promise<{
-      action: string;
-      documentId?: string;
-      workspaceId?: string;
-    }>((resolve) => {
+    const workspaceEvent = new Promise<CatalogEvent>((resolve) => {
       received = resolve;
     });
     const subscription = client.subscribeCatalog(received, {
@@ -525,10 +559,7 @@ test("routes producer workspace and document mutations through the daemon", asyn
       artifactRoots: [workspace],
     });
     assert.equal(added.id, "example");
-    assert.deepEqual(await workspaceEvent, {
-      action: "workspace-added",
-      workspaceId: "example",
-    });
+    assert.deepEqual(await workspaceEvent, {});
 
     const document = await client.registerDocument({
       workspaceId: "example",

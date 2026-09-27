@@ -216,11 +216,11 @@ file does not remove the imported copy.
 Every registered-source render re-authorizes the real path and reconciles its
 content hash, revision, reading state, review state, and local-link mappings.
 When a foreground web service or daemon is running, mdmaid.desk also watches
-the parent directories of active registered sources. A committed source
-change, disappearance, or restoration publishes a document-scoped event: an
-open matching Web or TUI reader rerenders automatically, while unrelated
-readers only refresh queue metadata. The interfaces label registered documents
-as `live source` and imports as `snapshot`.
+the parent directories of active registered sources. Every committed catalog
+change publishes one metadata-free invalidation; Web, TUI, and waiting CLI
+clients then reread authoritative state for their selected Space. The
+interfaces label registered documents as `live source` and imports as
+`snapshot`.
 
 Without a running service, registration and rendering still work and a manual
 render reconciles current source state. Automatic push refresh is
@@ -248,6 +248,26 @@ node dist/cli.js list --workspace example
 node dist/cli.js list --task PROJECT-123
 ```
 
+Create persistent Spaces that classify current and future documents from one
+or more repository, repository-namespace, workspace, or tag patterns:
+
+```bash
+mdmaid-desk space add work --name "Work" \
+  --namespace github.com/example \
+  --tag work
+mdmaid-desk space add home --name "Home" --workspace personal
+mdmaid-desk space list
+mdmaid-desk repository list
+mdmaid-desk list --space work
+```
+
+An agent creating a Space must ask which patterns belong to it when none were
+provided. Matchers use OR semantics and membership is derived from current
+repository identity and tags, so later matching documents appear automatically.
+Use `space matchers set`, `space rename`, and `space delete` to manage the
+definition. Space-aware commands refuse a healthy older daemon and ask for a
+restart after upgrade instead of bypassing it with direct catalog access.
+
 Run the browser workspace as a foreground local service:
 
 ```bash
@@ -271,6 +291,10 @@ and keeps its persistent random authentication token in a user-only
 names are scoped to that token, allowing independent mdmaid.desk daemons on
 different ports to remain signed in at the same time. Stop the foreground
 service with `Ctrl-C`.
+
+Project, Space, and content type are global filters. Open the Project control
+and type any part of a project name to narrow its choices with a
+case-insensitive substring match, then select the project normally.
 
 Use `--port` to select another loopback port for intentional isolated testing.
 An advanced `--public-url` option
@@ -328,15 +352,17 @@ node dist/cli.js tui
 ```
 
 The TUI reuses the running web daemon when available, so both clients share
-catalog events and reading state. Keys are shown in its footer; the main flow
+catalog invalidations and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
 The queue starts grouped by project; press `g` to cycle through project, tag,
-and one ordered-list view.
+and one ordered-list view. Press `x` to cycle All and named Spaces.
 Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for
 Approve, Request changes, or Reject. The response composer uses `Enter` for a
 newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
-Press `c` from the terminal queue to enter the dedicated Change Reviews space.
+Press `c` from the terminal queue to switch between Docs and Change reviews.
+This content mode is independent from the Actions filter, so “Waiting for you”
+can narrow either mode.
 Producers publish an implementation review and its mandatory decision with:
 
 ```bash
@@ -404,6 +430,11 @@ ${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
   daemon.json  # present while a foreground or background service is running
   daemon.log
 ```
+
+The Spaces release upgrades existing catalogs from schema 8 to schema 9.
+Before the first upgraded start, follow the verified backup and downgrade
+procedure in [docs/RELEASING.md](docs/RELEASING.md#schema-9-backup-and-downgrade-recovery).
+In-place downgrade is not supported.
 
 ## Target Interaction
 

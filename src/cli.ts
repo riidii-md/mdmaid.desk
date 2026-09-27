@@ -17,6 +17,9 @@ import {
   type ReviewKind,
   type ReviewOutcome,
   type ReviewRequest,
+  type RepositoryInventoryItem,
+  type Space,
+  type SpaceMatcher,
 } from "./catalog.js";
 import {
   DeskApiClient,
@@ -126,6 +129,17 @@ Usage:
       [--repository <identity>] [--repository-name <name>]
       [--artifact-root <path> ...]
   mdmaid-desk workspace list
+  mdmaid-desk space add <id> --name <name>
+      [--repository <key-or-name> ...] [--namespace <prefix> ...]
+      [--workspace <id> ...] [--tag <tag> ...] [--json]
+  mdmaid-desk space list [--json]
+  mdmaid-desk space show <id> [--json]
+  mdmaid-desk space rename <id> --name <name> [--json]
+  mdmaid-desk space matchers set <id>
+      [--repository <key-or-name> ...] [--namespace <prefix> ...]
+      [--workspace <id> ...] [--tag <tag> ...] [--json]
+  mdmaid-desk space delete <id> [--json]
+  mdmaid-desk repository list [--json]
   mdmaid-desk validate <file.md> [--json]
   mdmaid-desk register <file.md> --workspace <id>
       [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
@@ -307,6 +321,15 @@ export async function run(
     if (args[0] === "review") {
       return await runReview(statePath, args.slice(1), stdout, options);
     }
+    if (args[0] === "space") {
+      return await runSpace(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "repository") {
+      return await runRepository(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "list" && args.includes("--space")) {
+      return await runScopedList(statePath, args.slice(1), stdout, options);
+    }
     const catalog = await Catalog.open(statePath);
     try {
       const command = args[0];
@@ -324,7 +347,20 @@ export async function run(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const validation = validationReportFromError(error);
-    if (args.includes("--json") && validation !== undefined) {
+    if (
+      args.includes("--json") &&
+      (args[0] === "space" || args[0] === "repository")
+    ) {
+      const code = error instanceof DeskApiError
+        ? error.code
+        : error instanceof UsageError
+        ? "validation_error"
+        : "operation_failed";
+      stderr.write(`${JSON.stringify({
+        schemaVersion: 1,
+        error: { code, message },
+      })}\n`);
+    } else if (args.includes("--json") && validation !== undefined) {
       stderr.write(`${JSON.stringify({
         schemaVersion: 1,
         error: {
@@ -336,11 +372,231 @@ export async function run(
     } else {
       stderr.write(`error: ${message}\n`);
     }
-    if (error instanceof UsageError) {
+    if (
+      error instanceof UsageError ||
+      (error instanceof DeskApiError && error.status === 422)
+    ) {
       stderr.write(usage);
       return 2;
     }
     return 1;
+  }
+}
+
+async function runSpace(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (!action) {
+    throw new UsageError("space action is required");
+  }
+  const matcherSet = action === "matchers" && args[1] === "set";
+  const argumentOffset = matcherSet ? 2 : 1;
+  const parsed = parseArguments(args.slice(argumentOffset), new Set(["json"]));
+  const allowed = matcherSet || action === "add"
+    ? new Set(["name", "repository", "namespace", "workspace", "tag", "json"])
+    : action === "rename"
+    ? new Set(["name", "json"])
+    : new Set(["json"]);
+  rejectUnknownOptions(parsed, allowed);
+
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+  }
+  const catalog = client
+    ? undefined
+    : await Catalog.open(statePath);
+  try {
+    let result: Space | Space[] | { id: string };
+    if (action === "list") {
+      if (parsed.positionals.length > 0) {
+        throw new UsageError("space list accepts options only");
+      }
+      result = client ? await client.listSpaces() : catalog!.listSpaces();
+    } else {
+      const id = parsed.positionals[0];
+      if (!id || parsed.positionals.length > 1) {
+        throw new UsageError(`space ${matcherSet ? "matchers set" : action} requires one id`);
+      }
+      if (action === "show") {
+        result = client
+          ? await client.getSpace(id)
+          : requiredSpace(catalog!, id);
+      } else if (action === "add") {
+        const matchers = await matcherInputs(parsed, client, catalog);
+        const input = { id, name: requiredOption(parsed, "name"), matchers };
+        result = client
+          ? await client.createSpace(input)
+          : catalog!.createSpace(input);
+      } else if (action === "rename") {
+        const name = requiredOption(parsed, "name");
+        result = client
+          ? await client.renameSpace(id, name)
+          : catalog!.renameSpace(id, name);
+      } else if (matcherSet) {
+        const matchers = await matcherInputs(parsed, client, catalog);
+        result = client
+          ? await client.replaceSpaceMatchers(id, matchers)
+          : catalog!.replaceSpaceMatchers(id, { matchers });
+      } else if (action === "delete") {
+        result = client
+          ? await client.deleteSpace(id)
+          : catalog!.deleteSpace(id);
+      } else {
+        throw new UsageError(
+          "space action must be add, list, show, rename, matchers set, or delete",
+        );
+      }
+    }
+    writeManagementResult(stdout, result, hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog?.close();
+  }
+}
+
+async function runRepository(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  if (args[0] !== "list") {
+    throw new UsageError("repository action must be list");
+  }
+  const parsed = parseArguments(args.slice(1), new Set(["json"]));
+  rejectUnknownOptions(parsed, new Set(["json"]));
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("repository list accepts options only");
+  }
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1");
+    writeManagementResult(stdout, await client.listRepositories(), hasFlag(parsed, "json"));
+    return 0;
+  }
+  const catalog = await Catalog.open(statePath);
+  try {
+    writeManagementResult(stdout, catalog.listRepositories(), hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog.close();
+  }
+}
+
+async function runScopedList(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(args);
+  rejectUnknownOptions(parsed, new Set(["workspace", "task", "space"]));
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("list accepts options only");
+  }
+  const spaceId = requiredOption(parsed, "space");
+  const workspace = firstOption(parsed, "workspace");
+  const task = firstOption(parsed, "task");
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+    const documents = (await client.listDocuments({ spaceId })).filter(
+      (document) => (!workspace || document.workspaceId === workspace) &&
+        (!task || document.taskId === task),
+    );
+    for (const document of documents) {
+      stdout.write([
+        document.id,
+        document.workspaceId,
+        document.taskId ?? "-",
+        document.kind,
+        document.attention,
+        document.title,
+        document.route,
+      ].join("\t") + "\n");
+    }
+    return 0;
+  }
+  const catalog = await Catalog.open(statePath);
+  try {
+    return runList(catalog, args, stdout);
+  } finally {
+    catalog.close();
+  }
+}
+
+async function matcherInputs(
+  parsed: ParsedArguments,
+  client: DeskApiClient | undefined,
+  catalog: Catalog | undefined,
+): Promise<SpaceMatcher[]> {
+  const inventory = client
+    ? await client.listRepositories()
+    : catalog!.listRepositories();
+  const result: SpaceMatcher[] = [];
+  for (const candidate of parsed.options.get("repository") ?? []) {
+    const named = inventory.filter(({ name }) => name === candidate);
+    if (named.length > 1) {
+      throw new UsageError(
+        `repository name ${candidate} is ambiguous; use one of: ${named.map(({ key }) => key).join(", ")}`,
+      );
+    }
+    result.push({ kind: "repository", value: named[0]?.key ?? candidate });
+  }
+  for (const value of parsed.options.get("namespace") ?? []) {
+    result.push({ kind: "repository-namespace", value });
+  }
+  for (const workspaceId of parsed.options.get("workspace") ?? []) {
+    const repositories = inventory.filter(({ workspaceIds }) =>
+      workspaceIds.includes(workspaceId)
+    );
+    if (repositories.length !== 1) {
+      throw new UsageError(`unknown or ambiguous workspace ${workspaceId}`);
+    }
+    result.push({ kind: "repository", value: repositories[0]!.key });
+  }
+  for (const value of parsed.options.get("tag") ?? []) {
+    result.push({ kind: "tag", value });
+  }
+  if (result.length === 0) {
+    throw new UsageError(
+      "provide one or more --repository, --namespace, --workspace, or --tag patterns; ask the user which patterns belong to this Space",
+    );
+  }
+  return result;
+}
+
+function requiredSpace(catalog: Catalog, id: string): Space {
+  const space = catalog.getSpace(id);
+  if (!space) {
+    throw new Error(`unknown space ${id}`);
+  }
+  return space;
+}
+
+function writeManagementResult(
+  stdout: Writer,
+  result: Space | Space[] | RepositoryInventoryItem[] | { id: string },
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, data: result })}\n`);
+    return;
+  }
+  const values = Array.isArray(result) ? result : [result];
+  for (const value of values) {
+    if ("matchers" in value) {
+      stdout.write(`${value.id}\t${value.name}\t${value.matchers.map(({ kind, value: matcher }) => `${kind}:${matcher}`).join(",")}\n`);
+    } else if ("key" in value) {
+      stdout.write(`${value.key}\t${value.name}\t${value.workspaceIds.join(",")}\n`);
+    } else {
+      stdout.write(`${value.id}\n`);
+    }
   }
 }
 
@@ -1333,14 +1589,7 @@ async function waitForReviewEvent(
     signal?.addEventListener("abort", onAbort, { once: true });
     void client
       .subscribeCatalog(
-        (event) => {
-          if (
-            event.reviewRequestId === id ||
-            event.documentId === current.documentId
-          ) {
-            check();
-          }
-        },
+        check,
         { signal: controller.signal, onReady: check },
       )
       .then(() => {
@@ -1497,11 +1746,15 @@ function runList(
   if (parsed.positionals.length > 0) {
     throw new UsageError("list accepts options only");
   }
-  rejectUnknownOptions(parsed, new Set(["workspace", "task"]));
+  rejectUnknownOptions(parsed, new Set(["workspace", "task", "space"]));
   const workspace = firstOption(parsed, "workspace");
   const task = firstOption(parsed, "task");
+  const space = firstOption(parsed, "space");
 
-  const documents = catalog.listDocuments().filter((document) => {
+  const documents = catalog.listDocuments(
+    {},
+    space === undefined ? {} : { spaceId: space },
+  ).filter((document) => {
     if (workspace && document.workspaceId !== workspace) {
       return false;
     }
@@ -1594,7 +1847,11 @@ function rejectUnknownOptions(
     if (!allowed.has(name)) {
       throw new UsageError(`unknown option --${name}`);
     }
-    if (name !== "artifact-root" && name !== "tag" && values.length > 1) {
+    if (
+      !["artifact-root", "tag", "repository", "namespace", "workspace"]
+        .includes(name) &&
+      values.length > 1
+    ) {
       throw new UsageError(`option --${name} may be used only once`);
     }
   }

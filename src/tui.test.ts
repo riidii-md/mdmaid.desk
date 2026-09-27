@@ -216,6 +216,10 @@ test("keeps missing documents visible and directly archivable", () => {
 test("filters by status, project, and terminal search input", () => {
   let state = createTuiState(documents, workspaces);
   state = handleTuiKey(state, "s").state;
+  assert.equal(state.actionsOnly, true);
+  assert.equal(state.statusFilter, "all");
+  state = handleTuiKey(state, "s").state;
+  assert.equal(state.actionsOnly, false);
   assert.equal(state.statusFilter, "unread");
   assert.deepEqual(state.visibleDocuments.map(({ id }) => id), [documents[0]?.id]);
 
@@ -241,7 +245,8 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.equal(queueFrame.split("\n").length, 28);
   assert.match(queueFrame, /mdmaid\.desk/);
   assert.match(queueFrame, /DOCUMENT INBOX/);
-  assert.match(queueFrame, /PROJECTS/);
+  assert.match(queueFrame, /FILTERS/);
+  assert.match(queueFrame, /Project.*Space.*Content.*STATUS/s);
   assert.match(queueFrame, /STATUS/);
   assert.match(queueFrame, /Daemon plan/);
   assert.match(queueFrame, /Terminal review/);
@@ -252,7 +257,7 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   const compactFrame = renderTui(queue, 68, 22);
   assert.equal(compactFrame.split("\n").length, 22);
   assert.match(compactFrame, /2 documents/);
-  assert.doesNotMatch(compactFrame, /PROJECTS/);
+  assert.doesNotMatch(compactFrame, /FILTERS/);
 
   const reader = applyTuiReader(
     queue,
@@ -337,7 +342,15 @@ test("targets only new live-source revisions at the open TUI reader", () => {
 test("filters explicit actions and composes a review response", () => {
   const queue = createTuiState(documents, workspaces, reviewRequests);
   const queueFrame = renderTui(queue, 128, 30);
-  assert.match(queueFrame, /ACTIONS/);
+  assert.doesNotMatch(queueFrame, /ACTIONS/);
+  assert.match(
+    queueFrame,
+    /FILTERS[\s\S]*Project[\s\S]*Space[\s\S]*Content[\s\S]*STATUS[\s\S]*Waiting for you/,
+  );
+  assert.ok(
+    queueFrame.indexOf("All projects") < queueFrame.indexOf("All spaces") &&
+      queueFrame.indexOf("All spaces") < queueFrame.indexOf("Documents"),
+  );
   assert.match(queueFrame, /Waiting for you/);
 
   const actions = handleTuiKey(queue, "r").state;
@@ -412,8 +425,8 @@ test("provides a dedicated Change Reviews space", () => {
   );
 
   const inbox = renderTui(state, 128, 30);
-  assert.match(inbox, /c Change reviews/);
-  assert.match(inbox, /Checkout refactor/);
+  assert.match(inbox, /c docs\/changes/);
+  assert.doesNotMatch(inbox, /Checkout refactor/);
 
   state = handleTuiKey(state, "c").state;
   assert.equal(state.changeReviewsOnly, true);
@@ -712,20 +725,20 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
 
   const project = handleTuiMouse(
     queue,
-    { button: "left", x: 10, y: 8 },
+    { button: "left", x: 10, y: 6 },
     128,
     28,
   );
-  assert.equal(project.state.workspaceFilter, "beta");
+  assert.equal(project.state.workspaceFilter, "alpha");
   assert.equal(
     handleTuiMouse(project.state, { button: "left", x: 10, y: 6 }, 128, 28)
       .state.workspaceFilter,
-    undefined,
+    "beta",
   );
 
   const status = handleTuiMouse(
     queue,
-    { button: "left", x: 10, y: 14 },
+    { button: "left", x: 10, y: 15 },
     128,
     28,
   );
@@ -809,10 +822,24 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
     ],
   );
   assert.equal(
-    handleTuiMouse(queue, { button: "left", x: 74, y: 27 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: 100, y: 27 }, 128, 28)
       .state.searching,
     true,
   );
+});
+
+test("switches Spaces fail-closed before requesting scoped reload", () => {
+  const state = createTuiState(documents, workspaces, reviewRequests, [{
+    id: "work",
+    name: "Work",
+    matchers: [{ kind: "tag", value: "work" }],
+  }]);
+  const switched = handleTuiKey(state, "x");
+  assert.equal(switched.state.selectedSpace, "work");
+  assert.deepEqual(switched.state.documents, []);
+  assert.deepEqual(switched.state.reviewRequests, []);
+  assert.deepEqual(switched.effects, [{ type: "reload" }]);
+  assert.match(renderTui(switched.state, 128, 28), /Work/);
 });
 
 test("preserves selection and allows only safe document styling", () => {
@@ -956,6 +983,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   let renderPreferences: { color?: boolean; unicode?: boolean } | undefined;
   let lists = 0;
   let onCatalog: ((event: CatalogEvent) => void) | undefined;
+  let onReady: (() => void) | undefined;
   const client = {
     listDocuments: async () => {
       lists += 1;
@@ -963,6 +991,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
     },
     listWorkspaces: async () => structuredClone(workspaces),
     listReviewRequests: async () => [],
+    listSpaces: async () => [],
     renderDocument: async (
       id: string,
       _target: string,
@@ -999,6 +1028,7 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
       options: CatalogSubscriptionOptions = {},
     ) => {
       onCatalog = listener;
+      onReady = options.onReady;
       await new Promise<void>((resolve) => {
         options.signal?.addEventListener("abort", () => resolve(), { once: true });
       });
@@ -1017,9 +1047,13 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   input.write("\u001b[<65;10;7M\u001b[<64;10;7M\u001b[6~\u001b[5~");
   input.write("\u001b[<0;10;7m");
   const listsBeforeEvent = lists;
-  onCatalog?.({ action: "tags", documentId: documents[1]!.id });
+  onCatalog?.({});
   await eventually(() => lists > listsBeforeEvent);
-  assert.equal(renders, 1);
+  assert.equal(renders, 2);
+  const listsBeforeReady = lists;
+  onReady?.();
+  await eventually(() => lists > listsBeforeReady);
+  assert.equal(renders, 3);
 
   const openedId = actions
     .find((value) => value.startsWith("opened:"))
@@ -1034,13 +1068,8 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
         }
       : document,
   );
-  const nextRevision = current.find(({ id }) => id === openedId)!.revision;
-  onCatalog?.({
-    action: "source-changed",
-    documentId: openedId,
-    revision: nextRevision,
-  });
-  await eventually(() => renders === 2);
+  onCatalog?.({});
+  await eventually(() => renders === 4);
   assert.equal(
     actions.filter((value) => value === `opened:${openedId}`).length,
     1,
@@ -1057,6 +1086,65 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   assert.match(terminal, /\u001b\[\?1006l\u001b\[\?1000l/);
   assert.equal(terminal.match(/\u001b\[2J/g)?.length, 1);
   assert.deepEqual(renderPreferences, { color: true, unicode: true });
+});
+
+test("discards a delayed TUI reload after switching to another Space", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  Object.defineProperties(output, {
+    columns: { value: 80 },
+    rows: { value: 20 },
+    isTTY: { value: true },
+  });
+  let terminal = "";
+  output.on("data", (chunk: Buffer) => {
+    terminal += chunk.toString();
+  });
+  const allDocument = { ...documents[0]!, title: "All current" };
+  const workDocument = { ...documents[1]!, title: "Work stale" };
+  let resolveWork: ((value: PublicDocument[]) => void) | undefined;
+  const workDocuments = new Promise<PublicDocument[]>((resolve) => {
+    resolveWork = resolve;
+  });
+  const scopes: Array<string | undefined> = [];
+  const client = {
+    listDocuments: async (scope: { spaceId?: string } = {}) => {
+      scopes.push(scope.spaceId);
+      return scope.spaceId === "work" ? workDocuments : [allDocument];
+    },
+    listWorkspaces: async () => [workspaces[0]!],
+    listReviewRequests: async () => [],
+    listSpaces: async () => [{
+      id: "work",
+      name: "Work",
+      matchers: [{ kind: "tag" as const, value: "work" }],
+    }],
+    subscribeCatalog: async (
+      _listener: (event: CatalogEvent) => void,
+      options: CatalogSubscriptionOptions = {},
+    ) => {
+      await new Promise<void>((resolve) => {
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  } as unknown as DeskApiClient;
+
+  const running = runTui(client, {
+    env: { TERM: "xterm-256color" },
+    input: input as unknown as ReadStream,
+    output: output as unknown as WriteStream,
+  });
+  await eventually(() => terminal.includes("All current"));
+  input.write("x");
+  await eventually(() => scopes.includes("work"));
+  input.write("x");
+  resolveWork?.([workDocument]);
+  await eventually(() => scopes.filter((scope) => scope === undefined).length >= 2);
+  input.write("q");
+  await running;
+
+  assert.match(terminal, /All current/);
+  assert.doesNotMatch(terminal, /Work stale/);
 });
 
 test("opens a safe missing-source reader when a source disappears during render", async () => {
@@ -1083,6 +1171,7 @@ test("opens a safe missing-source reader when a source disappears during render"
     listDocuments: async () => [sourceMissing ? missing : present],
     listWorkspaces: async () => [workspaces[0]!],
     listReviewRequests: async () => [],
+    listSpaces: async () => [],
     renderDocument: async () => {
       sourceMissing = true;
       throw new DeskApiError(

@@ -61,18 +61,32 @@ requested port matches and rejects a conflicting second server.
 
 ## Live source refresh
 
+The header brand is a same-origin link back to the workspace root. Docs and
+Change reviews are top-level content modes; “Waiting for you” narrows the
+selected mode. The Project control filters its choices by a case-insensitive
+substring while the user types. The Space selector filters every list, reader,
+action, review, source, and media request while preserving stable `/`, `/w`,
+`/p`, and `/d` paths through query state.
+
 Registered documents are shown as `live source`; imported durable copies are
 shown as `snapshot`. While this service is running, mdmaid.desk watches only
 the parent directories needed by active registered Markdown sources. Editing,
 atomically replacing, removing, or restoring a registered source reconciles
-its revision and refreshes an open matching Web or TUI reader. Web refresh
-preserves the nearest available heading and reruns Mermaid without adding a
-history entry or marking the revision opened again.
+its revision and publishes a metadata-free invalidation. Web and TUI reload
+authoritative data for their selected Space; an open reader is kept only when
+the document remains in scope. Web refresh preserves the nearest available
+heading and reruns Mermaid without adding a history entry or marking the
+revision opened again.
 
 Linked text files and validated SVG media are re-read and re-authorized on each
 request but are not watched. Without this service, opening or rendering a
 registered document still reconciles its current source; there is simply no
 automatic push event.
+
+The Spaces release upgrades the catalog to schema 9. Before the first upgraded
+start, stop the daemon and create the verified schema-8 backup described in
+[Releasing and distribution](./RELEASING.md#schema-9-backup-and-downgrade-recovery).
+In-place downgrade is unsupported; recovery requires that backup.
 
 ## Security boundary
 

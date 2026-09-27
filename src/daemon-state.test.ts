@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { Catalog } from "./catalog.js";
 import {
+  connectToDaemonInfo,
   connectToDaemon,
   daemonDescriptorPath,
   descriptorForServer,
@@ -14,6 +15,7 @@ import {
   writeDaemonDescriptor,
   type DaemonDescriptor,
 } from "./daemon-state.js";
+import { DaemonHealthCompatibilityError } from "./api-client.js";
 import { startDeskServer } from "./server.js";
 
 const descriptor: DaemonDescriptor = {
@@ -72,6 +74,88 @@ test("rejects malformed and symlinked daemon descriptors", async () => {
     }),
     /Invalid daemon descriptor/,
   );
+});
+
+test("retains a live descriptor when its core-valid protocol version differs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-daemon-version-"));
+  const statePath = join(root, "catalog.sqlite3");
+  const path = daemonDescriptorPath(statePath);
+  await writeDaemonDescriptor(path, descriptor);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    data: {
+      service: "mdmaid.desk",
+      status: "ok",
+      version: descriptor.protocolVersion + 1,
+      capabilities: ["spaces-v1", "scoped-content-v1"],
+    },
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+  try {
+    await assert.rejects(
+      connectToDaemonInfo(statePath),
+      DaemonHealthCompatibilityError,
+    );
+    assert.deepEqual(await readDaemonDescriptor(path), descriptor);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("classifies live daemon capability extensions without deleting its descriptor", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const capabilityCase of [
+      { name: "absent", value: undefined, compatible: true },
+      { name: "malformed", value: ["spaces-v1", 3], compatible: false },
+      {
+        name: "duplicates and future values",
+        value: ["spaces-v1", "spaces-v1", "future-v4"],
+        compatible: true,
+      },
+    ] as const) {
+      const root = await mkdtemp(join(tmpdir(), `mdmaid-desk-daemon-${capabilityCase.name}-`));
+      const statePath = join(root, "catalog.sqlite3");
+      const path = daemonDescriptorPath(statePath);
+      await writeDaemonDescriptor(path, descriptor);
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        data: {
+          service: "mdmaid.desk",
+          status: "ok",
+          version: descriptor.protocolVersion,
+          ...(capabilityCase.value === undefined
+            ? {}
+            : { capabilities: capabilityCase.value }),
+        },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+
+      if (capabilityCase.compatible) {
+        const connection = await connectToDaemonInfo(statePath);
+        assert.ok(connection);
+        if (capabilityCase.value === undefined) {
+          await assert.rejects(
+            connection.client.requireCapabilities("spaces-v1"),
+            DaemonHealthCompatibilityError,
+          );
+        } else {
+          await connection.client.requireCapabilities("spaces-v1");
+        }
+      } else {
+        await assert.rejects(
+          connectToDaemonInfo(statePath),
+          DaemonHealthCompatibilityError,
+        );
+      }
+      assert.deepEqual(await readDaemonDescriptor(path), descriptor);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("connects to a live descriptor and removes stale connection state", async () => {

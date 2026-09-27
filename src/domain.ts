@@ -119,6 +119,36 @@ export interface RepositoryIdentity {
   name: string;
 }
 
+export const SPACE_MATCHER_KINDS = [
+  "repository",
+  "repository-namespace",
+  "tag",
+] as const;
+
+export type SpaceMatcherKind = (typeof SPACE_MATCHER_KINDS)[number];
+
+export type SpaceMatcher =
+  | { kind: "repository"; value: string }
+  | { kind: "repository-namespace"; value: string }
+  | { kind: "tag"; value: string };
+
+export interface Space {
+  id: string;
+  name: string;
+  matchers: SpaceMatcher[];
+}
+
+export interface ContentScope {
+  spaceId?: string;
+}
+
+export interface RepositoryInventoryItem {
+  key: string;
+  name: string;
+  workspaceIds: string[];
+  kind: "remote" | "local";
+}
+
 export interface Project {
   id: string;
   repositoryKey: string;
@@ -224,4 +254,8 @@ export function isReviewStatus(value: string): value is ReviewStatus {
 
 export function isReviewOutcome(value: string): value is ReviewOutcome {
   return (REVIEW_OUTCOMES as readonly string[]).includes(value);
+}
+
+export function isSpaceMatcherKind(value: string): value is SpaceMatcherKind {
+  return (SPACE_MATCHER_KINDS as readonly string[]).includes(value);
 }
