@@ -7,6 +7,7 @@ import {
   mkdir,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -305,6 +306,7 @@ export class Catalog {
       if (legacyStatePath && storage.isEmpty()) {
         await catalog.#migrateLegacyState(legacyStatePath);
       }
+      await recoverManagedPurges(catalog.#managedRoot, storage);
       return catalog;
     } catch (error) {
       storage.close();
@@ -1362,39 +1364,90 @@ export class Catalog {
     id: string,
     scope: ContentScope = {},
   ): Promise<Document> {
-    validateDocumentId(id);
+    return (await this.archiveDocuments([id], scope))[0]!;
+  }
+
+  async archiveDocuments(
+    ids: readonly string[],
+    scope: ContentScope = {},
+  ): Promise<Document[]> {
     const resolvedScope = this.#resolveScope(scope);
+    const documents = this.#documentsForMutation(ids, resolvedScope);
     const result = this.#storage.transaction(() => {
-      if (
-        this.#storage.listReviewRequests(
-          { documentId: id, status: "pending" },
-          resolvedScope,
-        )
-          .length > 0
-      ) {
-        throw new ReviewConflictError(
-          "document has a pending review request",
-        );
+      for (const document of documents) {
+        if (
+          this.#storage.listReviewRequests(
+            { documentId: document.id, status: "pending" },
+            resolvedScope,
+          ).length > 0
+        ) {
+          throw new ReviewConflictError(
+            "document has a pending review request",
+          );
+        }
       }
-      return this.#updateDocumentResult(id, (document) => ({
-        ...document,
-        archivedAt: document.archivedAt ?? new Date().toISOString(),
-      }), resolvedScope);
+      const archivedAt = new Date().toISOString();
+      return documents.map(({ id }) => this.#updateDocumentResult(
+        id,
+        (document) => ({
+          ...document,
+          archivedAt: document.archivedAt ?? archivedAt,
+        }),
+        resolvedScope,
+      ));
     });
-    if (result.changed) {
+    if (result.some(({ changed }) => changed)) {
       this.#emitInvalidation();
     }
-    return result.document;
+    return result.map(({ document }) => document);
   }
 
   async restoreDocument(
     id: string,
     scope: ContentScope = {},
   ): Promise<Document> {
-    return this.#updateDocument(id, (document) => ({
-      ...document,
-      archivedAt: null,
-    }), scope);
+    return (await this.restoreDocuments([id], scope))[0]!;
+  }
+
+  async restoreDocuments(
+    ids: readonly string[],
+    scope: ContentScope = {},
+  ): Promise<Document[]> {
+    const resolvedScope = this.#resolveScope(scope);
+    const documents = this.#documentsForMutation(ids, resolvedScope);
+    const result = this.#storage.transaction(() => documents.map(({ id }) =>
+      this.#updateDocumentResult(id, (document) => ({
+        ...document,
+        archivedAt: null,
+      }), resolvedScope)
+    ));
+    if (result.some(({ changed }) => changed)) {
+      this.#emitInvalidation();
+    }
+    return result.map(({ document }) => document);
+  }
+
+  async purgeDocuments(
+    ids: readonly string[],
+    scope: ContentScope = {},
+  ): Promise<string[]> {
+    const resolvedScope = this.#resolveScope(scope);
+    const documents = this.#documentsForMutation(ids, resolvedScope);
+    const staged = await stageManagedDocumentFiles(this.#managedRoot, documents);
+    try {
+      const deleted = this.#storage.deleteDocuments(
+        documents.map(({ id }) => id),
+      );
+      if (deleted !== documents.length) {
+        throw new Error("document purge was incomplete");
+      }
+    } catch (error) {
+      await restoreStagedManagedFiles(staged);
+      throw error;
+    }
+    await finalizeStagedManagedFiles(staged);
+    this.#emitInvalidation();
+    return documents.map(({ id }) => id);
   }
 
   async markDocumentMissing(
@@ -1405,6 +1458,28 @@ export class Catalog {
       ...document,
       missingAt: document.missingAt ?? new Date().toISOString(),
     }), scope);
+  }
+
+  #documentsForMutation(
+    ids: readonly string[],
+    scope: ContentScope,
+  ): StoredDocument[] {
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 500) {
+      throw new Error("document ids must contain between 1 and 500 entries");
+    }
+    const unique = new Set<string>();
+    return ids.map((id) => {
+      validateDocumentId(id);
+      if (unique.has(id)) {
+        throw new Error("document ids must be unique");
+      }
+      unique.add(id);
+      const document = this.#storage.getDocument(id, scope);
+      if (!document) {
+        throw new Error(`unknown document ${id}`);
+      }
+      return document;
+    });
   }
 
   async markDocumentPresent(
@@ -2365,6 +2440,182 @@ async function writeManagedCopy(
     await rm(temporary, { force: true });
     throw error;
   }
+}
+
+interface StagedManagedFile {
+  directory: string;
+  originalPath: string;
+  stagedPath: string;
+}
+
+async function stageManagedDocumentFiles(
+  managedRoot: string,
+  documents: readonly StoredDocument[],
+): Promise<StagedManagedFile[]> {
+  const managed = documents.filter(({ storage }) => storage === "managed");
+  if (managed.length === 0) {
+    return [];
+  }
+  const canonicalRoot = await authorizedManagedRoot(managedRoot);
+  const staged: StagedManagedFile[] = [];
+  try {
+    const documentsByDirectory = new Map<string, Set<string>>();
+    for (const document of managed) {
+      const directory = await authorizedManagedDirectory(
+        canonicalRoot,
+        dirname(document.path),
+      );
+      const ids = documentsByDirectory.get(directory) ?? new Set<string>();
+      ids.add(document.id);
+      documentsByDirectory.set(directory, ids);
+    }
+    for (const [directory, ids] of documentsByDirectory) {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const match = /^(doc-[a-f0-9]{20})-[a-f0-9]{64}\.md$/.exec(
+          entry.name,
+        );
+        if (!match || !ids.has(match[1]!)) {
+          continue;
+        }
+        const originalPath = join(directory, entry.name);
+        const info = await lstat(originalPath);
+        if (info.isSymbolicLink() || !info.isFile()) {
+          throw new Error("managed document path must be a regular, non-symlink file");
+        }
+        const stagedPath = join(
+          directory,
+          `.${entry.name}.${randomUUID()}.purging`,
+        );
+        await rename(originalPath, stagedPath);
+        staged.push({ directory, originalPath, stagedPath });
+      }
+      await syncDirectory(directory);
+    }
+    return staged;
+  } catch (error) {
+    await restoreStagedManagedFiles(staged);
+    throw error;
+  }
+}
+
+async function restoreStagedManagedFiles(
+  staged: readonly StagedManagedFile[],
+): Promise<void> {
+  const directories = new Set<string>();
+  for (const file of [...staged].reverse()) {
+    await rename(file.stagedPath, file.originalPath);
+    directories.add(file.directory);
+  }
+  for (const directory of directories) {
+    await syncDirectory(directory);
+  }
+}
+
+async function finalizeStagedManagedFiles(
+  staged: readonly StagedManagedFile[],
+): Promise<void> {
+  const directories = new Set<string>();
+  await Promise.all(staged.map(async (file) => {
+    directories.add(file.directory);
+    try {
+      await rm(file.stagedPath, { force: true });
+    } catch {
+      // A private purge marker is retried when the catalog next opens.
+    }
+  }));
+  for (const directory of directories) {
+    try {
+      await syncDirectory(directory);
+    } catch {
+      // The committed purge remains successful; recovery removes any marker.
+    }
+  }
+}
+
+async function recoverManagedPurges(
+  managedRoot: string,
+  storage: CatalogStorage,
+): Promise<void> {
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = await authorizedManagedRoot(managedRoot);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  const workspaces = await readdir(canonicalRoot, { withFileTypes: true });
+  for (const workspace of workspaces) {
+    if (!workspace.isDirectory() || workspace.isSymbolicLink()) {
+      continue;
+    }
+    const directory = await authorizedManagedDirectory(
+      canonicalRoot,
+      join(canonicalRoot, workspace.name),
+    );
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const match = /^\.(doc-[a-f0-9]{20})-[a-f0-9]{64}\.md\.[0-9a-f-]+\.purging$/.exec(
+        entry.name,
+      );
+      if (!match || !entry.isFile() || entry.isSymbolicLink()) {
+        continue;
+      }
+      const stagedPath = join(directory, entry.name);
+      const suffix = entry.name.slice(1, entry.name.lastIndexOf("."));
+      const originalName = suffix.slice(0, suffix.lastIndexOf("."));
+      const originalPath = join(directory, originalName);
+      const document = storage.getDocument(match[1]!);
+      const documentDirectory = document?.storage === "managed"
+        ? await authorizedManagedDirectory(
+            canonicalRoot,
+            dirname(document.path),
+          )
+        : undefined;
+      if (
+        document?.storage === "managed" &&
+        documentDirectory === directory
+      ) {
+        try {
+          await lstat(originalPath);
+          await rm(stagedPath, { force: true });
+        } catch (error) {
+          if (!isNodeError(error) || error.code !== "ENOENT") {
+            throw error;
+          }
+          await rename(stagedPath, originalPath);
+        }
+      } else {
+        await rm(stagedPath, { force: true });
+      }
+    }
+    await syncDirectory(directory);
+  }
+}
+
+async function authorizedManagedRoot(managedRoot: string): Promise<string> {
+  const info = await lstat(managedRoot);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("managed document storage must be a non-symlink directory");
+  }
+  return realpath(managedRoot);
+}
+
+async function authorizedManagedDirectory(
+  canonicalRoot: string,
+  directory: string,
+): Promise<string> {
+  const info = await lstat(directory);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("managed document directory must be a non-symlink directory");
+  }
+  const canonicalDirectory = await realpath(directory);
+  if (!isWithin(canonicalRoot, canonicalDirectory)) {
+    throw new Error("managed document is outside private storage");
+  }
+  return canonicalDirectory;
 }
 
 async function ensurePrivateDirectory(path: string): Promise<void> {

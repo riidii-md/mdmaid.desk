@@ -1,6 +1,7 @@
 /* mdmaid.desk web client */
 
 import type {
+  BulkDocumentResult,
   ChangeReviewDiff,
   PublicDocument,
   PublicReviewRequest,
@@ -21,7 +22,8 @@ export type WebDocument = PublicDocument;
 export type WebWorkspace = PublicWorkspace;
 export type WebReviewRequest = PublicReviewRequest;
 export type WebQueueGrouping = "project" | "tag" | "all";
-export type WebContentMode = "docs" | "change-reviews";
+export type WebContentMode = "docs" | "change-reviews" | "archive";
+export type WebMutationAction = "archive" | "restore" | "purge";
 
 export interface WebFilters {
   workspaceId?: string | undefined;
@@ -385,6 +387,7 @@ interface WebState {
   filters: WebFilters;
   grouping: WebQueueGrouping;
   reviewRequests: WebReviewRequest[];
+  selectedDocumentIds: Set<string>;
   selectedId: string | undefined;
   selectedSpace: string | undefined;
   spaces: PublicSpace[];
@@ -429,7 +432,14 @@ export function filterQueue(
     const contentMode = filters.contentMode ??
       (filters.changeReviewsOnly === true ? "change-reviews" : "docs");
     if (
+      (contentMode === "archive" && document.archivedAt === null) ||
+      (contentMode !== "archive" && document.archivedAt !== null)
+    ) {
+      return false;
+    }
+    if (
       filters.contentMode !== undefined &&
+      contentMode !== "archive" &&
       ((contentMode === "docs" && document.kind === "change-review") ||
         (contentMode === "change-reviews" && document.kind !== "change-review"))
     ) {
@@ -490,6 +500,37 @@ export function filterQueue(
   });
 }
 
+export function bulkDocumentIds(
+  documents: WebDocument[],
+  filters: WebFilters,
+  reviewRequests: WebReviewRequest[] = [],
+): string[] {
+  return filterQueue(documents, filters, reviewRequests).map(({ id }) => id);
+}
+
+export function webMutationConfirmation(
+  action: "archive" | "purge",
+  count: number,
+): { confirmLabel: string; message: string; title: string } {
+  const multiple = count !== 1;
+  if (action === "archive") {
+    return {
+      confirmLabel: multiple ? `archive ${count} documents` : "archive document",
+      message: multiple
+        ? `Archive ${count} documents? You can restore them later from Archive.`
+        : "Archive this document? You can restore it later from Archive.",
+      title: multiple ? "Archive documents?" : "Archive document?",
+    };
+  }
+  return {
+    confirmLabel: multiple ? `purge ${count} documents forever` : "purge document forever",
+    message: multiple
+      ? `Purge ${count} documents forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.`
+      : "Purge this document forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.",
+    title: "Purge forever?",
+  };
+}
+
 export function projectQueueSelection(
   filters: WebFilters,
   workspace: Pick<WebWorkspace, "id" | "route"> | undefined,
@@ -538,7 +579,9 @@ export function workspaceQueryState(search: string): {
     ...(selectedSpace === undefined ? {} : { selectedSpace }),
     contentMode: query.get("view") === "change-reviews"
       ? "change-reviews"
-      : "docs",
+      : query.get("view") === "archive"
+        ? "archive"
+        : "docs",
     actionsOnly: query.get("actions") === "1",
   };
 }
@@ -1152,12 +1195,13 @@ export function groupQueue(
 export function visibleWorkspaces(
   documents: WebDocument[],
   workspaces: WebWorkspace[],
+  includeArchived = false,
 ): WebWorkspace[] {
   const counts = new Map<string, number>();
   const labels = new Map<string, string>();
   const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
   for (const document of documents) {
-    if (document.archivedAt === null) {
+    if (includeArchived || document.archivedAt === null) {
       const projectId = document.projectId ?? document.workspaceId;
       counts.set(
         projectId,
@@ -1334,6 +1378,7 @@ async function boot(): Promise<void> {
   const state: WebState = {
     documents: [],
     reviewRequests: [],
+    selectedDocumentIds: new Set(),
     filters: {
       status: "all",
       workspaceId:
@@ -1362,6 +1407,7 @@ async function boot(): Promise<void> {
   const projectOptions = element("project-options");
   const docsFilter = element("docs-filter") as HTMLButtonElement;
   const changeReviewsFilter = element("change-reviews-filter") as HTMLButtonElement;
+  const archiveFilter = element("archive-filter") as HTMLButtonElement;
   const changeReviewsCount = element("change-reviews-count");
   const actionsFilter = element("actions-filter") as HTMLButtonElement;
   const actionsCount = element("actions-count");
@@ -1412,6 +1458,26 @@ async function boot(): Promise<void> {
   const copyLink = element("copy-link") as HTMLButtonElement;
   const print = element("print") as HTMLButtonElement;
   const empty = element("queue-empty");
+  const bulkActions = element("bulk-actions");
+  const selectVisible = element("select-visible") as HTMLButtonElement;
+  const selectionCount = element("selection-count");
+  const bulkArchive = element("bulk-archive") as HTMLButtonElement;
+  const bulkRestore = element("bulk-restore") as HTMLButtonElement;
+  const bulkPurge = element("bulk-purge") as HTMLButtonElement;
+  const queueError = element("queue-error");
+  const queueErrorTitle = element("queue-error-title");
+  const queueErrorGuidance = element("queue-error-guidance");
+  const archiveButton = element("archive") as HTMLButtonElement;
+  const restoreButton = element("restore") as HTMLButtonElement;
+  const purgeButton = element("purge") as HTMLButtonElement;
+  const actionDialog = element("document-action-dialog") as HTMLDialogElement;
+  const actionDialogTitle = element("document-action-title");
+  const actionDialogMessage = element("document-action-message");
+  const actionCancel = element("document-action-cancel") as HTMLButtonElement;
+  const actionConfirm = element("document-action-confirm") as HTMLButtonElement;
+  const archiveUndo = element("archive-undo");
+  const archiveUndoMessage = element("archive-undo-message");
+  const archiveUndoButton = element("archive-undo-button") as HTMLButtonElement;
   const search = element("search") as HTMLInputElement;
   const live = element("live-status");
   const statusButtons = Array.from(
@@ -1436,6 +1502,8 @@ async function boot(): Promise<void> {
   let projectPickerOpen = false;
   let highlightedProjectIndex = -1;
   let displayedProjectChoices: Array<WebWorkspace | undefined> = [];
+  let pendingMutation: { action: "archive" | "purge"; ids: string[] } | undefined;
+  let lastArchivedIds: string[] = [];
 
   function scopedPath(path: string): string {
     const url = new URL(path, location.origin);
@@ -1457,9 +1525,20 @@ async function boot(): Promise<void> {
     return projectQueueRoute(
       state.filters.workspaceId,
       [
-        ...visibleWorkspaces(state.documents, state.workspaces),
+        ...currentVisibleWorkspaces(),
         ...state.workspaces,
       ],
+    );
+  }
+
+  function currentVisibleWorkspaces(
+    documents: WebDocument[] = state.documents,
+    workspaces: WebWorkspace[] = state.workspaces,
+  ): WebWorkspace[] {
+    return visibleWorkspaces(
+      documents,
+      workspaces,
+      state.filters.contentMode === "archive",
     );
   }
 
@@ -1489,7 +1568,7 @@ async function boot(): Promise<void> {
 
   function projectInventory(): WebWorkspace[] {
     const selected = state.filters.workspaceId ?? "";
-    const projects = visibleWorkspaces(state.documents, state.workspaces);
+    const projects = currentVisibleWorkspaces();
     if (selected !== "" && !projects.some(({ id }) => id === selected)) {
       const selectedProject = state.workspaces.find(({ id }) => id === selected);
       projects.push({
@@ -1596,6 +1675,7 @@ async function boot(): Promise<void> {
   function selectProjectChoice(selected?: WebWorkspace): void {
     const selection = projectQueueSelection(state.filters, selected);
     state.filters = selection.filters;
+    state.selectedDocumentIds.clear();
     closeProjectPicker();
     closeReader(false);
     history.pushState({}, "", currentRoute(selection.route));
@@ -1624,6 +1704,10 @@ async function boot(): Promise<void> {
       state.filters.contentMode === "change-reviews",
     );
     docsFilter.classList.toggle("active", state.filters.contentMode === "docs");
+    archiveFilter.classList.toggle(
+      "active",
+      state.filters.contentMode === "archive",
+    );
     changeReviewsFilter.setAttribute(
       "aria-pressed",
       String(state.filters.contentMode === "change-reviews"),
@@ -1631,6 +1715,10 @@ async function boot(): Promise<void> {
     docsFilter.setAttribute(
       "aria-pressed",
       String(state.filters.contentMode === "docs"),
+    );
+    archiveFilter.setAttribute(
+      "aria-pressed",
+      String(state.filters.contentMode === "archive"),
     );
   }
 
@@ -1681,10 +1769,24 @@ async function boot(): Promise<void> {
       state.reviewRequests,
     );
     const changes = state.filters.contentMode === "change-reviews";
-    queueEyebrow.textContent = changes
-      ? "implementation review workspace"
-      : "persistent reading queue";
-    queueTitle.textContent = changes ? "Change Reviews" : "What needs your eyes?";
+    const archived = state.filters.contentMode === "archive";
+    queueEyebrow.textContent = archived
+      ? "reversible document storage"
+      : changes
+        ? "implementation review workspace"
+        : "persistent reading queue";
+    queueTitle.textContent = archived
+      ? "Archive"
+      : changes
+        ? "Change Reviews"
+        : "What needs your eyes?";
+    const visibleIds = new Set(documents.map(({ id }) => id));
+    for (const id of state.selectedDocumentIds) {
+      if (!visibleIds.has(id)) {
+        state.selectedDocumentIds.delete(id);
+      }
+    }
+    renderBulkActions(documents);
     empty.toggleAttribute("hidden", documents.length !== 0);
     for (const group of groupQueue(documents, state.grouping, state.workspaces)) {
       const grid = document.createElement("div");
@@ -1710,7 +1812,48 @@ async function boot(): Promise<void> {
     }
   }
 
-  function documentCard(item: WebDocument): HTMLButtonElement {
+  function renderBulkActions(documents: WebDocument[]): void {
+    bulkActions.toggleAttribute("hidden", documents.length === 0);
+    const selectedCount = state.selectedDocumentIds.size;
+    const allSelected = documents.length > 0 &&
+      documents.every(({ id }) => state.selectedDocumentIds.has(id));
+    selectVisible.textContent = allSelected
+      ? "clear selection"
+      : state.filters.workspaceId === undefined
+        ? "select all visible"
+        : "select all in project";
+    selectionCount.textContent = `${selectedCount} selected`;
+    bulkArchive.disabled = selectedCount === 0;
+    bulkRestore.disabled = selectedCount === 0;
+    bulkPurge.disabled = selectedCount === 0;
+    bulkArchive.toggleAttribute("hidden", state.filters.contentMode === "archive");
+    bulkRestore.toggleAttribute("hidden", state.filters.contentMode !== "archive");
+  }
+
+  function documentCard(item: WebDocument): HTMLElement {
+    const shell = document.createElement("article");
+    shell.className = "document-card-shell";
+    const selector = document.createElement("label");
+    selector.className = "document-selector";
+    selector.title = `Select ${item.title}`;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedDocumentIds.has(item.id);
+    checkbox.setAttribute("aria-label", `Select ${item.title}`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        state.selectedDocumentIds.add(item.id);
+      } else {
+        state.selectedDocumentIds.delete(item.id);
+      }
+      renderBulkActions(filterQueue(
+        state.documents,
+        state.filters,
+        state.reviewRequests,
+      ));
+    });
+    selector.append(checkbox);
+
     const card = document.createElement("button");
     card.type = "button";
     card.className = `document-card status-${item.status}`;
@@ -1766,7 +1909,8 @@ async function boot(): Promise<void> {
 
     card.append(top, title, detail, tags);
     card.addEventListener("click", () => void openDocument(item.id));
-    return card;
+    shell.append(selector, card);
+    return shell;
   }
 
   function renderGroupingControls(): void {
@@ -1826,6 +1970,7 @@ async function boot(): Promise<void> {
       state.documents = [];
       state.workspaces = [];
       state.reviewRequests = [];
+      state.selectedDocumentIds.clear();
       readerContent.replaceChildren();
       reader.setAttribute("hidden", "");
       queuePanel.removeAttribute("hidden");
@@ -1833,8 +1978,11 @@ async function boot(): Promise<void> {
     }
     let loaded: [WebDocument[], WebWorkspace[], WebReviewRequest[], PublicSpace[]];
     try {
+      const documentsPath = state.filters.contentMode === "archive"
+        ? "/api/v1/documents?archived=true"
+        : "/api/v1/documents";
       loaded = await Promise.all([
-        api<WebDocument[]>("/api/v1/documents"),
+        api<WebDocument[]>(documentsPath),
         api<WebWorkspace[]>("/api/v1/workspaces"),
         api<WebReviewRequest[]>("/api/v1/review-requests"),
         api<PublicSpace[]>("/api/v1/spaces", {}, false),
@@ -1854,10 +2002,7 @@ async function boot(): Promise<void> {
     state.reviewRequests = reviewRequests;
     state.spaces = spaces;
     renderSpaceOptions();
-    const navigationWorkspaces = visibleWorkspaces(
-      documents,
-      workspaces,
-    );
+    const navigationWorkspaces = currentVisibleWorkspaces(documents, workspaces);
     if (
       state.filters.workspaceId !== undefined &&
       !navigationWorkspaces.some(({ id }) => id === state.filters.workspaceId) &&
@@ -1869,9 +2014,11 @@ async function boot(): Promise<void> {
       ? undefined
       : documents.find(({ id }) => id === state.selectedId);
     if (selectedDocument) {
-      state.filters.contentMode = selectedDocument.kind === "change-review"
-        ? "change-reviews"
-        : "docs";
+      state.filters.contentMode = selectedDocument.archivedAt !== null
+        ? "archive"
+        : selectedDocument.kind === "change-review"
+          ? "change-reviews"
+          : "docs";
       state.filters.changeReviewsOnly =
         state.filters.contentMode === "change-reviews";
       history.replaceState(
@@ -1881,9 +2028,8 @@ async function boot(): Promise<void> {
       );
     }
     if (openSelected) {
-      const visible = visibleWorkspaces(
+      const visible = currentVisibleWorkspaces(
         state.documents.filter(({ kind }) => kind !== "change-review"),
-        state.workspaces,
       );
       const queueWorkspaces = [...visible, ...state.workspaces];
       const selection = state.selectedId
@@ -2013,6 +2159,11 @@ async function boot(): Promise<void> {
     readerEyebrow.textContent = selected?.kind === "change-review"
       ? "change review"
       : "document";
+    const archived = selected?.archivedAt !== null && selected !== undefined;
+    archiveButton.toggleAttribute("hidden", archived);
+    restoreButton.toggleAttribute("hidden", !archived);
+    markRead.toggleAttribute("hidden", archived);
+    markUnread.toggleAttribute("hidden", archived);
   }
 
   function openFeedbackComposer(
@@ -2658,9 +2809,8 @@ async function boot(): Promise<void> {
   }
 
   function pushDocumentHistory(id: string, route: string): void {
-    const visible = visibleWorkspaces(
+    const visible = currentVisibleWorkspaces(
       state.documents.filter(({ kind }) => kind !== "change-review"),
-      state.workspaces,
     );
     history.pushState(
       documentHistoryState(id, state.filters, [...visible, ...state.workspaces]),
@@ -3011,9 +3161,8 @@ async function boot(): Promise<void> {
     readerTocList.replaceChildren();
     queuePanel.removeAttribute("hidden");
     if (pushHistory) {
-      const workspaces = visibleWorkspaces(
+      const workspaces = currentVisibleWorkspaces(
         state.documents.filter(({ kind }) => kind !== "change-review"),
-        state.workspaces,
       );
       history.pushState(
         queueHistoryState(state.filters),
@@ -3035,13 +3184,13 @@ async function boot(): Promise<void> {
     render();
   }
 
-  async function act(action: "read" | "unread" | "archive"): Promise<void> {
+  async function act(action: "read" | "unread"): Promise<void> {
     const id = state.selectedId;
     if (!id) {
       return;
     }
     const selected = state.documents.find((item) => item.id === id);
-    if (action !== "archive" && selected && isSourceMissing(selected)) {
+    if (selected && isSourceMissing(selected)) {
       return;
     }
     const updated = await api<WebDocument>(
@@ -3049,12 +3198,98 @@ async function boot(): Promise<void> {
       { method: "POST" },
     );
     replaceDocument(updated);
-    if (action === "archive") {
-      state.documents = state.documents.filter(({ id }) => id !== updated.id);
-      if (state.selectedId === id) {
-        closeReader();
+  }
+
+  function requestMutation(
+    action: "archive" | "purge",
+    ids: string[],
+  ): void {
+    if (ids.length === 0) {
+      return;
+    }
+    pendingMutation = { action, ids: [...ids] };
+    const confirmation = webMutationConfirmation(action, ids.length);
+    actionDialogTitle.textContent = confirmation.title;
+    actionDialogMessage.textContent = confirmation.message;
+    actionConfirm.textContent = confirmation.confirmLabel;
+    actionConfirm.classList.toggle("danger", action === "purge");
+    actionDialog.showModal();
+  }
+
+  function showQueueFailure(title: string, error: unknown): void {
+    queueErrorTitle.textContent = title;
+    queueErrorGuidance.textContent = error instanceof Error
+      ? error.message
+      : "The operation failed. Please try again.";
+    queueError.removeAttribute("hidden");
+  }
+
+  async function mutateDocuments(
+    action: WebMutationAction,
+    ids: string[],
+  ): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    const previousDocuments = state.documents;
+    const selectedId = state.selectedId;
+    queueError.setAttribute("hidden", "");
+    state.documents = state.documents.filter((document) => !ids.includes(document.id));
+    for (const id of ids) {
+      state.selectedDocumentIds.delete(id);
+    }
+    if (selectedId !== undefined && ids.includes(selectedId)) {
+      closeReader();
+    }
+    render();
+    try {
+      await api<BulkDocumentResult>("/api/v1/documents/bulk", {
+        method: "POST",
+        body: JSON.stringify({ action, ids }),
+      });
+      if (action === "archive") {
+        lastArchivedIds = [...ids];
+        archiveUndoMessage.textContent = ids.length === 1
+          ? "Document archived."
+          : `${ids.length} documents archived.`;
+        archiveUndo.removeAttribute("hidden");
       }
+    } catch (error) {
+      state.documents = previousDocuments;
       render();
+      showQueueFailure(
+        action === "archive"
+          ? "Could not archive documents"
+          : action === "restore"
+            ? "Could not restore documents"
+            : "Could not purge documents",
+        error,
+      );
+    }
+  }
+
+  async function switchContentMode(mode: WebContentMode): Promise<void> {
+    state.filters.contentMode = mode;
+    state.filters.changeReviewsOnly = mode === "change-reviews";
+    if (mode === "archive") {
+      state.filters.actionsOnly = false;
+      state.filters.status = "all";
+    }
+    state.selectedDocumentIds.clear();
+    closeReader(false);
+    history.pushState(
+      queueHistoryState(state.filters),
+      "",
+      currentRoute(currentProjectRoute()),
+    );
+    setLiveStatus("loading");
+    try {
+      const loaded = await load(false);
+      if (loaded) {
+        setLiveStatus(state.documents.length === 0 ? "loaded, empty" : "loaded");
+      }
+    } catch (error) {
+      failClosedLoad(error);
     }
   }
 
@@ -3062,13 +3297,38 @@ async function boot(): Promise<void> {
     state.filters.search = search.value;
     renderQueue();
   });
+  selectVisible.addEventListener("click", () => {
+    const ids = bulkDocumentIds(
+      state.documents,
+      state.filters,
+      state.reviewRequests,
+    );
+    const allSelected = ids.length > 0 &&
+      ids.every((id) => state.selectedDocumentIds.has(id));
+    for (const id of ids) {
+      if (allSelected) {
+        state.selectedDocumentIds.delete(id);
+      } else {
+        state.selectedDocumentIds.add(id);
+      }
+    }
+    renderQueue();
+  });
+  bulkArchive.addEventListener("click", () =>
+    requestMutation("archive", [...state.selectedDocumentIds])
+  );
+  bulkRestore.addEventListener("click", () =>
+    void mutateDocuments("restore", [...state.selectedDocumentIds])
+  );
+  bulkPurge.addEventListener("click", () =>
+    requestMutation("purge", [...state.selectedDocumentIds])
+  );
   actionsFilter.addEventListener("click", () => {
     if (state.filters.actionsOnly === true) {
       return;
     }
-    const workspaces = visibleWorkspaces(
+    const workspaces = currentVisibleWorkspaces(
       state.documents.filter(({ kind }) => kind !== "change-review"),
-      state.workspaces,
     );
     const transition = actionsQueueTransition(
       state.filters,
@@ -3095,29 +3355,12 @@ async function boot(): Promise<void> {
     render();
   });
   changeReviewsFilter.addEventListener("click", () => {
-    state.filters.contentMode = "change-reviews";
-    state.filters.changeReviewsOnly = true;
-    closeReader(false);
-    history.pushState(
-      queueHistoryState(state.filters),
-      "",
-      currentRoute(currentProjectRoute()),
-    );
-    render();
-    window.scrollTo(0, 0);
+    void switchContentMode("change-reviews");
   });
   docsFilter.addEventListener("click", () => {
-    state.filters.contentMode = "docs";
-    state.filters.changeReviewsOnly = false;
-    closeReader(false);
-    history.pushState(
-      queueHistoryState(state.filters),
-      "",
-      currentRoute(currentProjectRoute()),
-    );
-    render();
-    window.scrollTo(0, 0);
+    void switchContentMode("docs");
   });
+  archiveFilter.addEventListener("click", () => void switchContentMode("archive"));
   spaceSelect.addEventListener("change", () => {
     state.selectedSpace = spaceSelect.value === "" ? undefined : spaceSelect.value;
     closeReader(false);
@@ -3248,7 +3491,56 @@ async function boot(): Promise<void> {
       });
   });
   print.addEventListener("click", () => requestDocumentPrint(window));
-  element("archive").addEventListener("click", () => void act("archive"));
+  archiveButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      requestMutation("archive", [state.selectedId]);
+    }
+  });
+  restoreButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      void mutateDocuments("restore", [state.selectedId]);
+    }
+  });
+  purgeButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      requestMutation("purge", [state.selectedId]);
+    }
+  });
+  actionCancel.addEventListener("click", () => {
+    pendingMutation = undefined;
+    actionDialog.close();
+  });
+  actionDialog.addEventListener("cancel", () => {
+    pendingMutation = undefined;
+  });
+  actionConfirm.addEventListener("click", () => {
+    const mutation = pendingMutation;
+    pendingMutation = undefined;
+    actionDialog.close();
+    if (mutation !== undefined) {
+      void mutateDocuments(mutation.action, mutation.ids);
+    }
+  });
+  archiveUndoButton.addEventListener("click", () => {
+    const ids = [...lastArchivedIds];
+    if (ids.length === 0) {
+      return;
+    }
+    archiveUndo.setAttribute("hidden", "");
+    lastArchivedIds = [];
+    void api<BulkDocumentResult>("/api/v1/documents/bulk", {
+      method: "POST",
+      body: JSON.stringify({ action: "restore", ids }),
+    })
+      .then(async () => {
+        await load(false, false);
+      })
+      .catch((error: unknown) => {
+        lastArchivedIds = ids;
+        archiveUndo.removeAttribute("hidden");
+        showQueueFailure("Could not restore documents", error);
+      });
+  });
   reviewApprove.addEventListener("click", () =>
     void respondToReview("approved"),
   );
@@ -3314,6 +3606,8 @@ async function boot(): Promise<void> {
     void (async () => {
       const queryState = workspaceQueryState(location.search);
       const scopeChanged = queryState.selectedSpace !== state.selectedSpace;
+      const contentModeChanged =
+        queryState.contentMode !== state.filters.contentMode;
       state.selectedSpace = queryState.selectedSpace;
       state.filters.contentMode = queryState.contentMode;
       state.filters.changeReviewsOnly = queryState.contentMode === "change-reviews";
@@ -3323,7 +3617,7 @@ async function boot(): Promise<void> {
       }
       const match = location.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/);
       state.selectedId = match?.[1];
-      if (scopeChanged) {
+      if (scopeChanged || contentModeChanged) {
         setLiveStatus("loading");
         if (!await load(false)) {
           return;
@@ -3339,7 +3633,7 @@ async function boot(): Promise<void> {
         },
         state.reviewRequests,
       );
-      const workspaces = visibleWorkspaces(navigationDocuments, state.workspaces);
+      const workspaces = currentVisibleWorkspaces(navigationDocuments);
       const queueWorkspaces = [...workspaces, ...state.workspaces];
       if (match?.[1]) {
         const selection = projectQueueSelectionForReaderHistory(

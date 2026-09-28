@@ -201,15 +201,85 @@ test("keeps missing documents visible and directly archivable", () => {
   const frame = renderTui(queue, 100, 24);
   assert.match(frame, /SOURCE MISSING/);
   assert.match(frame, /a archive/);
-  assert.deepEqual(handleTuiKey(queue, "a").effects, [
-    { type: "action", action: "archive", documentId: missing.id },
+  const queueConfirmation = handleTuiKey(queue, "a");
+  assert.deepEqual(queueConfirmation.effects, []);
+  assert.deepEqual(handleTuiKey(queueConfirmation.state, "y").effects, [
+    { type: "bulk-action", action: "archive", documentIds: [missing.id] },
   ]);
 
   const reader = applyTuiMissingReader(queue, missing);
   assert.equal(reader.mode, "reader");
   assert.match(renderTui(reader, 100, 24), /source file is missing/i);
-  assert.deepEqual(handleTuiKey(reader, "a").effects, [
-    { type: "action", action: "archive", documentId: missing.id },
+  const readerConfirmation = handleTuiKey(reader, "a");
+  assert.deepEqual(readerConfirmation.effects, []);
+  assert.deepEqual(handleTuiKey(readerConfirmation.state, "y").effects, [
+    { type: "bulk-action", action: "archive", documentIds: [missing.id] },
+  ]);
+});
+
+test("selects document batches and confirms archive or permanent purge", () => {
+  let state = createTuiState(documents, workspaces);
+  state = handleTuiKey(state, " ").state;
+  assert.deepEqual(state.selectedDocumentIds, [documents[0]!.id]);
+  state = handleTuiKey(state, "A").state;
+  assert.deepEqual(state.selectedDocumentIds, documents.map(({ id }) => id));
+
+  const archive = handleTuiKey(state, "a");
+  assert.deepEqual(archive.effects, []);
+  assert.match(renderTui(archive.state, 100, 24), /restore them later/i);
+  assert.equal(handleTuiKey(archive.state, "n").state.confirmation, undefined);
+  assert.deepEqual(handleTuiKey(archive.state, "y").effects, [
+    {
+      type: "bulk-action",
+      action: "archive",
+      documentIds: documents.map(({ id }) => id),
+    },
+  ]);
+
+  const purge = handleTuiKey(state, "X");
+  assert.match(renderTui(purge.state, 100, 24), /cannot be undone/i);
+  assert.deepEqual(handleTuiKey(purge.state, "y").effects, [
+    {
+      type: "bulk-action",
+      action: "purge",
+      documentIds: documents.map(({ id }) => id),
+    },
+  ]);
+});
+
+test("opens the archive and restores selected documents", () => {
+  const archived = documents.map((document) => ({
+    ...document,
+    archivedAt: "2026-09-27T10:00:00.000Z",
+  }));
+  const archivedChangeReview: PublicDocument = {
+    ...archived[0]!,
+    id: "doc-33333333333333333333",
+    kind: "change-review",
+    title: "Archived change review",
+  };
+  let state = createTuiState(documents, workspaces);
+  const openArchive = handleTuiKey(state, "v");
+  assert.equal(openArchive.state.contentMode, "archive");
+  assert.deepEqual(openArchive.effects, [{ type: "reload" }]);
+
+  state = replaceTuiDocuments(
+    openArchive.state,
+    [...archived, archivedChangeReview],
+    workspaces,
+  );
+  assert.deepEqual(
+    state.visibleDocuments.map(({ id }) => id).sort(),
+    [...archived.map(({ id }) => id), archivedChangeReview.id].sort(),
+  );
+  assert.equal(handleTuiKey(state, "c").state.contentMode, "archive");
+  state = handleTuiKey(state, " ").state;
+  assert.deepEqual(handleTuiKey(state, "u").effects, [
+    {
+      type: "bulk-action",
+      action: "restore",
+      documentIds: [archived[0]!.id],
+    },
   ]);
 });
 
@@ -425,7 +495,7 @@ test("provides a dedicated Change Reviews space", () => {
   );
 
   const inbox = renderTui(state, 128, 30);
-  assert.match(inbox, /c docs\/changes/);
+  assert.match(inbox, /c content/);
   assert.doesNotMatch(inbox, /Checkout refactor/);
 
   state = handleTuiKey(state, "c").state;
@@ -810,19 +880,22 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
       .effects,
     [{ type: "open", documentId: documents[0]!.id }],
   );
-  assert.deepEqual(
-    handleTuiMouse(queue, { button: "left", x: 28, y: 27 }, 128, 28)
-      .effects,
-    [
-      {
-        type: "action",
-        action: "archive",
-        documentId: documents[0]!.id,
-      },
-    ],
+  const archiveConfirmation = handleTuiMouse(
+    queue,
+    { button: "left", x: 28, y: 27 },
+    128,
+    28,
   );
+  assert.deepEqual(archiveConfirmation.effects, []);
+  assert.deepEqual(handleTuiKey(archiveConfirmation.state, "y").effects, [
+    {
+      type: "bulk-action",
+      action: "archive",
+      documentIds: [documents[0]!.id],
+    },
+  ]);
   assert.equal(
-    handleTuiMouse(queue, { button: "left", x: 100, y: 27 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: 120, y: 27 }, 128, 28)
       .state.searching,
     true,
   );
@@ -1184,6 +1257,12 @@ test("opens a safe missing-source reader when a source disappears during render"
       actions.push(`${action}:${id}`);
       return missing;
     },
+    bulkAct: async (action: string, ids: string[]) => {
+      actions.push(...ids.map((id) => `${action}:${id}`));
+      return action === "purge"
+        ? { action, purgedIds: ids }
+        : { action, documents: [] };
+    },
     subscribeCatalog: async (
       _listener: (event: CatalogEvent) => void,
       options: CatalogSubscriptionOptions = {},
@@ -1202,6 +1281,7 @@ test("opens a safe missing-source reader when a source disappears during render"
   input.write("\r");
   await eventually(() => /source file is missing/i.test(terminal));
   input.write("a");
+  input.write("y");
   await eventually(() => actions.includes(`archive:${present.id}`));
   input.write("q");
   await running;

@@ -34,6 +34,7 @@ export interface CatalogStorage {
     scope?: ContentScope,
   ): string | undefined;
   saveDocument(document: StoredDocument): void;
+  deleteDocuments(ids: readonly string[]): number;
   listReviewRequests(
     filters?: ReviewRequestFilters,
     scope?: ContentScope,

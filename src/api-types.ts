@@ -148,3 +148,15 @@ export type DocumentAction =
   | "restore"
   | "missing"
   | "present";
+
+export type BulkDocumentAction = "archive" | "restore" | "purge";
+
+export type BulkDocumentResult =
+  | {
+      action: "archive" | "restore";
+      documents: PublicDocument[];
+    }
+  | {
+      action: "purge";
+      purgedIds: string[];
+    };

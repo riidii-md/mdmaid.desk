@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   actionsQueueTransition,
   activateReviewDraft,
+  bulkDocumentIds,
   changeReviewApprovalError,
   cleanupReviewDrafts,
   documentHistoryState,
@@ -43,6 +44,7 @@ import {
   webDiffLineControlModel,
   webDiffRows,
   webLoadFailure,
+  webMutationConfirmation,
   visibleWorkspaces,
   workspaceQueryState,
   workspaceRouteWithState,
@@ -207,6 +209,44 @@ test("keeps content mode independent from the Actions intersection", () => {
   );
 });
 
+test("separates archived documents and selects the current project in bulk", () => {
+  const archived = {
+    ...documents[2]!,
+    archivedAt: "2026-09-27T10:00:00.000Z",
+  };
+  const mixed = [documents[0]!, documents[1]!, archived];
+
+  assert.deepEqual(
+    filterQueue(mixed, { contentMode: "archive" }).map(({ id }) => id),
+    [archived.id],
+  );
+  assert.deepEqual(
+    filterQueue(mixed, { contentMode: "docs" }).map(({ id }) => id),
+    [documents[0]!.id, documents[1]!.id],
+  );
+  assert.deepEqual(
+    bulkDocumentIds(mixed, {
+      contentMode: "docs",
+      workspaceId: "alpha",
+    }),
+    [documents[0]!.id],
+  );
+});
+
+test("describes reversible archive and irreversible purge confirmations", () => {
+  assert.deepEqual(webMutationConfirmation("archive", 2), {
+    confirmLabel: "archive 2 documents",
+    message: "Archive 2 documents? You can restore them later from Archive.",
+    title: "Archive documents?",
+  });
+  assert.deepEqual(webMutationConfirmation("purge", 1), {
+    confirmLabel: "purge document forever",
+    message:
+      "Purge this document forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.",
+    title: "Purge forever?",
+  });
+});
+
 test("counts every pending decision across document content types", () => {
   const changeReviewRequest: PublicReviewRequest = {
     ...pendingReview,
@@ -254,6 +294,10 @@ test("restores orthogonal workspace query state", () => {
   );
   assert.deepEqual(workspaceQueryState("?view=docs"), {
     contentMode: "docs",
+    actionsOnly: false,
+  });
+  assert.deepEqual(workspaceQueryState("?view=archive"), {
+    contentMode: "archive",
     actionsOnly: false,
   });
 });

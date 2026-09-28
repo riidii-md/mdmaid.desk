@@ -5,13 +5,14 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import test from "node:test";
 
 import Database from "better-sqlite3";
@@ -2606,6 +2607,147 @@ test("supports lifecycle updates and all persisted document filters", async () =
     /unknown document/,
   );
   catalog.close();
+});
+
+test("archives and restores document batches atomically", async () => {
+  const { catalog, workspace } = await fixture();
+  const firstPath = join(workspace, "reports", "bulk-first.md");
+  const secondPath = join(workspace, "reports", "bulk-second.md");
+  await writeFile(firstPath, "# First\n", "utf8");
+  await writeFile(secondPath, "# Second\n", "utf8");
+  const first = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "First",
+    path: firstPath,
+    attention: "none",
+  });
+  const second = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "review",
+    title: "Second",
+    path: secondPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: second.id,
+    kind: "plan-decision",
+    requestMessage: "Review before archiving.",
+  });
+
+  await assert.rejects(
+    catalog.archiveDocuments([first.id, second.id]),
+    /document has a pending review request/,
+  );
+  assert.deepEqual(
+    catalog.listDocuments().map(({ id }) => id).sort(),
+    [first.id, second.id].sort(),
+  );
+
+  await catalog.respondToReviewRequest(request.id, {
+    outcome: "approved",
+    message: "Done.",
+  });
+  assert.equal((await catalog.archiveDocuments([first.id, second.id])).length, 2);
+  assert.equal(catalog.listDocuments().length, 0);
+  assert.equal(catalog.listDocuments({ archived: true }).length, 2);
+  assert.equal((await catalog.restoreDocuments([first.id, second.id])).length, 2);
+  assert.equal(catalog.listDocuments().length, 2);
+  catalog.close();
+});
+
+test("purges catalog history without deleting referenced Markdown", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "purge-reference.md");
+  await writeFile(documentPath, "# Keep source\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Purge reference",
+    path: documentPath,
+    attention: "approval",
+    tags: ["purge-test"],
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "This history will be purged.",
+  });
+
+  assert.deepEqual(await catalog.purgeDocuments([document.id]), [document.id]);
+  assert.equal(catalog.getDocument(document.id), undefined);
+  assert.equal(catalog.getReviewRequest(request.id), undefined);
+  assert.equal(await readFile(documentPath, "utf8"), "# Keep source\n");
+  catalog.close();
+});
+
+test("purges every private managed copy while preserving its original source", async () => {
+  const { catalog, workspace } = await fixture();
+  const sourcePath = join(workspace, "..", "purge-managed.md");
+  await writeFile(sourcePath, "# Managed v1\n", "utf8");
+  const first = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed purge",
+    path: sourcePath,
+    attention: "none",
+  });
+  await writeFile(sourcePath, "# Managed v2\n", "utf8");
+  const second = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed purge",
+    path: sourcePath,
+    attention: "none",
+  });
+  assert.equal(second.id, first.id);
+  assert.notEqual(second.path, first.path);
+  const unrelatedPath = join(dirname(first.path), `${first.id}-notes.md`);
+  await writeFile(unrelatedPath, "# Not a managed revision\n", "utf8");
+
+  assert.deepEqual(await catalog.purgeDocuments([first.id]), [first.id]);
+  await assert.rejects(access(first.path));
+  await assert.rejects(access(second.path));
+  assert.equal(
+    await readFile(unrelatedPath, "utf8"),
+    "# Not a managed revision\n",
+  );
+  assert.equal(await readFile(sourcePath, "utf8"), "# Managed v2\n");
+  catalog.close();
+});
+
+test("restores every staged managed revision after an interrupted purge", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const sourcePath = join(workspace, "..", "purge-recovery.md");
+  await writeFile(sourcePath, "# Managed v1\n", "utf8");
+  const first = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed recovery",
+    path: sourcePath,
+    attention: "none",
+  });
+  await writeFile(sourcePath, "# Managed v2\n", "utf8");
+  const second = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed recovery",
+    path: sourcePath,
+    attention: "none",
+  });
+  catalog.close();
+
+  for (const path of [first.path, second.path]) {
+    await rename(
+      path,
+      join(dirname(path), `.${basename(path)}.deadbeef.purging`),
+    );
+  }
+  const recovered = await Catalog.open(statePath);
+  await access(first.path);
+  await access(second.path);
+  assert.equal(recovered.getDocument(first.id)?.path, second.path);
+  recovered.close();
 });
 
 test("validates structured catalog input at runtime", async () => {
