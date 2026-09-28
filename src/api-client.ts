@@ -7,6 +7,7 @@ import {
 } from "./domain.js";
 import type { ContentScope } from "./domain.js";
 import type {
+  BulkDocumentResult,
   DocumentAction,
   DocumentImport,
   DocumentRegistration,
@@ -128,11 +129,17 @@ export class DeskApiClient {
     }
   }
 
-  async listDocuments(scope: ContentScope = {}): Promise<PublicDocument[]> {
+  async listDocuments(
+    scope: ContentScope = {},
+    filters: { archived?: boolean } = {},
+  ): Promise<PublicDocument[]> {
     const query = new URLSearchParams();
     if (scope.spaceId !== undefined) {
       assertSpaceId(scope.spaceId);
       query.set("space", scope.spaceId);
+    }
+    if (filters.archived === true) {
+      query.set("archived", "true");
     }
     const suffix = query.size === 0 ? "" : `?${query.toString()}`;
     const value = await this.#request(`/api/v1/documents${suffix}`);
@@ -400,6 +407,47 @@ export class DeskApiClient {
     return value;
   }
 
+  async bulkAct(
+    action: "archive" | "restore",
+    ids: string[],
+    scope?: ContentScope,
+  ): Promise<Extract<BulkDocumentResult, { documents: PublicDocument[] }>>;
+  async bulkAct(
+    action: "purge",
+    ids: string[],
+    scope?: ContentScope,
+  ): Promise<Extract<BulkDocumentResult, { action: "purge" }>>;
+  async bulkAct(
+    action: "archive" | "restore" | "purge",
+    ids: string[],
+    scope: ContentScope = {},
+  ): Promise<BulkDocumentResult> {
+    assertDocumentIds(ids);
+    const value = await this.#request(
+      withScope("/api/v1/documents/bulk", scope),
+      { method: "POST", body: { action, ids } },
+    );
+    if (!isBulkDocumentResult(value, action)) {
+      throw new Error("Daemon returned an invalid bulk document response");
+    }
+    return value;
+  }
+
+  async purgeDocument(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<string> {
+    assertDocumentId(id);
+    const value = await this.#request(
+      withScope(`/api/v1/documents/${encodeURIComponent(id)}/purge`, scope),
+      { method: "POST" },
+    );
+    if (!isRecord(value) || value.purgedId !== id) {
+      throw new Error("Daemon returned an invalid purge response");
+    }
+    return value.purgedId;
+  }
+
   async getDocument(
     id: string,
     scope: ContentScope = {},
@@ -625,6 +673,19 @@ function isPublicDocument(value: unknown): value is PublicDocument {
   );
 }
 
+function isBulkDocumentResult(
+  value: unknown,
+  action: "archive" | "restore" | "purge",
+): value is BulkDocumentResult {
+  if (!isRecord(value) || value.action !== action) {
+    return false;
+  }
+  return action === "purge"
+    ? Array.isArray(value.purgedIds) &&
+        value.purgedIds.every((id) => typeof id === "string" && isDocumentId(id))
+    : Array.isArray(value.documents) && value.documents.every(isPublicDocument);
+}
+
 export function isPublicReviewRequest(value: unknown): value is PublicReviewRequest {
   if (!isRecord(value)) {
     return false;
@@ -827,6 +888,22 @@ function nullableInteger(value: unknown): boolean {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertDocumentIds(ids: unknown): asserts ids is string[] {
+  if (
+    !Array.isArray(ids) ||
+    ids.length === 0 ||
+    ids.length > 500 ||
+    !ids.every((id) => typeof id === "string" && isDocumentId(id)) ||
+    new Set(ids).size !== ids.length
+  ) {
+    throw new Error("document ids must contain between 1 and 500 unique ids");
+  }
+}
+
+function isDocumentId(value: string): boolean {
+  return /^doc-[a-f0-9]{20}$/.test(value);
 }
 
 function assertDocumentId(id: string): void {

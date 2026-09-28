@@ -11,6 +11,7 @@ import {
 } from "./api-client.js";
 import {
   documentStorageLabel,
+  type BulkDocumentAction,
   type DocumentAction,
   type PublicDocument,
   type PublicReviewRequest,
@@ -38,7 +39,12 @@ import {
 type TuiMode = "queue" | "reader";
 type StatusFilter = "all" | ReadingStatus;
 export type TuiQueueGrouping = "project" | "tag" | "all";
-export type TuiContentMode = "docs" | "change-reviews";
+export type TuiContentMode = "docs" | "change-reviews" | "archive";
+
+interface TuiConfirmation {
+  action: "archive" | "purge";
+  documentIds: string[];
+}
 
 export interface TuiDocumentGroup {
   key: string;
@@ -86,12 +92,14 @@ export interface TuiState {
   actionsOnly: boolean;
   changeReviewsOnly: boolean;
   contentMode: TuiContentMode;
+  confirmation?: TuiConfirmation | undefined;
   grouping: TuiQueueGrouping;
   mode: TuiMode;
   reader?: TuiReader | undefined;
   search: string;
   searching: boolean;
   selectedIndex: number;
+  selectedDocumentIds: string[];
   selectedSpace?: string | undefined;
   scopeGeneration: number;
   spaces: PublicSpace[];
@@ -108,6 +116,11 @@ export type TuiEffect =
   | { type: "open"; documentId: string }
   | { type: "reload" }
   | { type: "action"; documentId: string; action: DocumentAction }
+  | {
+      type: "bulk-action";
+      action: BulkDocumentAction;
+      documentIds: string[];
+    }
   | {
       type: "review-response";
       requestId: string;
@@ -159,6 +172,7 @@ export function createTuiState(
     search: "",
     searching: false,
     selectedIndex: 0,
+    selectedDocumentIds: [],
     scopeGeneration: 0,
     spaces,
     statusFilter: "all",
@@ -325,6 +339,9 @@ export function replaceTuiDocuments(
     : -1;
   next = {
     ...next,
+    selectedDocumentIds: next.selectedDocumentIds.filter((id) =>
+      next.visibleDocuments.some((document) => document.id === id)
+    ),
     selectedIndex:
       selectedIndex >= 0
         ? selectedIndex
@@ -368,6 +385,25 @@ export function replaceTuiDocuments(
 export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   if (key === "ctrl-c") {
     return { state, effects: [{ type: "quit" }] };
+  }
+  if (state.confirmation) {
+    if (key === "y") {
+      return {
+        state: { ...state, confirmation: undefined, message: undefined },
+        effects: [{
+          type: "bulk-action",
+          action: state.confirmation.action,
+          documentIds: state.confirmation.documentIds,
+        }],
+      };
+    }
+    if (key === "n" || key === "escape") {
+      return {
+        state: { ...state, confirmation: undefined, message: undefined },
+        effects: [],
+      };
+    }
+    return { state, effects: [] };
   }
   if (state.searching) {
     return handleSearchKey(state, key);
@@ -457,7 +493,9 @@ export function renderTui(
     `${borders.middleLeft}${borders.horizontal.repeat(innerWidth)}${borders.middleRight}`,
   );
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
-  const footer = state.annotationComposer
+  const footer = state.confirmation
+    ? `${theme.accent(theme.styles.bold("CONFIRM"))} ${theme.ink(confirmationMessage(state.confirmation))}  ${theme.accent("y")} yes  ${theme.accent("n")} no`
+    : state.annotationComposer
     ? renderShortcutBar(
         [["enter", "newline"], ["ctrl-d", "save note"], ["esc", "cancel"]],
         theme,
@@ -470,7 +508,7 @@ export function renderTui(
     : state.mode === "reader"
       ? renderShortcutBar(
           state.reader?.document.missingAt
-            ? [["a", "archive"], ["b", "queue"], ["q", "quit"]]
+            ? [["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
             : state.reader?.changeView === "diff"
               ? pendingReviewForDocument(
                     state.reviewRequests,
@@ -483,13 +521,17 @@ export function renderTui(
                   state.reader?.document.id ?? "",
                 )
               ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["j/k", "scroll"], ["b", "queue"]]
-              : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+              : state.contentMode === "archive"
+                ? [["j/k", "scroll"], ["u", "restore"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
+                : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]],
           theme,
         )
     : state.searching
       ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
       : renderShortcutBar(
-          [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["s", "status"], ["p", "project"], ["x", "space"], ["c", "docs/changes"], ["g", "group"], ["/", "search"], ["q", "quit"]],
+          state.contentMode === "archive"
+            ? [["j/k", "move"], ["space", "select"], ["A", "select all"], ["u", "restore"], ["X", "purge"], ["v", "documents"], ["q", "quit"]]
+            : [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["X", "purge"], ["space", "select"], ["A", "all"], ["c", "content"], ["v", "archive"], ["p", "project"], ["x", "space"], ["/", "search"], ["q", "quit"]],
           theme,
         );
   const bodyHeight = safeHeight - 6;
@@ -544,6 +586,8 @@ export async function runTui(
   let previousFrame: string[] | undefined;
   const currentScope = (): { spaceId?: string } =>
     state.selectedSpace === undefined ? {} : { spaceId: state.selectedSpace };
+  const documentFilters = (): { archived?: boolean } =>
+    state.contentMode === "archive" ? { archived: true } : {};
   type ScopeContext = {
     generation: number;
     scope: { spaceId?: string };
@@ -610,7 +654,7 @@ export async function runTui(
       if (effect.type === "reload") {
         const [documents, workspaces, reviewRequests, nextSpaces] =
           await Promise.all([
-            client.listDocuments(scope),
+            client.listDocuments(scope, documentFilters()),
             client.listWorkspaces(scope),
             client.listReviewRequests({}, scope),
             typeof client.listSpaces === "function"
@@ -663,6 +707,28 @@ export async function runTui(
         if (effect.action === "archive") {
           state = { ...state, mode: "queue", reader: undefined, scroll: 0 };
         }
+      } else if (effect.type === "bulk-action") {
+        if (effect.action === "purge") {
+          await client.bulkAct("purge", effect.documentIds, scope);
+        } else {
+          await client.bulkAct(effect.action, effect.documentIds, scope);
+        }
+        if (!scopeContextMatches(context)) {
+          return;
+        }
+        state = {
+          ...state,
+          confirmation: undefined,
+          mode: "queue",
+          reader: undefined,
+          scroll: 0,
+          selectedDocumentIds: [],
+          message: effect.action === "archive"
+            ? `${effect.documentIds.length} archived · open Archive with v to restore`
+            : effect.action === "restore"
+              ? `${effect.documentIds.length} restored`
+              : `${effect.documentIds.length} purged forever`,
+        };
       } else {
         await client.respondToReviewRequest(effect.requestId, {
           outcome: effect.outcome,
@@ -675,7 +741,7 @@ export async function runTui(
         state = completeTuiReviewResponse(state);
       }
       const [documents, workspaces, reviewRequests] = await Promise.all([
-        client.listDocuments(scope),
+        client.listDocuments(scope, documentFilters()),
         client.listWorkspaces(scope),
         client.listReviewRequests({}, scope),
       ]);
@@ -697,7 +763,7 @@ export async function runTui(
       ) {
         try {
           const [documents, reviewRequests] = await Promise.all([
-            client.listDocuments(scope),
+            client.listDocuments(scope, documentFilters()),
             client.listReviewRequests({}, scope),
           ]);
           if (!scopeContextMatches(context)) {
@@ -845,7 +911,7 @@ export async function runTui(
           const refreshReader = readerDocumentId !== undefined;
           const scroll = state.scroll;
           const [documents, workspaces, reviewRequests, spaces] = await Promise.all([
-            client.listDocuments(context.scope),
+            client.listDocuments(context.scope, documentFilters()),
             client.listWorkspaces(context.scope),
             client.listReviewRequests({}, context.scope),
             client.listSpaces(),
@@ -1007,13 +1073,88 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
       effects: document ? [{ type: "open", documentId: document.id }] : [],
     };
   }
-  if (key === "a") {
+  if (key === " ") {
     const document = state.visibleDocuments[state.selectedIndex];
+    if (!document) {
+      return { state, effects: [] };
+    }
+    const selected = new Set(state.selectedDocumentIds);
+    if (selected.has(document.id)) {
+      selected.delete(document.id);
+    } else {
+      selected.add(document.id);
+    }
+    return {
+      state: { ...state, selectedDocumentIds: [...selected], message: undefined },
+      effects: [],
+    };
+  }
+  if (key === "A") {
+    const ids = [...new Set(state.visibleDocuments.map(({ id }) => id))];
+    const allSelected = ids.length > 0 &&
+      ids.every((id) => state.selectedDocumentIds.includes(id));
+    return {
+      state: {
+        ...state,
+        selectedDocumentIds: allSelected ? [] : ids,
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "a") {
+    if (state.contentMode === "archive") {
+      return { state, effects: [] };
+    }
+    const documentIds = selectedOrCurrentDocumentIds(state);
+    return {
+      state: documentIds.length === 0
+        ? state
+        : {
+            ...state,
+            confirmation: { action: "archive", documentIds },
+            message: undefined,
+          },
+      effects: [],
+    };
+  }
+  if (key === "X") {
+    const documentIds = selectedOrCurrentDocumentIds(state);
+    return {
+      state: documentIds.length === 0
+        ? state
+        : {
+            ...state,
+            confirmation: { action: "purge", documentIds },
+            message: undefined,
+          },
+      effects: [],
+    };
+  }
+  if (key === "u" && state.contentMode === "archive") {
+    const documentIds = selectedOrCurrentDocumentIds(state);
     return {
       state,
-      effects: document
-        ? [{ type: "action", action: "archive", documentId: document.id }]
-        : [],
+      effects: documentIds.length === 0
+        ? []
+        : [{ type: "bulk-action", action: "restore", documentIds }],
+    };
+  }
+  if (key === "v") {
+    const contentMode = state.contentMode === "archive" ? "docs" : "archive";
+    return {
+      state: applyFilters({
+        ...state,
+        contentMode,
+        changeReviewsOnly: false,
+        actionsOnly: false,
+        statusFilter: "all",
+        documents: [],
+        selectedDocumentIds: [],
+        selectedIndex: 0,
+        message: contentMode === "archive" ? "Loading Archive…" : "Loading documents…",
+      }),
+      effects: [{ type: "reload" }],
     };
   }
   if (key === "r") {
@@ -1028,6 +1169,9 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
     };
   }
   if (key === "c") {
+    if (state.contentMode === "archive") {
+      return { state, effects: [] };
+    }
     const contentMode = state.contentMode === "docs" ? "change-reviews" : "docs";
     return {
       state: applyFilters({
@@ -1105,6 +1249,29 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     return {
       state: { ...state, mode: "queue", reader: undefined, scroll: 0 },
       effects: [],
+    };
+  }
+  if ((key === "a" || key === "X") && state.reader) {
+    return {
+      state: {
+        ...state,
+        confirmation: {
+          action: key === "a" ? "archive" : "purge",
+          documentIds: [state.reader.document.id],
+        },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "u" && state.contentMode === "archive" && state.reader) {
+    return {
+      state,
+      effects: [{
+        type: "bulk-action",
+        action: "restore",
+        documentIds: [state.reader.document.id],
+      }],
     };
   }
   if (key === "d" && state.reader?.changeReview) {
@@ -1331,13 +1498,12 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
   const actions: Partial<Record<string, DocumentAction>> = {
     m: "read",
     u: "unread",
-    a: "archive",
   };
   const action = actions[key];
   if (
     action &&
     state.reader &&
-    (action === "archive" || state.reader.document.missingAt === null)
+    state.reader.document.missingAt === null
   ) {
     return {
       state,
@@ -1602,6 +1768,27 @@ function moveQueueSelection(state: TuiState, amount: number): TuiTransition {
   };
 }
 
+function selectedOrCurrentDocumentIds(state: TuiState): string[] {
+  if (state.selectedDocumentIds.length > 0) {
+    const visibleIds = new Set(state.visibleDocuments.map(({ id }) => id));
+    return state.selectedDocumentIds.filter((id) => visibleIds.has(id));
+  }
+  const current = state.visibleDocuments[state.selectedIndex];
+  return current ? [current.id] : [];
+}
+
+function confirmationMessage(confirmation: TuiConfirmation): string {
+  const count = confirmation.documentIds.length;
+  if (confirmation.action === "archive") {
+    return count === 1
+      ? "Archive this document? You can restore it later."
+      : `Archive ${count} documents? You can restore them later.`;
+  }
+  return count === 1
+    ? "Purge this document forever? This cannot be undone."
+    : `Purge ${count} documents forever? This cannot be undone.`;
+}
+
 function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
   if (!state.reader) {
     return state;
@@ -1660,8 +1847,10 @@ function applyFilters(state: TuiState): TuiState {
     const changeReviews = state.changeReviewsOnly ||
       state.contentMode === "change-reviews";
     if (
+      state.contentMode !== "archive" &&
       (!changeReviews && document.kind === "change-review") ||
-      (changeReviews && document.kind !== "change-review")
+      state.contentMode !== "archive" &&
+        (changeReviews && document.kind !== "change-review")
     ) {
       return false;
     }
@@ -1845,6 +2034,8 @@ function renderWorkspaceTitle(
     ? state.reader?.document.kind === "change-review"
       ? "CHANGE REVIEW"
       : "DOCUMENT READER"
+    : state.contentMode === "archive"
+      ? "ARCHIVE"
     : state.changeReviewsOnly || state.contentMode === "change-reviews"
       ? "CHANGE REVIEWS"
       : "DOCUMENT INBOX";
@@ -1985,26 +2176,38 @@ function footerKeyAt(state: TuiState, x: number): string | undefined {
       ? state.reader?.document.missingAt
         ? [
             ["a", "archive", "a"],
+            ["X", "purge", "X"],
             ["b", "queue", "b"],
             ["q", "quit", "q"],
           ]
-        : [
-            ["j/k", "scroll", undefined],
-            ["m", "read", "m"],
-            ["u", "unread", "u"],
-            ["a", "archive", "a"],
-            ["b", "queue", "b"],
-            ["q", "quit", "q"],
-          ]
+        : state.contentMode === "archive"
+          ? [
+              ["j/k", "scroll", undefined],
+              ["u", "restore", "u"],
+              ["X", "purge", "X"],
+              ["b", "queue", "b"],
+              ["q", "quit", "q"],
+            ]
+          : [
+              ["j/k", "scroll", undefined],
+              ["m", "read", "m"],
+              ["u", "unread", "u"],
+              ["a", "archive", "a"],
+              ["X", "purge", "X"],
+              ["b", "queue", "b"],
+              ["q", "quit", "q"],
+            ]
       : [
           ["j/k", "move", undefined],
           ["enter", "open", "enter"],
           ["a", "archive", "a"],
-          ["s", "status", "s"],
+          ["X", "purge", "X"],
+          ["space", "select", " "],
+          ["A", "all", "A"],
+          ["c", "content", "c"],
+          ["v", "archive", "v"],
           ["p", "project", "p"],
           ["x", "space", "x"],
-          ["c", "changes", "c"],
-          ["g", "group", "g"],
           ["/", "search", "/"],
           ["q", "quit", "q"],
         ];
@@ -2226,7 +2429,9 @@ function queueMainLines(
     ? "All spaces"
     : state.spaces.find(({ id }) => id === state.selectedSpace)?.name ??
       state.selectedSpace;
-  const space = state.changeReviewsOnly || state.contentMode === "change-reviews"
+  const space = state.contentMode === "archive"
+    ? "Archive · v Documents"
+    : state.changeReviewsOnly || state.contentMode === "change-reviews"
     ? "Change reviews"
     : "Documents · c Change reviews";
   const groupLabel = state.grouping === "all"
@@ -2237,7 +2442,9 @@ function queueMainLines(
   const lines = [
     spread(
       theme.styles.bold(
-        state.changeReviewsOnly || state.contentMode === "change-reviews"
+        state.contentMode === "archive"
+          ? `${count} archived ${count === 1 ? "document" : "documents"}`
+        : state.changeReviewsOnly || state.contentMode === "change-reviews"
           ? `${count} ${count === 1 ? "change review" : "change reviews"}`
           : `${count} ${count === 1 ? "document" : "documents"}`,
       ),
@@ -2275,6 +2482,7 @@ function queueMainLines(
         state.reviewRequests,
         state.visibleDocuments[firstIndex]!.id,
       ) !== undefined,
+      state.selectedDocumentIds.includes(state.visibleDocuments[firstIndex]!.id),
       theme,
       borders,
     );
@@ -2289,6 +2497,7 @@ function queueMainLines(
           secondIndex === state.selectedIndex,
           pendingReviewForDocument(state.reviewRequests, secondDocument.id) !==
             undefined,
+          state.selectedDocumentIds.includes(secondDocument.id),
           theme,
           borders,
         )
@@ -2310,6 +2519,7 @@ function renderDocumentCard(
   width: number,
   selected: boolean,
   actionRequired: boolean,
+  batchSelected: boolean,
   theme: TuiTheme,
   borders: TuiBorders,
 ): string[] {
@@ -2323,7 +2533,7 @@ function renderDocumentCard(
   const topPrefix = `${borderStyle(`${borders.topLeft}${borders.horizontal}`)} ${label} `;
   const topFill = Math.max(0, width - stringWidth(topPrefix) - 1);
   const top = `${topPrefix}${borderStyle(`${borders.horizontal.repeat(topFill)}${borders.topRight}`)}`;
-  const marker = selected ? theme.accent("› ") : "  ";
+  const marker = `${selected ? theme.accent("›") : " "}${batchSelected ? theme.accent("✓") : " "}`;
   const title = selected
     ? theme.styles.bold(sanitizeTerminalText(document.title))
     : theme.ink(sanitizeTerminalText(document.title));

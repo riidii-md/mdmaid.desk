@@ -169,6 +169,19 @@ test("uses the versioned daemon API for terminal client operations", async () =>
     assert.deepEqual(await catalogEvent, {});
     controller.abort();
     await subscription;
+
+    const archived = await client.bulkAct("archive", [document.id]);
+    assert.equal(archived.action, "archive");
+    assert.equal(archived.documents[0]?.id, document.id);
+    assert.deepEqual(
+      (await client.listDocuments({}, { archived: true })).map(({ id }) => id),
+      [document.id],
+    );
+    const restored = await client.bulkAct("restore", [document.id]);
+    assert.equal(restored.action, "restore");
+    assert.equal(restored.documents[0]?.archivedAt, null);
+    assert.equal(await client.purgeDocument(document.id), document.id);
+    assert.deepEqual(await client.listDocuments(), []);
   } finally {
     await server.close();
     catalog.close();

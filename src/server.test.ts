@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -881,6 +881,66 @@ test("shares reading lifecycle mutations through the API", async () => {
       ((await tags.json()) as { data: Document }).data.tags,
       ["review", "updated"],
     );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("archives, restores, and purges validated document batches", async () => {
+  const value = await fixture();
+  const secondPath = join(value.workspace, "second.md");
+  await writeFile(secondPath, "# Second\n", "utf8");
+  const second = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "review",
+    title: "Second",
+    path: secondPath,
+    attention: "none",
+  });
+  const ids = [value.document.id, second.id];
+  try {
+    const archived = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "archive", ids }),
+    });
+    assert.equal(archived.status, 200);
+    assert.deepEqual(
+      ((await archived.json()) as { data: { documents: Document[] } })
+        .data.documents.map(({ id }) => id),
+      ids,
+    );
+
+    const restored = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "restore", ids }),
+    });
+    assert.equal(restored.status, 200);
+    assert.equal(
+      ((await restored.json()) as { data: { documents: Document[] } })
+        .data.documents.every(({ archivedAt }) => archivedAt === null),
+      true,
+    );
+
+    const malformed = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "purge", ids: [second.id, second.id] }),
+    });
+    assert.equal(malformed.status, 422);
+
+    const purged = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/purge`,
+      { method: "POST" },
+    );
+    assert.equal(purged.status, 200);
+    assert.deepEqual(await purged.json(), {
+      data: { purgedId: value.document.id },
+    });
+    assert.equal(value.catalog.getDocument(value.document.id), undefined);
+    assert.match(await readFile(join(value.workspace, "plan.md"), "utf8"), /Visible plan/);
   } finally {
     await closeFixture(value);
   }

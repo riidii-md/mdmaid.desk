@@ -176,6 +176,8 @@ button { color: inherit; }
 }
 .icon-button, .action { padding: 8px 11px; }
 .icon-button:hover, .action:hover { background: var(--ink); color: var(--surface); }
+.action.danger { border-color: var(--accent); color: var(--accent); }
+.action.danger:hover { background: var(--accent); color: var(--surface); }
 
 .workspace {
   display: grid;
@@ -301,6 +303,38 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
   gap: 16px;
 }
 
+.bulk-actions {
+  position: sticky;
+  top: 74px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+  padding: 10px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 var(--ink);
+}
+.bulk-actions #selection-count { margin-right: auto; color: var(--muted); font-size: 10px; }
+
+.document-card-shell { position: relative; min-width: 0; }
+.document-card-shell .document-card { width: 100%; height: 100%; }
+.document-selector {
+  position: absolute;
+  z-index: 2;
+  top: 10px;
+  right: 10px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+}
+.document-selector input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+
 .document-card {
   position: relative;
   display: flex;
@@ -347,6 +381,34 @@ kbd { border: 1px solid var(--line); padding: 1px 4px; background: var(--surface
 .error-state { border-color: var(--accent); }
 .error-state strong { display: block; color: var(--accent); font-size: 18px; }
 .error-state p { max-width: 700px; margin: 14px auto 0; line-height: 1.7; }
+
+.confirmation-dialog {
+  width: min(520px, calc(100vw - 32px));
+  padding: 24px;
+  border: 2px solid var(--ink);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 8px 8px 0 var(--ink);
+}
+.confirmation-dialog::backdrop { background: color-mix(in srgb, var(--ink) 62%, transparent); }
+.confirmation-dialog h2 { margin: 0 0 14px; font-size: 20px; }
+.confirmation-dialog p { margin: 0; color: var(--muted); line-height: 1.6; }
+.confirmation-actions { display: flex; justify-content: end; gap: 8px; margin-top: 22px; }
+.archive-undo {
+  position: fixed;
+  z-index: 60;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: calc(100vw - 40px);
+  padding: 12px;
+  border: 1px solid var(--ink);
+  background: var(--surface);
+  box-shadow: 5px 5px 0 var(--ink);
+  font-size: 11px;
+}
 
 .reader { width: 100%; max-width: 1600px; margin: 0 auto; }
 .reader-toolbar {

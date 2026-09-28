@@ -774,6 +774,57 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/api/v1/documents/bulk") {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const body = await readJson(request);
+    if (!isBulkDocumentAction(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Bulk document action requires an action and 1-500 unique document ids",
+      );
+    }
+    try {
+      if (body.action === "purge") {
+        const purgedIds = await catalog.purgeDocuments(body.ids, scope);
+        liveSources?.refresh();
+        sendJson(response, 200, {
+          data: { action: body.action, purgedIds },
+        });
+      } else {
+        const documents = body.action === "archive"
+          ? await catalog.archiveDocuments(body.ids, scope)
+          : await catalog.restoreDocuments(body.ids, scope);
+        liveSources?.refresh();
+        sendJson(response, 200, {
+          data: {
+            action: body.action,
+            documents: documents.map(publicDocument),
+          },
+        });
+      }
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  const purgeMatch = url.pathname.match(
+    /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/purge$/,
+  );
+  if (request.method === "POST" && purgeMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const id = purgeMatch[1] ?? "";
+    try {
+      const [purgedId] = await catalog.purgeDocuments([id], scope);
+      liveSources?.refresh();
+      sendJson(response, 200, { data: { purgedId } });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
   const actionMatch = url.pathname.match(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/(opened|read|unread|archive|restore|missing|present)$/,
   );
@@ -1471,6 +1522,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isBulkDocumentAction(
+  value: unknown,
+): value is { action: "archive" | "restore" | "purge"; ids: string[] } {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ["action", "ids"]) &&
+    (value.action === "archive" ||
+      value.action === "restore" ||
+      value.action === "purge") &&
+    Array.isArray(value.ids) &&
+    value.ids.length > 0 &&
+    value.ids.length <= 500 &&
+    value.ids.every((id) =>
+      typeof id === "string" && /^doc-[a-f0-9]{20}$/.test(id)
+    ) &&
+    new Set(value.ids).size === value.ids.length;
+}
+
 function hasOnlyKeys(
   value: Record<string, unknown>,
   allowed: string[],
@@ -1610,6 +1678,7 @@ function workspaceHtml(pathname: string): string {
           <button id="change-reviews-filter" class="content-mode" type="button" aria-pressed="false">
             change reviews <span id="change-reviews-count" class="count">0</span>
           </button>
+          <button id="archive-filter" class="content-mode" type="button" aria-pressed="false">archive</button>
         </div>
       </nav>
       <div class="top-actions">
@@ -1659,9 +1728,16 @@ function workspaceHtml(pathname: string): string {
               <button class="grouping-button" type="button" data-grouping="all" aria-pressed="false">all in order</button>
             </div>
           </div>
+          <div id="bulk-actions" class="bulk-actions" hidden>
+            <button id="select-visible" class="action" type="button">select all</button>
+            <span id="selection-count" role="status" aria-live="polite">0 selected</span>
+            <button id="bulk-archive" class="action" type="button" disabled>archive selected</button>
+            <button id="bulk-restore" class="action" type="button" disabled hidden>restore selected</button>
+            <button id="bulk-purge" class="action danger" type="button" disabled>purge selected</button>
+          </div>
           <div id="document-queue" class="document-queue" data-testid="document-queue"></div>
           <div id="queue-empty" class="empty" hidden>No documents match this view.</div>
-          <div id="queue-error" class="empty error-state" data-testid="queue-error" hidden>
+          <div id="queue-error" class="empty error-state" data-testid="queue-error" role="alert" hidden>
             <strong id="queue-error-title">Could not load documents</strong>
             <p id="queue-error-guidance"></p>
           </div>
@@ -1675,6 +1751,8 @@ function workspaceHtml(pathname: string): string {
               <button id="copy-link" class="action" type="button">copy link</button>
               <button id="print" class="action" type="button">print</button>
               <button id="archive" class="action" type="button">archive</button>
+              <button id="restore" class="action" type="button" hidden>restore</button>
+              <button id="purge" class="action danger" type="button">purge</button>
             </div>
           </div>
           <header class="reader-heading">
@@ -1736,6 +1814,18 @@ function workspaceHtml(pathname: string): string {
           </section>
         </article>
       </main>
+    </div>
+    <dialog id="document-action-dialog" class="confirmation-dialog" aria-labelledby="document-action-title">
+      <h2 id="document-action-title">Confirm action</h2>
+      <p id="document-action-message"></p>
+      <div class="confirmation-actions">
+        <button id="document-action-cancel" class="action" type="button">cancel</button>
+        <button id="document-action-confirm" class="action danger" type="button">confirm</button>
+      </div>
+    </dialog>
+    <div id="archive-undo" class="archive-undo" role="status" aria-live="polite" hidden>
+      <span id="archive-undo-message">Document archived.</span>
+      <button id="archive-undo-button" class="action" type="button">undo</button>
     </div>
   </body>
 </html>`;

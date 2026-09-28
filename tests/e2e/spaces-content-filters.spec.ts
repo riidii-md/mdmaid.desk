@@ -105,6 +105,8 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await page.keyboard.press("Tab");
     await expect(page.locator("#change-reviews-filter")).toBeFocused();
     await page.keyboard.press("Tab");
+    await expect(page.locator("#archive-filter")).toBeFocused();
+    await page.keyboard.press("Tab");
     await expect(page.locator("#theme-toggle")).toBeFocused();
 
     await expect(page.locator(".status-filters #actions-filter")).toHaveCount(1);

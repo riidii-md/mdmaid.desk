@@ -811,6 +811,29 @@ export class SqliteCatalogStorage implements CatalogStorage {
     });
   }
 
+  deleteDocuments(ids: readonly string[]): number {
+    return this.transaction(() => {
+      const deleteReviews = this.#database.prepare(
+        "DELETE FROM review_requests WHERE document_id = ?",
+      );
+      const deleteDocument = this.#database.prepare(
+        "DELETE FROM documents WHERE id = ?",
+      );
+      let deleted = 0;
+      for (const id of ids) {
+        deleteReviews.run(id);
+        deleted += deleteDocument.run(id).changes;
+      }
+      this.#database.prepare(
+        `DELETE FROM tags
+         WHERE NOT EXISTS (
+           SELECT 1 FROM document_tags dt WHERE dt.tag_name = tags.name
+         )`,
+      ).run();
+      return deleted;
+    });
+  }
+
   listReviewRequests(
     filters: ReviewRequestFilters = {},
     scope: ContentScope = {},
