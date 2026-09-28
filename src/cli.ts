@@ -128,6 +128,8 @@ Usage:
   mdmaid-desk workspace add <root> --id <id> [--name <name>]
       [--repository <identity>] [--repository-name <name>]
       [--artifact-root <path> ...]
+  mdmaid-desk workspace reconcile <source-id> --into <target-id>
+      [--discard-archived-conflicts] [--apply] [--json]
   mdmaid-desk workspace list
   mdmaid-desk space add <id> --name <name>
       [--repository <key-or-name> ...] [--namespace <prefix> ...]
@@ -311,6 +313,14 @@ export async function run(
     }
     if (args[0] === "workspace" && args[1] === "add") {
       return await runWorkspaceAdd(statePath, args.slice(2), stdout, options);
+    }
+    if (args[0] === "workspace" && args[1] === "reconcile") {
+      return await runWorkspaceReconcile(
+        statePath,
+        args.slice(2),
+        stdout,
+        options,
+      );
     }
     if (args[0] === "register") {
       return await runRegister(statePath, args.slice(1), stdout, options);
@@ -974,7 +984,7 @@ function runWorkspaceList(
     }
     return 0;
   }
-  throw new UsageError("workspace action must be add or list");
+  throw new UsageError("workspace action must be add, reconcile, or list");
 }
 
 async function runWorkspaceAdd(
@@ -1028,6 +1038,63 @@ async function runWorkspaceAdd(
   }
   stdout.write(`workspace ${id} added: ${root}\n`);
   return 0;
+}
+
+async function runWorkspaceReconcile(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(
+    args,
+    new Set(["discard-archived-conflicts", "apply", "json"]),
+  );
+  const sourceWorkspaceId = parsed.positionals[0];
+  if (!sourceWorkspaceId) {
+    throw new UsageError("source workspace id is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("workspace reconcile accepts one source workspace id");
+  }
+  rejectUnknownOptions(
+    parsed,
+    new Set(["into", "discard-archived-conflicts", "apply", "json"]),
+  );
+  const input = {
+    targetWorkspaceId: requiredOption(parsed, "into"),
+    discardArchivedConflicts: hasFlag(parsed, "discard-archived-conflicts"),
+    apply: hasFlag(parsed, "apply"),
+  };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  const reconciliation = client
+    ? await (async () => {
+        await client.requireCapabilities("workspace-reconciliation-v1");
+        return client.reconcileWorkspace(sourceWorkspaceId, input);
+      })()
+    : await (async () => {
+        const catalog = await Catalog.open(statePath);
+        try {
+          return catalog.reconcileWorkspace({ sourceWorkspaceId, ...input });
+        } finally {
+          catalog.close();
+        }
+      })();
+  if (hasFlag(parsed, "json")) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, data: reconciliation })}\n`);
+  } else {
+    stdout.write(
+      `${reconciliation.applied ? "reconciled" : "dry run"}: ` +
+        `${reconciliation.sourceWorkspaceId} -> ${reconciliation.targetWorkspaceId}; ` +
+        `${reconciliation.movedDocumentIds.length} moved, ` +
+        `${reconciliation.discardedDocumentIds.length} discarded, ` +
+        `${reconciliation.blockingConflicts.length} blocked\n`,
+    );
+    if (!reconciliation.applied) {
+      stdout.write("Run again with --apply to commit this reconciliation.\n");
+    }
+  }
+  return reconciliation.blockingConflicts.length === 0 ? 0 : 1;
 }
 
 async function runRegister(

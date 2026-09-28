@@ -122,7 +122,11 @@ test("serves health publicly and protects catalog APIs", async () => {
         service: "mdmaid.desk",
         status: "ok",
         version: 1,
-        capabilities: ["spaces-v1", "scoped-content-v1"],
+        capabilities: [
+          "spaces-v1",
+          "scoped-content-v1",
+          "workspace-reconciliation-v1",
+        ],
       },
     });
 
@@ -131,6 +135,17 @@ test("serves health publicly and protects catalog APIs", async () => {
     );
     assert.equal(unauthorized.status, 401);
     assert.deepEqual(await unauthorized.json(), {
+      error: { code: "unauthorized", message: "Authentication required" },
+    });
+    const unauthorizedReconciliation = await fetch(
+      new URL(
+        "/api/v1/workspaces/example/reconcile",
+        value.server.url,
+      ),
+      { method: "POST" },
+    );
+    assert.equal(unauthorizedReconciliation.status, 401);
+    assert.deepEqual(await unauthorizedReconciliation.json(), {
       error: { code: "unauthorized", message: "Authentication required" },
     });
   } finally {
@@ -1248,6 +1263,45 @@ test("adds workspaces through validated producer-neutral input", async () => {
         name: "Created",
         documentCount: 0,
         route: "/w/created",
+      },
+    });
+
+    const conflict = await authorized(value, "/api/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "task-derived",
+        name: "Task derived",
+        root: workspace,
+        artifactRoots: [workspace],
+      }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.deepEqual(await conflict.json(), {
+      error: {
+        code: "workspace_conflict",
+        message:
+          "workspace root is already registered as created; reconcile it before using task-derived",
+      },
+    });
+
+    const invalidReconciliation = await authorized(
+      value,
+      "/api/v1/workspaces/created/reconcile",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetWorkspaceId: "task-derived",
+          apply: "yes",
+        }),
+      },
+    );
+    assert.equal(invalidReconciliation.status, 422);
+    assert.deepEqual(await invalidReconciliation.json(), {
+      error: {
+        code: "validation_error",
+        message: "Invalid workspace reconciliation",
       },
     });
 

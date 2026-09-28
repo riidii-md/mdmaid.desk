@@ -29,8 +29,10 @@ import {
   type RegisterDocumentInput,
   ReviewConflictError,
   type ReplaceSpaceMatchersInput,
+  type ReconcileWorkspaceInput,
   SpaceConflictError,
   SpaceNotFoundError,
+  WorkspaceConflictError,
   type ReviewRequest,
   type Workspace,
 } from "./catalog.js";
@@ -270,7 +272,11 @@ async function handleRequest(
         service: "mdmaid.desk",
         status: "ok",
         version: API_VERSION,
-        capabilities: ["spaces-v1", "scoped-content-v1"],
+        capabilities: [
+          "spaces-v1",
+          "scoped-content-v1",
+          "workspace-reconciliation-v1",
+        ],
       },
     });
     return;
@@ -514,14 +520,39 @@ async function handleRequest(
       response.setHeader("location", `/api/v1/workspaces/${workspace.id}`);
       sendJson(response, 201, { data: publicWorkspace(workspace, 0) });
     } catch (error) {
-      if (error instanceof Error) {
-        throw new HttpError(
-          422,
-          "validation_error",
-          "Invalid workspace registration",
-        );
+      if (error instanceof WorkspaceConflictError) {
+        throw mapCatalogError(error);
       }
-      throw error;
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid workspace registration",
+      );
+    }
+    return;
+  }
+
+  const workspaceReconcileMatch = url.pathname.match(
+    /^\/api\/v1\/workspaces\/([a-z0-9][a-z0-9-]{0,63})\/reconcile$/,
+  );
+  if (request.method === "POST" && workspaceReconcileMatch) {
+    const body = await readJson(request);
+    if (!isWorkspaceReconciliationRequest(body)) {
+      throw new HttpError(
+        422,
+        "validation_error",
+        "Invalid workspace reconciliation",
+      );
+    }
+    try {
+      sendJson(response, 200, {
+        data: catalog.reconcileWorkspace({
+          sourceWorkspaceId: workspaceReconcileMatch[1] ?? "",
+          ...body,
+        }),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
     }
     return;
   }
@@ -1034,6 +1065,9 @@ function mapCatalogError(error: unknown): HttpError {
   if (error instanceof SpaceConflictError) {
     return new HttpError(409, "space_conflict", error.message);
   }
+  if (error instanceof WorkspaceConflictError) {
+    return new HttpError(409, "workspace_conflict", error.message);
+  }
   if (error instanceof MermaidValidationError) {
     return new HttpError(
       422,
@@ -1433,6 +1467,21 @@ function isWorkspaceRegistration(value: unknown): value is AddWorkspaceInput {
     Array.isArray(value.artifactRoots) &&
     value.artifactRoots.every((root) => typeof root === "string")
   );
+}
+
+function isWorkspaceReconciliationRequest(
+  value: unknown,
+): value is Omit<ReconcileWorkspaceInput, "sourceWorkspaceId"> {
+  return isRecord(value) &&
+    hasOnlyKeys(value, [
+      "targetWorkspaceId",
+      "discardArchivedConflicts",
+      "apply",
+    ]) &&
+    typeof value.targetWorkspaceId === "string" &&
+    (value.discardArchivedConflicts === undefined ||
+      typeof value.discardArchivedConflicts === "boolean") &&
+    typeof value.apply === "boolean";
 }
 
 function isReviewRequestRegistration(

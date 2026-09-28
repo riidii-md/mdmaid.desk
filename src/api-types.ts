@@ -79,6 +79,28 @@ export interface WorkspaceRegistration {
   repositoryName?: string;
 }
 
+export interface WorkspaceReconciliationRequest {
+  targetWorkspaceId: string;
+  discardArchivedConflicts?: boolean;
+  apply: boolean;
+}
+
+export interface PublicWorkspaceReconciliationConflict {
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  reason: "path-conflict" | "review-history";
+}
+
+export interface PublicWorkspaceReconciliation {
+  sourceWorkspaceId: string;
+  targetWorkspaceId: string;
+  applied: boolean;
+  movedDocumentIds: string[];
+  discardedDocumentIds: string[];
+  blockingConflicts: PublicWorkspaceReconciliationConflict[];
+  reviewRequestCount: number;
+}
+
 export interface DocumentRegistration {
   workspaceId: string;
   taskId?: string;

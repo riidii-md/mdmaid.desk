@@ -128,6 +128,27 @@ node dist/cli.js workspace add /path/to/repository \
   --repository-name "Example"
 ```
 
+A canonical repository/worktree root can belong to only one workspace ID.
+Ticket and task identifiers belong in document/project metadata and must not be
+used as workspace IDs. If an older catalog contains two IDs for one root,
+inspect a dry-run reconciliation before applying it:
+
+```bash
+mdmaid-desk workspace reconcile task-derived-id \
+  --into stable-repository-id \
+  --json
+
+mdmaid-desk workspace reconcile task-derived-id \
+  --into stable-repository-id \
+  --apply
+```
+
+The operation preserves non-conflicting document and review IDs. Path
+conflicts block the repair. An archived conflicting document may be discarded
+only with `--discard-archived-conflicts`; review history is never discarded.
+The command uses the live daemon when available, so its dry run and mutation
+observe the same catalog authority.
+
 Register a document:
 
 ```bash

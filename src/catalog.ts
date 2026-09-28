@@ -135,6 +135,29 @@ export interface AddWorkspaceInput {
   repositoryName?: string;
 }
 
+export interface ReconcileWorkspaceInput {
+  sourceWorkspaceId: string;
+  targetWorkspaceId: string;
+  discardArchivedConflicts?: boolean;
+  apply: boolean;
+}
+
+export interface WorkspaceReconciliationConflict {
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  reason: "path-conflict" | "review-history";
+}
+
+export interface WorkspaceReconciliation {
+  sourceWorkspaceId: string;
+  targetWorkspaceId: string;
+  applied: boolean;
+  movedDocumentIds: string[];
+  discardedDocumentIds: string[];
+  blockingConflicts: WorkspaceReconciliationConflict[];
+  reviewRequestCount: number;
+}
+
 export interface SpaceMatcherInput {
   kind: string;
   value: string;
@@ -254,6 +277,13 @@ export class SpaceConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SpaceConflictError";
+  }
+}
+
+export class WorkspaceConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkspaceConflictError";
   }
 }
 
@@ -1087,9 +1117,19 @@ export class Catalog {
       root,
       artifactRoots,
     };
+    const requestedRepository = repositoryIdentity(input, root);
     const existing = this.#storage.getWorkspace(workspace.id);
     if (existing && existing.root !== workspace.root) {
       throw new Error(`workspace ${workspace.id} already uses another root`);
+    }
+    const rootConflict = this.#storage.listWorkspaces().find(
+      (candidate) =>
+        candidate.id !== workspace.id && candidate.root === workspace.root,
+    );
+    if (rootConflict) {
+      throw new WorkspaceConflictError(
+        `workspace root is already registered as ${rootConflict.id}; reconcile it before using ${workspace.id}`,
+      );
     }
 
     const documents = [
@@ -1114,7 +1154,7 @@ export class Catalog {
     const repository = input.repository === undefined &&
         input.repositoryName === undefined && existingRepository
       ? existingRepository
-      : repositoryIdentity(input, root);
+      : requestedRepository;
     if (
       existingRepository &&
       this.#storage.workspaceHasDocuments(workspace.id) &&
@@ -1137,6 +1177,129 @@ export class Catalog {
     this.#storage.saveWorkspace(workspace, repository);
     this.#emitInvalidation();
     return structuredClone(workspace);
+  }
+
+  reconcileWorkspace(input: ReconcileWorkspaceInput): WorkspaceReconciliation {
+    validateReconcileWorkspaceInput(input);
+    if (input.sourceWorkspaceId === input.targetWorkspaceId) {
+      throw new WorkspaceConflictError(
+        "source and target workspaces must be different",
+      );
+    }
+    const source = this.#storage.getWorkspace(input.sourceWorkspaceId);
+    const target = this.#storage.getWorkspace(input.targetWorkspaceId);
+    if (!source) {
+      throw new WorkspaceConflictError(
+        `unknown workspace ${input.sourceWorkspaceId}`,
+      );
+    }
+    if (!target) {
+      throw new WorkspaceConflictError(
+        `unknown workspace ${input.targetWorkspaceId}`,
+      );
+    }
+    if (source.root !== target.root) {
+      throw new WorkspaceConflictError(
+        "workspace reconciliation requires the same canonical root",
+      );
+    }
+    const sourceRepository = this.#storage.getWorkspaceRepository(source.id);
+    const targetRepository = this.#storage.getWorkspaceRepository(target.id);
+    if (
+      !sourceRepository ||
+      !targetRepository ||
+      sourceRepository.key !== targetRepository.key
+    ) {
+      throw new WorkspaceConflictError(
+        "workspace reconciliation requires the same repository identity",
+      );
+    }
+
+    const sourceDocuments = [
+      ...this.#storage.listDocuments({ workspaceId: source.id }),
+      ...this.#storage.listDocuments({ workspaceId: source.id, archived: true }),
+    ];
+    const excludedDocument = sourceDocuments.find(
+      (document) =>
+        document.storage === "reference" &&
+        !target.artifactRoots.some((artifactRoot) =>
+          isWithin(artifactRoot, document.path),
+        ),
+    );
+    if (excludedDocument) {
+      throw new WorkspaceConflictError(
+        `target workspace would exclude registered document ${excludedDocument.id}`,
+      );
+    }
+    const targetDocuments = [
+      ...this.#storage.listDocuments({ workspaceId: target.id }),
+      ...this.#storage.listDocuments({ workspaceId: target.id, archived: true }),
+    ];
+    const targetByPath = new Map(
+      targetDocuments.map((document) => [document.path, document]),
+    );
+    const sourceDocumentIds = new Set(sourceDocuments.map(({ id }) => id));
+    const sourceReviews = this.#storage
+      .listReviewRequests()
+      .filter(({ documentId }) => sourceDocumentIds.has(documentId));
+    const reviewedDocumentIds = new Set(
+      sourceReviews.map(({ documentId }) => documentId),
+    );
+    const movedDocumentIds: string[] = [];
+    const discardedDocumentIds: string[] = [];
+    const blockingConflicts: WorkspaceReconciliationConflict[] = [];
+
+    for (const document of sourceDocuments) {
+      const targetDocument = targetByPath.get(document.path);
+      if (!targetDocument) {
+        movedDocumentIds.push(document.id);
+        continue;
+      }
+      if (
+        input.discardArchivedConflicts === true &&
+        document.archivedAt !== null &&
+        !reviewedDocumentIds.has(document.id)
+      ) {
+        discardedDocumentIds.push(document.id);
+        continue;
+      }
+      blockingConflicts.push({
+        sourceDocumentId: document.id,
+        targetDocumentId: targetDocument.id,
+        reason:
+          document.archivedAt !== null && reviewedDocumentIds.has(document.id)
+            ? "review-history"
+            : "path-conflict",
+      });
+    }
+
+    const reconciliation: WorkspaceReconciliation = {
+      sourceWorkspaceId: source.id,
+      targetWorkspaceId: target.id,
+      applied: false,
+      movedDocumentIds: movedDocumentIds.sort(compareText),
+      discardedDocumentIds: discardedDocumentIds.sort(compareText),
+      blockingConflicts: blockingConflicts.sort((left, right) =>
+        compareText(left.sourceDocumentId, right.sourceDocumentId)
+      ),
+      reviewRequestCount: sourceReviews.length,
+    };
+    if (!input.apply) {
+      return reconciliation;
+    }
+    if (blockingConflicts.length > 0) {
+      throw new WorkspaceConflictError(
+        "workspace reconciliation has blocking conflicts",
+      );
+    }
+    this.#storage.reconcileWorkspaces(
+      source.id,
+      target.id,
+      reconciliation.movedDocumentIds,
+      reconciliation.discardedDocumentIds,
+    );
+    this.#emitInvalidation();
+    return { ...reconciliation, applied: true };
   }
 
   async registerDocument(input: RegisterDocumentInput): Promise<Document> {
@@ -1634,6 +1797,29 @@ function validateAddWorkspaceInput(input: AddWorkspaceInput): void {
         input.repositoryName.length > MAX_CONTEXT_LENGTH))
   ) {
     throw new Error("invalid workspace input");
+  }
+}
+
+function validateReconcileWorkspaceInput(
+  input: ReconcileWorkspaceInput,
+): void {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, [
+      "sourceWorkspaceId",
+      "targetWorkspaceId",
+      "discardArchivedConflicts",
+      "apply",
+    ]) ||
+    typeof input.sourceWorkspaceId !== "string" ||
+    !WORKSPACE_ID_PATTERN.test(input.sourceWorkspaceId) ||
+    typeof input.targetWorkspaceId !== "string" ||
+    !WORKSPACE_ID_PATTERN.test(input.targetWorkspaceId) ||
+    (input.discardArchivedConflicts !== undefined &&
+      typeof input.discardArchivedConflicts !== "boolean") ||
+    typeof input.apply !== "boolean"
+  ) {
+    throw new Error("invalid workspace reconciliation input");
   }
 }
 
