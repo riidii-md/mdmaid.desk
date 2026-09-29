@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
   type CatalogEvent,
 } from "./api-client.js";
 import { Catalog } from "./catalog.js";
+import { SqliteCatalogStorage } from "./sqlite-storage.js";
 import { startLiveSourceCoordinator } from "./live-sources.js";
 import { startDeskServer } from "./server.js";
 
@@ -35,6 +36,63 @@ test("rejects unsafe daemon client configuration", async () => {
     ),
     /render width must be an integer between 20 and 1000/,
   );
+});
+
+test("reconciles workspace identity through the authenticated daemon API", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-api-reconcile-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  await mkdir(workspace);
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const server = await startDeskServer({
+    catalog,
+    host: "127.0.0.1",
+    port: 0,
+    token: "reconcile-token",
+  });
+
+  try {
+    const client = new DeskApiClient(server.url, server.token);
+    assert.ok(
+      (await client.health()).capabilities?.includes("workspace-reconciliation-v1"),
+    );
+    assert.deepEqual(
+      await client.reconcileWorkspace("task-derived", {
+        targetWorkspaceId: "stable-repository",
+        apply: true,
+      }),
+      {
+        sourceWorkspaceId: "task-derived",
+        targetWorkspaceId: "stable-repository",
+        applied: true,
+        movedDocumentIds: [],
+        discardedDocumentIds: [],
+        blockingConflicts: [],
+        reviewRequestCount: 0,
+      },
+    );
+    assert.deepEqual(
+      catalog.listWorkspaces().map(({ id }) => id),
+      ["stable-repository"],
+    );
+  } finally {
+    await server.close();
+    catalog.close();
+  }
 });
 
 test("uses the versioned daemon API for terminal client operations", async () => {
@@ -73,7 +131,11 @@ test("uses the versioned daemon API for terminal client operations", async () =>
       service: "mdmaid.desk",
       status: "ok",
       version: 1,
-      capabilities: ["spaces-v1", "scoped-content-v1"],
+      capabilities: [
+        "spaces-v1",
+        "scoped-content-v1",
+        "workspace-reconciliation-v1",
+      ],
     });
     assert.deepEqual(await client.listSpaces(), []);
     const repositories = await client.listRepositories();

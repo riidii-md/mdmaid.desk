@@ -25,6 +25,12 @@ export interface CatalogStorage {
   getWorkspaceRepository(id: string): RepositoryIdentity | undefined;
   workspaceHasDocuments(id: string): boolean;
   saveWorkspace(workspace: Workspace, repository: RepositoryIdentity): void;
+  reconcileWorkspaces(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    movedDocumentIds: string[],
+    discardedDocumentIds: string[],
+  ): void;
   saveProject(project: Project): Project;
   listDocuments(filters?: DocumentFilters, scope?: ContentScope): StoredDocument[];
   getDocument(id: string, scope?: ContentScope): StoredDocument | undefined;

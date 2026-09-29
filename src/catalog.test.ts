@@ -4,6 +4,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  realpath,
   readdir,
   rename,
   rm,
@@ -1572,6 +1573,297 @@ test("rejects workspace updates that would orphan registered documents", async (
     }),
     /exclude registered document/,
   );
+});
+
+test("rejects a second workspace for the same canonical root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-root-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "stable-repository",
+    name: "Stable repository",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "task-derived-id",
+      name: "Task-derived identity",
+      root: join(workspace, "."),
+      artifactRoots: [workspace],
+    }),
+    /workspace root is already registered as stable-repository/,
+  );
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("reconciles duplicate-root workspaces without changing document or review ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-reconcile-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "plan.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Plan\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const document = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "plan",
+    title: "Plan",
+    path: documentPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "Review the plan.",
+  });
+
+  const dryRun = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: false,
+  });
+  assert.equal(dryRun.applied, false);
+  assert.deepEqual(dryRun.movedDocumentIds, [document.id]);
+  assert.deepEqual(dryRun.discardedDocumentIds, []);
+  assert.deepEqual(dryRun.blockingConflicts, []);
+  assert.equal(dryRun.reviewRequestCount, 1);
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "task-derived");
+
+  const applied = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: true,
+  });
+  assert.equal(applied.applied, true);
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "stable-repository");
+  assert.equal(catalog.getReviewRequest(review.id)?.documentId, document.id);
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("requires explicit disposal of archived path conflicts during reconciliation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-conflict-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "direction.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Direction\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const obsolete = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "decision",
+    title: "Obsolete direction",
+    path: documentPath,
+    attention: "none",
+  });
+  await catalog.archiveDocument(obsolete.id);
+  const active = await catalog.registerDocument({
+    workspaceId: "stable-repository",
+    kind: "decision",
+    title: "Active direction",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const blocked = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: false,
+  });
+  assert.deepEqual(blocked.blockingConflicts, [{
+    sourceDocumentId: obsolete.id,
+    targetDocumentId: active.id,
+    reason: "path-conflict",
+  }]);
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      apply: true,
+    }),
+    /workspace reconciliation has blocking conflicts/,
+  );
+
+  const allowed = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    discardArchivedConflicts: true,
+    apply: true,
+  });
+  assert.equal(allowed.applied, true);
+  assert.deepEqual(allowed.discardedDocumentIds, [obsolete.id]);
+  assert.equal(catalog.getDocument(obsolete.id), undefined);
+  assert.equal(catalog.getDocument(active.id)?.archivedAt, null);
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("never discards archived conflict review history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-review-conflict-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "reviewed.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Reviewed\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const obsolete = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "decision",
+    title: "Reviewed obsolete direction",
+    path: documentPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: obsolete.id,
+    kind: "plan-decision",
+    requestMessage: "Keep this history.",
+  });
+  await catalog.respondToReviewRequest(review.id, {
+    outcome: "approved",
+    message: "Keep the decision history.",
+  });
+  await catalog.archiveDocument(obsolete.id);
+  const active = await catalog.registerDocument({
+    workspaceId: "stable-repository",
+    kind: "decision",
+    title: "Active direction",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const plan = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    discardArchivedConflicts: true,
+    apply: false,
+  });
+  assert.deepEqual(plan.blockingConflicts, [{
+    sourceDocumentId: obsolete.id,
+    targetDocumentId: active.id,
+    reason: "review-history",
+  }]);
+  assert.equal(plan.reviewRequestCount, 1);
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      discardArchivedConflicts: true,
+      apply: true,
+    }),
+    /workspace reconciliation has blocking conflicts/,
+  );
+  assert.equal(catalog.getDocument(obsolete.id)?.workspaceId, "task-derived");
+  catalog.close();
+});
+
+test("refuses reconciliation that would escape target artifact roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-roots-"));
+  const workspace = join(root, "workspace");
+  const targetArtifacts = join(workspace, "published");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "outside-target.md");
+  await mkdir(targetArtifacts, { recursive: true });
+  await writeFile(documentPath, "# Outside target artifacts\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const canonicalTargetArtifacts = await realpath(targetArtifacts);
+  const storage = SqliteCatalogStorage.open(statePath);
+  storage.saveWorkspace(
+    {
+      id: "task-derived",
+      name: "Task derived",
+      root: canonicalWorkspace,
+      artifactRoots: [canonicalWorkspace],
+    },
+    { key: "github.com/acme/repository", name: "Repository" },
+  );
+  storage.saveWorkspace(
+    {
+      id: "stable-repository",
+      name: "Stable repository",
+      root: canonicalWorkspace,
+      artifactRoots: [canonicalTargetArtifacts],
+    },
+    { key: "github.com/acme/repository", name: "Repository" },
+  );
+  storage.close();
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const document = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "handoff",
+    title: "Outside target artifacts",
+    path: documentPath,
+    attention: "none",
+  });
+
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      apply: false,
+    }),
+    new RegExp(`target workspace would exclude registered document ${document.id}`),
+  );
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "task-derived");
+  catalog.close();
 });
 
 test("freezes workspace repository identity after the first document", async () => {

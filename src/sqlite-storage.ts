@@ -574,6 +574,49 @@ export class SqliteCatalogStorage implements CatalogStorage {
     });
   }
 
+  reconcileWorkspaces(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    movedDocumentIds: string[],
+    discardedDocumentIds: string[],
+  ): void {
+    this.transaction(() => {
+      const discardDocument = this.#database.prepare(
+        "DELETE FROM documents WHERE id = ? AND workspace_id = ?",
+      );
+      for (const documentId of discardedDocumentIds) {
+        if (discardDocument.run(documentId, sourceWorkspaceId).changes !== 1) {
+          throw new Error(`could not discard document ${documentId}`);
+        }
+      }
+      const moveDocument = this.#database.prepare(
+        `UPDATE documents SET workspace_id = ?
+         WHERE id = ? AND workspace_id = ?`,
+      );
+      for (const documentId of movedDocumentIds) {
+        if (
+          moveDocument.run(
+            targetWorkspaceId,
+            documentId,
+            sourceWorkspaceId,
+          ).changes !== 1
+        ) {
+          throw new Error(`could not move document ${documentId}`);
+        }
+      }
+      if (this.workspaceHasDocuments(sourceWorkspaceId)) {
+        throw new Error("workspace changed during reconciliation");
+      }
+      if (
+        this.#database
+          .prepare("DELETE FROM workspaces WHERE id = ?")
+          .run(sourceWorkspaceId).changes !== 1
+      ) {
+        throw new Error(`unknown workspace ${sourceWorkspaceId}`);
+      }
+    });
+  }
+
   saveProject(project: Project): Project {
     this.#database
       .prepare(

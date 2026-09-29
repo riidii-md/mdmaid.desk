@@ -111,6 +111,60 @@ test("adds a workspace, registers a document, and lists it", async () => {
   catalog.close();
 });
 
+test("routes dry-run-first workspace reconciliation through the daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-reconcile-"));
+  const statePath = join(root, "missing", "catalog.sqlite3");
+  const calls: unknown[] = [];
+  const client = {
+    requireCapabilities: async (...capabilities: string[]) => {
+      calls.push(["capabilities", capabilities]);
+    },
+    reconcileWorkspace: async (sourceWorkspaceId: string, input: unknown) => {
+      calls.push(["reconcile", sourceWorkspaceId, input]);
+      return {
+        sourceWorkspaceId,
+        targetWorkspaceId: "stable-repository",
+        applied: true,
+        movedDocumentIds: ["doc-0123456789abcdefabcd"],
+        discardedDocumentIds: [],
+        blockingConflicts: [],
+        reviewRequestCount: 1,
+      };
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      [
+        "workspace",
+        "reconcile",
+        "task-derived",
+        "--into",
+        "stable-repository",
+        "--apply",
+        "--json",
+      ],
+      stdout,
+      stderr,
+      { statePath, connectDaemon: async () => client },
+    ),
+    0,
+  );
+  assert.deepEqual(calls, [
+    ["capabilities", ["workspace-reconciliation-v1"]],
+    ["reconcile", "task-derived", {
+      targetWorkspaceId: "stable-repository",
+      discardArchivedConflicts: false,
+      apply: true,
+    }],
+  ]);
+  assert.equal(JSON.parse(stdout.text()).data.applied, true);
+  assert.equal(stderr.text(), "");
+  await assert.rejects(readFile(statePath), /ENOENT/);
+});
+
 test("manages Spaces from repeatable matcher flags and emits stable JSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-spaces-"));
   const workspace = join(root, "workspace");
@@ -1635,7 +1689,10 @@ test("reports usage errors for invalid commands and options", async () => {
   const statePath = join(root, "catalog.sqlite3");
   const cases: Array<{ args: string[]; message: RegExp }> = [
     { args: ["unknown"], message: /unknown command/ },
-    { args: ["workspace", "remove"], message: /action must be add or list/ },
+    {
+      args: ["workspace", "remove"],
+      message: /action must be add, reconcile, or list/,
+    },
     {
       args: ["workspace", "add", root, root, "--id", "example"],
       message: /accepts one root/,

@@ -96,6 +96,17 @@ and its `change-decision` request represents the human gate for that exact
 content. The TUI presents those documents in a dedicated filtered space while
 the catalog and API retain one generic document lifecycle.
 
+Workspace identity is stable at the canonical repository/worktree-root level.
+Registration rejects a second workspace ID for an already claimed canonical
+root; a task or ticket ID cannot create another authorization boundary for the
+same root. Legacy duplicate-root records are repaired through the authenticated
+workspace reconciliation operation. Reconciliation is dry-run-first,
+transactionally moves non-conflicting documents without changing their stable
+IDs, preserves review records, and removes the obsolete workspace only after a
+successful commit. Conflicting document paths stop the operation unless the
+obsolete record is archived, has no review history, and the operator explicitly
+allows archived-conflict disposal. SQLite is never an operator repair surface.
+
 Standard Git patches inside fenced `diff` blocks are parsed into a bounded,
 path-safe Change Review model. The parser supplies file status, line numbers,
 stable content-derived hunk IDs, and text lines to the TUI; it never reads a

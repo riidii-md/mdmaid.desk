@@ -19,6 +19,7 @@ import type {
   PublicSpace,
   PublicSpaceMatcher,
   PublicWorkspace,
+  PublicWorkspaceReconciliation,
   RenderTarget,
   TerminalRenderPreferences,
   TerminalRender,
@@ -27,6 +28,7 @@ import type {
   ReviewRequestResponse,
   ReviewStatus,
   WorkspaceRegistration,
+  WorkspaceReconciliationRequest,
 } from "./api-types.js";
 import { isChangeReviewDiff } from "./change-review.js";
 import type { MermaidValidationReport } from "./mermaid-validation.js";
@@ -246,6 +248,21 @@ export class DeskApiClient {
     });
     if (!isPublicWorkspace(value)) {
       throw new Error("Daemon returned an invalid workspace response");
+    }
+    return value;
+  }
+
+  async reconcileWorkspace(
+    sourceWorkspaceId: string,
+    input: WorkspaceReconciliationRequest,
+  ): Promise<PublicWorkspaceReconciliation> {
+    assertWorkspaceId(sourceWorkspaceId);
+    const value = await this.#request(
+      `/api/v1/workspaces/${encodeURIComponent(sourceWorkspaceId)}/reconcile`,
+      { method: "POST", body: input },
+    );
+    if (!isPublicWorkspaceReconciliation(value)) {
+      throw new Error("Daemon returned an invalid workspace reconciliation");
     }
     return value;
   }
@@ -627,6 +644,33 @@ function isPublicWorkspace(value: unknown): value is PublicWorkspace {
   );
 }
 
+function isPublicWorkspaceReconciliation(
+  value: unknown,
+): value is PublicWorkspaceReconciliation {
+  return isRecord(value) &&
+    Object.keys(value).length === 7 &&
+    typeof value.sourceWorkspaceId === "string" &&
+    typeof value.targetWorkspaceId === "string" &&
+    typeof value.applied === "boolean" &&
+    Array.isArray(value.movedDocumentIds) &&
+    value.movedDocumentIds.every((id) => typeof id === "string") &&
+    Array.isArray(value.discardedDocumentIds) &&
+    value.discardedDocumentIds.every((id) => typeof id === "string") &&
+    Array.isArray(value.blockingConflicts) &&
+    value.blockingConflicts.every(isPublicWorkspaceReconciliationConflict) &&
+    typeof value.reviewRequestCount === "number" &&
+    Number.isSafeInteger(value.reviewRequestCount) &&
+    value.reviewRequestCount >= 0;
+}
+
+function isPublicWorkspaceReconciliationConflict(value: unknown): boolean {
+  return isRecord(value) &&
+    Object.keys(value).length === 3 &&
+    typeof value.sourceDocumentId === "string" &&
+    typeof value.targetDocumentId === "string" &&
+    (value.reason === "path-conflict" || value.reason === "review-history");
+}
+
 function isPublicProject(value: unknown): value is PublicProject {
   return (
     isRecord(value) &&
@@ -921,6 +965,12 @@ function assertReviewRequestId(id: string): void {
 function assertSpaceId(id: string): void {
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
     throw new Error("invalid Space id");
+  }
+}
+
+function assertWorkspaceId(id: string): void {
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
+    throw new Error("invalid workspace id");
   }
 }
 
