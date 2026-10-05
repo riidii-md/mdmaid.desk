@@ -53,6 +53,87 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export const REVIEW_FEEDBACK_KINDS = ["feedback", "todo"] as const;
 export type ReviewFeedbackKind = (typeof REVIEW_FEEDBACK_KINDS)[number];
 
+export const FEEDBACK_COMMENT_INTENTS = ["feedback", "todo"] as const;
+export type FeedbackCommentIntent = (typeof FEEDBACK_COMMENT_INTENTS)[number];
+
+export interface MarkdownSourcePoint {
+  offset: number;
+  line: number;
+  column: number;
+}
+
+export interface MarkdownFeedbackAnchor {
+  kind: "markdown-v1";
+  start: MarkdownSourcePoint;
+  end: MarkdownSourcePoint;
+  exact: string;
+  prefix: string;
+  suffix: string;
+}
+
+export interface DiffFileFeedbackAnchor {
+  kind: "diff-file-v1";
+  path: string;
+}
+
+export interface DiffLinesFeedbackAnchor {
+  kind: "diff-lines-v1";
+  path: string;
+  hunkId: string;
+  side: "old" | "new";
+  line: number;
+  endLine?: number;
+}
+
+export type FeedbackAnchor =
+  | MarkdownFeedbackAnchor
+  | DiffFileFeedbackAnchor
+  | DiffLinesFeedbackAnchor;
+
+export interface FeedbackComment {
+  id: string;
+  intent: FeedbackCommentIntent;
+  anchor: FeedbackAnchor;
+  message: string;
+}
+
+export interface StoredFeedbackSubmission {
+  id: string;
+  documentId: string;
+  documentRevision: number;
+  documentContentHash: string;
+  generalMessage?: string;
+  comments: FeedbackComment[];
+  reviewRequestId?: string;
+  createdAt: string;
+}
+
+export interface FeedbackSubmission {
+  id: string;
+  documentId: string;
+  documentRevision: number;
+  generalMessage?: string;
+  comments: FeedbackComment[];
+  reviewRequestId?: string;
+  createdAt: string;
+  route: string;
+}
+
+export interface FeedbackSubmissionFilters {
+  documentId: string;
+  documentRevision?: number;
+}
+
+export interface FeedbackStorageCursor {
+  createdAt: string;
+  id: string;
+}
+
+export interface FeedbackStoragePage {
+  limit: number;
+  before?: FeedbackStorageCursor;
+}
+
 export interface ReviewFeedbackItem {
   id: string;
   kind: ReviewFeedbackKind;
@@ -68,6 +149,7 @@ export interface ReviewResponse {
   outcome: ReviewOutcome;
   message: string;
   items?: ReviewFeedbackItem[];
+  feedbackId?: string;
   createdAt: string;
 }
 
@@ -234,6 +316,16 @@ export function presentReviewRequest(
 ): ReviewRequest {
   const { documentContentHash: _privateHash, ...presented } = request;
   return structuredClone(presented);
+}
+
+export function presentFeedbackSubmission(
+  submission: StoredFeedbackSubmission,
+): FeedbackSubmission {
+  const { documentContentHash: _privateHash, ...presented } = submission;
+  return {
+    ...structuredClone(presented),
+    route: `/f/${submission.id}`,
+  };
 }
 
 export function isDocumentKind(value: string): value is DocumentKind {

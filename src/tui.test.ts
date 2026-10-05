@@ -4,6 +4,7 @@ import type { ReadStream, WriteStream } from "node:tty";
 import { stripVTControlCharacters } from "node:util";
 import test from "node:test";
 import stringWidth from "string-width";
+import { createMarkdownSourceMap } from "mdmaid";
 
 import type {
   CatalogEvent,
@@ -12,6 +13,7 @@ import type {
 import { DeskApiClient, DeskApiError } from "./api-client.js";
 import type {
   PublicDocument,
+  PublicFeedbackSubmission,
   PublicReviewRequest,
   PublicWorkspace,
 } from "./api-types.js";
@@ -26,6 +28,7 @@ import {
   handleTuiKey,
   handleTuiMouse,
   replaceTuiDocuments,
+  refreshTuiReader,
   renderTui,
   runTui,
   shouldRefreshTuiReader,
@@ -363,6 +366,34 @@ test("renders the web-inspired responsive queue and reader workspace", () => {
   assert.deepEqual(handleTuiKey(reader, "q").effects, [{ type: "quit" }]);
 });
 
+test("comments on a source row and submits feedback without a pending decision", async () => {
+  const markdown = "# Heading\n\nAlpha beta.\n";
+  const sourceMap = await createMarkdownSourceMap(markdown);
+  let state = applyTuiReader(
+    createTuiState(documents, workspaces),
+    documents[1]!,
+    "Heading\n\nAlpha beta.",
+    "built-in",
+    [],
+    undefined,
+    sourceMap,
+  );
+  state = handleTuiKey(state, "]").state;
+  state = handleTuiKey(state, "f").state;
+  for (const character of "Clarify this") {
+    state = handleTuiKey(state, character).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.markdownFeedbackItems.length, 1);
+  const submitted = handleTuiKey(state, "s");
+  assert.equal(submitted.effects[0]?.type, "feedback-submit");
+  const effect = submitted.effects[0];
+  assert.ok(effect?.type === "feedback-submit");
+  assert.equal(effect.input.documentId, documents[1]!.id);
+  assert.equal(effect.input.comments[0]?.anchor.kind, "markdown-selection-v1");
+  assert.equal(effect.input.comments[0]?.message, "Clarify this");
+});
+
 test("targets only new live-source revisions at the open TUI reader", () => {
   const documentId = documents[0]!.id;
   assert.equal(
@@ -407,6 +438,43 @@ test("targets only new live-source revisions at the open TUI reader", () => {
   );
   assert.equal(documentStorageLabel("reference"), "live source");
   assert.equal(documentStorageLabel("managed"), "snapshot");
+});
+
+test("drops anchored TUI drafts when the rendered document revision changes", async () => {
+  const firstMarkdown = "# Heading\n\nAlpha beta.\n";
+  const secondMarkdown = "# Heading\n\nDifferent text.\n";
+  let state = applyTuiReader(
+    createTuiState(documents, workspaces),
+    documents[1]!,
+    "Heading\n\nAlpha beta.",
+    "built-in",
+    [],
+    undefined,
+    await createMarkdownSourceMap(firstMarkdown),
+    `witness-${"a".repeat(64)}`,
+  );
+  state = handleTuiKey(state, "]").state;
+  state = handleTuiKey(state, "f").state;
+  for (const character of "Old anchor") {
+    state = handleTuiKey(state, character).state;
+  }
+  state = handleTuiKey(state, "ctrl-d").state;
+  assert.equal(state.reader?.markdownFeedbackItems.length, 1);
+
+  const revised = { ...documents[1]!, revision: documents[1]!.revision + 1 };
+  const refreshed = refreshTuiReader(
+    state,
+    revised,
+    "Heading\n\nDifferent text.",
+    "built-in",
+    [],
+    undefined,
+    await createMarkdownSourceMap(secondMarkdown),
+    `witness-${"b".repeat(64)}`,
+  );
+  assert.deepEqual(refreshed.reader?.markdownFeedbackItems, []);
+  assert.equal(refreshed.reader?.feedbackGeneralMessage, "");
+  assert.equal(refreshed.reader?.sourceWitness, `witness-${"b".repeat(64)}`);
 });
 
 test("filters explicit actions and composes a review response", () => {
@@ -773,6 +841,50 @@ test("clears submitted TUI feedback and renders approved items as history", () =
   assert.equal(frame.match(/Use the constant-time helper\./g)?.length, 1);
   assert.doesNotMatch(frame, /\[ \] feedback · Use the constant-time helper\./);
   assert.match(frame, /- feedback · Use the constant-time helper\./);
+});
+
+test("renders historical TUI feedback messages without placing old anchors inline", () => {
+  const current = { ...documents[0]!, revision: 2 };
+  let state = applyTuiReader(
+    createTuiState(documents, workspaces),
+    current,
+    "Rendered narrative",
+    "built-in",
+    [],
+  );
+  const historical = {
+    id: "feedback-99999999999999999999",
+    documentId: current.id,
+    documentRevision: 1,
+    generalMessage: "Earlier overall note.",
+    comments: [{
+      id: "comment-99999999999999999999",
+      intent: "feedback" as const,
+      anchor: {
+        kind: "markdown-v1" as const,
+        start: { offset: 0, line: 1, column: 1 },
+        end: { offset: 4, line: 1, column: 5 },
+        exact: "Old",
+        prefix: "",
+        suffix: " text",
+      },
+      message: "Earlier anchored note.",
+    }],
+    createdAt: "2026-08-19T10:05:00.000Z",
+    route: "/f/feedback-99999999999999999999",
+  } satisfies PublicFeedbackSubmission;
+  state = {
+    ...state,
+    reader: state.reader
+      ? { ...state.reader, feedbackHistory: [historical] }
+      : undefined,
+  };
+
+  const frame = renderTui(state, 130, 32);
+  assert.match(frame, /revision 1 · historical/);
+  assert.match(frame, /Earlier overall note\./);
+  assert.match(frame, /Earlier anchored note\./);
+  assert.match(frame, /document line 1/);
 });
 
 test("supports mouse navigation, direct actions, wheel, and page scrolling", () => {

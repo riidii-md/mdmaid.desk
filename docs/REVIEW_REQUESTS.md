@@ -3,6 +3,9 @@
 Mdmaid.desk keeps document reading state and workflow decisions separate. A
 document is passive unless its producer explicitly creates a review request.
 Opening, registering, importing, or marking a document done never approves it.
+Likewise, [document feedback](DOCUMENT_FEEDBACK.md) is available independently
+and never changes review state. `pending` means only that a producer is waiting
+for one explicit human decision.
 
 ## State Model
 
@@ -103,7 +106,9 @@ List filters:
 
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
 `requestMessage`. Response accepts `outcome` (`approved`, `changes_requested`,
-`rejected`, or `superseded`), `message`, and optional `items`.
+`rejected`, or `superseded`), `message`, and either legacy `items` or a
+structured `feedback` submission. Structured feedback supports Markdown and
+diff anchors and is linked to the decision atomically.
 Items are available for `approved` and `changes_requested` outcomes. On an
 approval they are non-blocking comments; on requested changes they identify
 work that must be addressed. A `feedback` item identifies a safe relative
@@ -156,7 +161,7 @@ tag groups and then to one ordered list. Wide layouts show section headings;
 narrow layouts retain the same grouped navigation order without spending rows
 on headings.
 
-The browser always provides a separate general-note text area. In the TUI, use
+The browser always provides a separate feedback surface on every document. In the TUI, use
 `r` for the Actions view, `y` to approve, `c` to request changes, `x` to reject,
 or `o` to supersede an obsolete request. The TUI composer uses `Enter` for a
 newline, `Ctrl-D` to submit, and `Esc` to cancel.
@@ -176,11 +181,10 @@ press `f` for a same-side range. Use `t` for feedback on the current file and
 a line number, Shift-click a second same-side line for a range, or use
 **feedback on file**. Line and range comments render inline after their anchor
 and remain in the feedback summary for management.
-Approve and Request Changes store all anchored notes as response `items` and
-keep the general note separate. Approval makes the notes non-blocking; Request
-Changes makes them required work. Browser drafts survive reload for the exact
-pending review and expose Edit and Remove controls. Open notes still block
-Reject and Supersede so they cannot be discarded accidentally. A
+Feedback can be sent directly without a review. When a decision is pending,
+the same general and anchored draft can instead be linked atomically to that
+decision. Browser drafts survive reload for the exact document revision and
+expose Edit and Remove controls. A
 Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
 

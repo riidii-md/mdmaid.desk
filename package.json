@@ -59,7 +59,7 @@
     "mdast-util-from-markdown": "^2.0.3",
     "mdmaid": "^0.1.16",
     "mermaid": "^11.16.1",
-    "sanitize-html": "^2.17.6",
+    "sanitize-html": "^2.17.7",
     "slice-ansi": "^7.1.2",
     "string-width": "^7.2.0"
   }

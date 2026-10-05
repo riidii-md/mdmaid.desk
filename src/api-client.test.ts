@@ -135,6 +135,7 @@ test("uses the versioned daemon API for terminal client operations", async () =>
         "spaces-v1",
         "scoped-content-v1",
         "workspace-reconciliation-v1",
+        "document-feedback-v1",
       ],
     });
     assert.deepEqual(await client.listSpaces(), []);
@@ -208,6 +209,21 @@ test("uses the versioned daemon API for terminal client operations", async () =>
     assert.match(rendered.content, /Terminal plan/);
     assert.match(rendered.content, /\u001b\[[0-9;]*m/);
     assert.equal(rendered.backend, "beautiful-mermaid");
+    assert.equal(rendered.sourceMap.version, 1);
+    const feedback = await client.createFeedback({
+      id: "feedback-0123456789abcdef0123",
+      documentId: document.id,
+      documentRevision: document.revision,
+      generalMessage: "Readable on every document.",
+      comments: [],
+    });
+    assert.equal(feedback.route, `/f/${feedback.id}`);
+    assert.deepEqual(await client.getFeedback(feedback.id), feedback);
+    assert.deepEqual(
+      await client.listFeedback({ documentId: document.id }),
+      { items: [feedback] },
+    );
+    assert.deepEqual(await client.listReviewRequests(), []);
     assert.equal((await client.act(document.id, "opened")).status, "reading");
     assert.equal((await client.act(document.id, "read")).status, "done");
 

@@ -12,6 +12,8 @@ import {
   type AddWorkspaceInput,
   Catalog,
   type DocumentKind,
+  type FeedbackPage,
+  type FeedbackSubmission,
   type ImportDocumentInput,
   type RegisterDocumentInput,
   type ReviewKind,
@@ -162,6 +164,10 @@ Usage:
   mdmaid-desk review respond <review-id>
       --outcome approved|changes_requested|rejected|superseded
       [--message <text>] [--json]
+  mdmaid-desk feedback show <feedback-id> [--space <id>] [--json]
+  mdmaid-desk feedback list --document <document-id>
+      [--revision <number>] [--cursor <cursor>] [--limit <number>]
+      [--space <id>] [--json]
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]
       [--public-url <http[s]://name.localhost[:port]>]
@@ -331,6 +337,9 @@ export async function run(
     if (args[0] === "review") {
       return await runReview(statePath, args.slice(1), stdout, options);
     }
+    if (args[0] === "feedback") {
+      return await runFeedback(statePath, args.slice(1), stdout, options);
+    }
     if (args[0] === "space") {
       return await runSpace(statePath, args.slice(1), stdout, options);
     }
@@ -359,7 +368,7 @@ export async function run(
     const validation = validationReportFromError(error);
     if (
       args.includes("--json") &&
-      (args[0] === "space" || args[0] === "repository")
+      (args[0] === "space" || args[0] === "repository" || args[0] === "feedback")
     ) {
       const code = error instanceof DeskApiError
         ? error.code
@@ -1494,6 +1503,103 @@ async function runReview(
   }
   writeReviewResult(stdout, request, hasFlag(parsed, "json"));
   return 0;
+}
+
+async function runFeedback(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (action !== "show" && action !== "list") {
+    throw new UsageError("feedback action must be show or list");
+  }
+  const parsed = parseArguments(args.slice(1), new Set(["json"]));
+  const scope = firstOption(parsed, "space") === undefined
+    ? {}
+    : { spaceId: firstOption(parsed, "space")! };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) await client.requireCapabilities("document-feedback-v1");
+  const catalog = client ? undefined : await Catalog.open(statePath);
+  try {
+    if (action === "show") {
+      rejectUnknownOptions(parsed, new Set(["space", "json"]));
+      const id = parsed.positionals[0];
+      if (!id || parsed.positionals.length !== 1) {
+        throw new UsageError("feedback show requires one feedback id");
+      }
+      const feedback = client
+        ? await client.getFeedback(id, scope)
+        : catalog!.getFeedback(id, scope);
+      if (!feedback) throw new Error(`unknown feedback ${id}`);
+      writeFeedbackResult(stdout, feedback, hasFlag(parsed, "json"));
+      return 0;
+    }
+
+    rejectUnknownOptions(
+      parsed,
+      new Set(["document", "revision", "cursor", "limit", "space", "json"]),
+    );
+    if (parsed.positionals.length > 0) {
+      throw new UsageError("feedback list accepts options only");
+    }
+    const documentId = requiredOption(parsed, "document");
+    const documentRevision = optionalPositiveInteger(parsed, "revision");
+    const limit = optionalPositiveInteger(parsed, "limit");
+    if (limit !== undefined && limit > 100) {
+      throw new UsageError("--limit must be at most 100");
+    }
+    const cursor = firstOption(parsed, "cursor");
+    const page = client
+      ? await client.listFeedback({
+          documentId,
+          ...(documentRevision === undefined ? {} : { documentRevision }),
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(limit === undefined ? {} : { limit }),
+        }, scope)
+      : catalog!.listFeedback({
+          documentId,
+          ...(documentRevision === undefined ? {} : { documentRevision }),
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(limit === undefined ? {} : { limit }),
+        }, scope);
+    writeFeedbackPage(stdout, page, hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog?.close();
+  }
+}
+
+function writeFeedbackResult(
+  stdout: Writer,
+  feedback: FeedbackSubmission,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, feedback })}\n`);
+    return;
+  }
+  stdout.write(
+    `${feedback.id}\t${feedback.documentId}@${feedback.documentRevision}\t${feedback.route}\n`,
+  );
+}
+
+function writeFeedbackPage(
+  stdout: Writer,
+  page: FeedbackPage,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, page })}\n`);
+    return;
+  }
+  for (const feedback of page.items) {
+    writeFeedbackResult(stdout, feedback, false);
+  }
+  if (page.nextCursor !== undefined) {
+    stdout.write(`next\t${page.nextCursor}\n`);
+  }
 }
 
 function writeReviewResult(

@@ -12,8 +12,10 @@ import {
 import {
   documentStorageLabel,
   type BulkDocumentAction,
+  type FeedbackSubmissionRegistration,
   type DocumentAction,
   type PublicDocument,
+  type PublicFeedbackSubmission,
   type PublicReviewRequest,
   type PublicSpace,
   type PublicWorkspace,
@@ -21,6 +23,7 @@ import {
   type ReviewOutcome,
   type ReviewFeedbackItem,
 } from "./api-types.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import {
   changedSegments,
@@ -65,6 +68,12 @@ interface TuiReader {
   changeLineIndex: number;
   changeRangeStartIndex?: number | undefined;
   feedbackItems: ReviewFeedbackItem[];
+  markdownFeedbackItems: FeedbackSubmissionRegistration["comments"];
+  feedbackGeneralMessage: string;
+  feedbackHistory: PublicFeedbackSubmission[];
+  sourceWitness?: string;
+  sourceLineIndex: number;
+  sourceMap?: MarkdownSourceMapV1;
 }
 
 interface TuiReviewComposer {
@@ -74,13 +83,22 @@ interface TuiReviewComposer {
   items: ReviewFeedbackItem[];
 }
 
+interface TuiFeedbackComposer {
+  message: string;
+}
+
 interface TuiAnnotationComposer {
   kind: "feedback" | "todo";
-  path: string;
+  path?: string;
   hunkId?: string;
   line?: number;
   endLine?: number;
   side?: "old" | "new";
+  markdownAnchor?: Extract<
+    FeedbackSubmissionRegistration["comments"][number]["anchor"],
+    { kind: "markdown-selection-v1" }
+  >;
+  label?: string;
   message: string;
 }
 
@@ -88,6 +106,7 @@ export interface TuiState {
   documents: PublicDocument[];
   reviewRequests: PublicReviewRequest[];
   reviewComposer?: TuiReviewComposer | undefined;
+  feedbackComposer?: TuiFeedbackComposer | undefined;
   annotationComposer?: TuiAnnotationComposer | undefined;
   actionsOnly: boolean;
   changeReviewsOnly: boolean;
@@ -127,7 +146,9 @@ export type TuiEffect =
       outcome: ReviewOutcome;
       message: string;
       items?: ReviewFeedbackItem[];
+      feedback?: FeedbackSubmissionRegistration;
     }
+  | { type: "feedback-submit"; input: FeedbackSubmissionRegistration }
   | { type: "quit" };
 
 export interface TuiTransition {
@@ -191,6 +212,8 @@ export function applyTuiReader(
   backend: string,
   warnings: string[],
   changeReview?: ChangeReviewDiff,
+  sourceMap?: MarkdownSourceMapV1,
+  sourceWitness?: string,
 ): TuiState {
   return {
     ...state,
@@ -201,15 +224,22 @@ export function applyTuiReader(
       document,
       warnings,
       ...(changeReview === undefined ? {} : { changeReview }),
+      ...(sourceMap === undefined ? {} : { sourceMap }),
+      ...(sourceWitness === undefined ? {} : { sourceWitness }),
       changeView: changeReview && changeReview.files.length > 0 ? "diff" : "document",
       changeLayout: "unified",
       changeFileIndex: 0,
       changeHunkIndex: 0,
       changeLineIndex: 0,
       feedbackItems: [],
+      markdownFeedbackItems: [],
+      feedbackGeneralMessage: "",
+      feedbackHistory: [],
+      sourceLineIndex: 0,
     },
     reviewComposer: undefined,
     annotationComposer: undefined,
+    feedbackComposer: undefined,
     scroll: 0,
     searching: false,
     message: undefined,
@@ -234,13 +264,15 @@ export function applyTuiMissingReader(
   );
 }
 
-function refreshTuiReader(
+export function refreshTuiReader(
   state: TuiState,
   document: PublicDocument,
   content: string,
   backend: string,
   warnings: string[],
   changeReview?: ChangeReviewDiff,
+  sourceMap?: MarkdownSourceMapV1,
+  sourceWitness?: string,
 ): TuiState {
   const previous = state.reader;
   const next = applyTuiReader(
@@ -250,8 +282,15 @@ function refreshTuiReader(
     backend,
     warnings,
     changeReview,
+    sourceMap,
+    sourceWitness,
   );
-  if (!previous || previous.document.id !== document.id || !next.reader) {
+  if (
+    !previous ||
+    previous.document.id !== document.id ||
+    previous.document.revision !== document.revision ||
+    !next.reader
+  ) {
     return next;
   }
   const fileCount = next.reader.changeReview?.files.length ?? 0;
@@ -278,6 +317,14 @@ function refreshTuiReader(
         ),
       ),
       feedbackItems: previous.feedbackItems,
+      markdownFeedbackItems: previous.markdownFeedbackItems,
+      feedbackGeneralMessage: previous.feedbackGeneralMessage,
+      feedbackHistory: previous.feedbackHistory,
+      sourceLineIndex: clamp(
+        previous.sourceLineIndex,
+        0,
+        Math.max(0, (sourceMap?.logicalLines.length ?? 1) - 1),
+      ),
     },
   };
 }
@@ -309,7 +356,12 @@ export function completeTuiReviewResponse(state: TuiState): TuiState {
     ...state,
     reviewComposer: undefined,
     reader: state.reader
-      ? { ...state.reader, feedbackItems: [] }
+      ? {
+          ...state.reader,
+          feedbackItems: [],
+          markdownFeedbackItems: [],
+          feedbackGeneralMessage: "",
+        }
       : undefined,
   };
 }
@@ -411,6 +463,9 @@ export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   if (state.annotationComposer) {
     return handleAnnotationComposerKey(state, key);
   }
+  if (state.feedbackComposer) {
+    return handleFeedbackComposerKey(state, key);
+  }
   if (state.reviewComposer) {
     return handleReviewComposerKey(state, key);
   }
@@ -500,6 +555,11 @@ export function renderTui(
         [["enter", "newline"], ["ctrl-d", "save note"], ["esc", "cancel"]],
         theme,
       )
+    : state.feedbackComposer
+    ? renderShortcutBar(
+        [["enter", "newline"], ["ctrl-d", "save general feedback"], ["esc", "cancel"]],
+        theme,
+      )
     : state.reviewComposer
     ? renderShortcutBar(
         [["enter", "newline"], ["ctrl-d", "submit"], ["esc", "cancel"]],
@@ -514,16 +574,16 @@ export function renderTui(
                     state.reviewRequests,
                     state.reader.document.id,
                   )
-                ? [["p/n", "file"], ["j/k", "line"], ["v", "range"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["z", "undo note"], ["y/c/x", "decide"], ["o", "supersede"], ["b", "queue"]]
-                : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
+                ? [["p/n", "file"], ["j/k", "line"], ["v", "range"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["y/c/x/o", "decide"], ["b", "queue"]]
+                : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["b", "queue"]]
             : pendingReviewForDocument(
                   state.reviewRequests,
                   state.reader?.document.id ?? "",
                 )
-              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["j/k", "scroll"], ["b", "queue"]]
+              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["b", "queue"]]
               : state.contentMode === "archive"
                 ? [["j/k", "scroll"], ["u", "restore"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
-                : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]],
+                : [["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"]],
           theme,
         )
     : state.searching
@@ -693,6 +753,8 @@ export async function runTui(
           rendered.backend,
           rendered.warnings,
           rendered.changeReview,
+          rendered.sourceMap,
+          rendered.sourceWitness,
         );
         draw();
         await client.act(effect.documentId, "opened", scope);
@@ -729,11 +791,29 @@ export async function runTui(
               ? `${effect.documentIds.length} restored`
               : `${effect.documentIds.length} purged forever`,
         };
+      } else if (effect.type === "feedback-submit") {
+        const submission = await client.createFeedback(effect.input, scope);
+        if (!scopeContextMatches(context)) return;
+        state = {
+          ...state,
+          reader: state.reader
+            ? {
+                ...state.reader,
+                feedbackItems: [],
+                markdownFeedbackItems: [],
+                feedbackGeneralMessage: "",
+                feedbackHistory: [submission, ...state.reader.feedbackHistory],
+              }
+            : undefined,
+          feedbackComposer: undefined,
+          message: `Feedback saved: ${submission.id} · ${submission.route}`,
+        };
       } else {
         await client.respondToReviewRequest(effect.requestId, {
           outcome: effect.outcome,
           message: effect.message,
           ...(effect.items === undefined ? {} : { items: effect.items }),
+          ...(effect.feedback === undefined ? {} : { feedback: effect.feedback }),
         }, scope);
         if (!scopeContextMatches(context)) {
           return;
@@ -754,6 +834,18 @@ export async function runTui(
         workspaces,
         reviewRequests,
       );
+      if (state.reader && typeof client.listFeedback === "function") {
+        const feedbackItems = await listAllFeedback(
+          client,
+          state.reader.document.id,
+          scope,
+        );
+        if (!scopeContextMatches(context)) return;
+        state = {
+          ...state,
+          reader: { ...state.reader, feedbackHistory: feedbackItems },
+        };
+      }
       draw();
     } catch (error) {
       if (
@@ -875,6 +967,7 @@ export async function runTui(
             rendered.backend,
             rendered.warnings,
             rendered.changeReview,
+            rendered.sourceMap,
           );
           state = { ...state, scroll };
           draw();
@@ -955,7 +1048,22 @@ export async function runTui(
                 rendered.backend,
                 rendered.warnings,
                 rendered.changeReview,
+                rendered.sourceMap,
+                rendered.sourceWitness,
               );
+              if (typeof client.listFeedback === "function") {
+                const feedbackItems = await listAllFeedback(
+                  client,
+                  rendered.document.id,
+                  context.scope,
+                );
+                if (state.reader?.document.id === rendered.document.id) {
+                  state = {
+                    ...state,
+                    reader: { ...state.reader, feedbackHistory: feedbackItems },
+                  };
+                }
+              }
               state = clampReaderScroll(
                 { ...state, scroll },
                 output.rows ?? 30,
@@ -1407,6 +1515,94 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       };
     }
   }
+  if (state.reader?.changeView === "document") {
+    const reader = state.reader;
+    const logicalLines = reader.sourceMap?.logicalLines ?? [];
+    if ((key === "[" || key === "]") && logicalLines.length > 0) {
+      return {
+        state: {
+          ...state,
+          reader: {
+            ...reader,
+            sourceLineIndex: clamp(
+              reader.sourceLineIndex + (key === "]" ? 1 : -1),
+              0,
+              logicalLines.length - 1,
+            ),
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+    if (key === "f") {
+      const logicalLine = logicalLines[reader.sourceLineIndex];
+      const firstRef = logicalLine?.segmentRefs[0];
+      const lastRef = logicalLine?.segmentRefs.at(-1);
+      const lastSegment = reader.sourceMap?.segments.find(({ ref }) => ref === lastRef);
+      if (!logicalLine || !firstRef || !lastRef || !lastSegment) {
+        return {
+          state: { ...state, message: "This document row is not commentable." },
+          effects: [],
+        };
+      }
+      return {
+        state: {
+          ...state,
+          annotationComposer: {
+            kind: "feedback",
+            markdownAnchor: {
+              kind: "markdown-selection-v1",
+              start: { ref: firstRef, offset: 0 },
+              end: { ref: lastRef, offset: lastSegment.text.length },
+            },
+            label: `source row ${logicalLine.sourceStart.line}: ${logicalLine.text.slice(0, 80)}`,
+            message: "",
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+  }
+  if (key === "g" && state.reader) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: state.reader.feedbackGeneralMessage },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "s" && state.reader) {
+    const input = tuiFeedbackRegistration(state.reader);
+    if (!input) {
+      return {
+        state: { ...state, message: "Add general feedback or a specific comment first." },
+        effects: [],
+      };
+    }
+    return { state: { ...state, message: undefined }, effects: [{ type: "feedback-submit", input }] };
+  }
+  if (
+    key === "z" &&
+    state.reader &&
+    state.reader.changeView === "document" &&
+    state.reader.markdownFeedbackItems.length > 0
+  ) {
+    return {
+      state: {
+        ...state,
+        reader: {
+          ...state.reader,
+          markdownFeedbackItems: state.reader.markdownFeedbackItems.slice(0, -1),
+        },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
   if (key === "j" || key === "down") {
     return { state: { ...state, scroll: state.scroll + 1 }, effects: [] };
   }
@@ -1460,19 +1656,6 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         state: {
           ...state,
           message: "This native diff is incomplete; request changes or reject it.",
-        },
-        effects: [],
-      };
-    }
-    if (
-      reviewOutcome !== "changes_requested" &&
-      reviewOutcome !== "approved" &&
-      (state.reader?.feedbackItems.length ?? 0) > 0
-    ) {
-      return {
-        state: {
-          ...state,
-          message: "Request changes or remove the open feedback with z before deciding.",
         },
         effects: [],
       };
@@ -1554,10 +1737,27 @@ function handleReviewComposerKey(
     };
   }
   if (key === "ctrl-d") {
+    const reader = state.reader;
+    const generalFeedback = reader?.feedbackGeneralMessage.trim() ?? "";
+    const decisionMessage = composer.message.trim();
+    const combinedMessage = decisionMessage === ""
+      ? generalFeedback
+      : generalFeedback === "" || generalFeedback === decisionMessage
+        ? decisionMessage
+        : `Feedback:\n${generalFeedback}\n\nDecision:\n${decisionMessage}`;
+    const hasStructuredFeedback = Boolean(
+      reader &&
+        (reader.feedbackGeneralMessage.trim() !== "" ||
+          reader.markdownFeedbackItems.length > 0),
+    );
+    const feedback = reader && hasStructuredFeedback
+      ? tuiFeedbackRegistration(reader, combinedMessage)
+      : undefined;
     if (
       composer.outcome === "changes_requested" &&
-      composer.message.trim() === "" &&
-      composer.items.length === 0
+      combinedMessage === "" &&
+      composer.items.length === 0 &&
+      (reader?.markdownFeedbackItems.length ?? 0) === 0
     ) {
       return {
         state: { ...state, message: "Explain what needs to change." },
@@ -1571,8 +1771,10 @@ function handleReviewComposerKey(
           type: "review-response",
           requestId: composer.requestId,
           outcome: composer.outcome,
-          message: composer.message,
-          ...(composer.items.length === 0 ? {} : { items: composer.items }),
+          message: combinedMessage,
+          ...(feedback === undefined
+            ? composer.items.length === 0 ? {} : { items: composer.items }
+            : { feedback }),
         },
       ],
     };
@@ -1582,6 +1784,115 @@ function handleReviewComposerKey(
       state: {
         ...state,
         reviewComposer: { ...composer, message: composer.message + key },
+      },
+      effects: [],
+    };
+  }
+  return { state, effects: [] };
+}
+
+function tuiFeedbackRegistration(
+  reader: TuiReader,
+  generalMessage = reader.feedbackGeneralMessage.trim(),
+): FeedbackSubmissionRegistration | undefined {
+  const comments: FeedbackSubmissionRegistration["comments"] = [
+    ...reader.markdownFeedbackItems,
+    ...reader.feedbackItems.map((item) => ({
+      id: item.id.replace(/^feedback-/, "comment-"),
+      intent: item.kind,
+      anchor: item.line === undefined
+        ? { kind: "diff-file-v1" as const, path: item.path }
+        : {
+            kind: "diff-lines-v1" as const,
+            path: item.path,
+            hunkId: item.hunkId!,
+            side: item.side!,
+            line: item.line,
+            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          },
+      message: item.message,
+    })),
+  ];
+  if (generalMessage === "" && comments.length === 0) return undefined;
+  return {
+    id: `feedback-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
+    documentId: reader.document.id,
+    documentRevision: reader.document.revision,
+    ...(comments.length === 0 ? {} : { sourceWitness: reader.sourceWitness }),
+    ...(generalMessage === "" ? {} : { generalMessage }),
+    comments,
+  };
+}
+
+async function listAllFeedback(
+  client: DeskApiClient,
+  documentId: string,
+  scope: { spaceId?: string },
+): Promise<PublicFeedbackSubmission[]> {
+  const items: PublicFeedbackSubmission[] = [];
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+  do {
+    const page = await client.listFeedback({
+      documentId,
+      limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    }, scope);
+    items.push(...page.items);
+    cursor = page.nextCursor;
+    if (cursor !== undefined && seenCursors.has(cursor)) {
+      throw new Error("Feedback history returned a repeated cursor.");
+    }
+    if (cursor !== undefined) seenCursors.add(cursor);
+  } while (cursor !== undefined);
+  return items;
+}
+
+function handleFeedbackComposerKey(
+  state: TuiState,
+  key: string,
+): TuiTransition {
+  const composer = state.feedbackComposer;
+  if (!composer || !state.reader) return { state, effects: [] };
+  if (key === "escape") {
+    return { state: { ...state, feedbackComposer: undefined }, effects: [] };
+  }
+  if (key === "backspace") {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: {
+          message: Array.from(composer.message).slice(0, -1).join(""),
+        },
+      },
+      effects: [],
+    };
+  }
+  if (key === "enter" && composer.message.length < 16 * 1024) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: `${composer.message}\n` },
+      },
+      effects: [],
+    };
+  }
+  if (key === "ctrl-d") {
+    return {
+      state: {
+        ...state,
+        reader: { ...state.reader, feedbackGeneralMessage: composer.message.trim() },
+        feedbackComposer: undefined,
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key.length === 1 && key >= " " && composer.message.length < 16 * 1024) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: composer.message + key },
       },
       effects: [],
     };
@@ -1631,12 +1942,35 @@ function handleAnnotationComposerKey(
         effects: [],
       };
     }
-    if (state.reader.feedbackItems.length >= 32) {
+    if (
+      state.reader.feedbackItems.length + state.reader.markdownFeedbackItems.length >= 32
+    ) {
       return {
-        state: { ...state, message: "A review can contain at most 32 feedback items." },
+        state: { ...state, message: "A feedback submission can contain at most 32 comments." },
         effects: [],
       };
     }
+    if (composer.markdownAnchor) {
+      const item: FeedbackSubmissionRegistration["comments"][number] = {
+        id: `comment-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
+        intent: composer.kind,
+        anchor: composer.markdownAnchor,
+        message: composer.message.replaceAll("\r", "").trim(),
+      };
+      return {
+        state: {
+          ...state,
+          reader: {
+            ...state.reader,
+            markdownFeedbackItems: [...state.reader.markdownFeedbackItems, item],
+          },
+          annotationComposer: undefined,
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+    if (!composer.path) return { state, effects: [] };
     const item: ReviewFeedbackItem = {
       id: `feedback-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
       kind: composer.kind,
@@ -2629,6 +2963,52 @@ function readerLines(
         "",
       ]
     : [];
+  const selectedSourceLine = state.reader.sourceMap?.logicalLines[state.reader.sourceLineIndex];
+  const showFeedbackDraft = Boolean(
+    state.reader.sourceMap ||
+      state.reader.feedbackGeneralMessage !== "" ||
+      state.reader.markdownFeedbackItems.length > 0 ||
+      state.reader.feedbackHistory.length > 0,
+  );
+  const feedbackLines = showFeedbackDraft ? [
+    theme.accent(theme.styles.bold("FEEDBACK DRAFT")),
+    theme.muted(selectedSourceLine
+      ? `selected source row ${selectedSourceLine.sourceStart.line}: ${sanitizeTerminalText(selectedSourceLine.text.slice(0, 100))}`
+      : "no commentable source row"),
+    ...(state.reader.feedbackGeneralMessage === ""
+      ? []
+      : [`general · ${sanitizeTerminalText(state.reader.feedbackGeneralMessage)}`]),
+    ...state.reader.markdownFeedbackItems.map((item) =>
+      `[ ] ${item.intent} · ${sanitizeTerminalText(item.message)}`
+    ),
+    ...state.reader.feedbackHistory.flatMap((submission) => [
+      `saved · ${submission.id} · revision ${submission.documentRevision}${submission.documentRevision === state.reader!.document.revision ? " · current" : " · historical"} · ${submission.comments.length} comment${submission.comments.length === 1 ? "" : "s"}`,
+      ...(submission.generalMessage === undefined
+        ? []
+        : [`  general · ${sanitizeTerminalText(submission.generalMessage)}`]),
+      ...submission.comments.map((comment) =>
+        `  ${comment.intent} · ${sanitizeTerminalText(comment.message)} — ${sanitizeTerminalText(tuiStoredFeedbackAnchorLabel(comment))}`
+      ),
+    ]),
+    theme.muted("[/] select source row · f comment · g general feedback · s send"),
+    "",
+  ] : [];
+  const annotationLines = state.annotationComposer
+    ? [
+        theme.accent(`${state.annotationComposer.kind.toUpperCase()} · ${sanitizeTerminalText(state.annotationComposer.label ?? "selected source row")}`),
+        ...sanitizeTerminalText(state.annotationComposer.message || "_").split("\n"),
+        theme.muted("ctrl-d save comment · esc cancel"),
+        "",
+      ]
+    : [];
+  const feedbackComposerLines = state.feedbackComposer
+    ? [
+        theme.accent("GENERAL FEEDBACK"),
+        ...sanitizeTerminalText(state.feedbackComposer.message || "_").split("\n"),
+        theme.muted("ctrl-d save draft · esc cancel"),
+        "",
+      ]
+    : [];
   const composerLines = state.reviewComposer
     ? [
         theme.accent(
@@ -2642,7 +3022,10 @@ function readerLines(
   const all = [
     ...(warningLines.length > 0 ? [...warningLines, ""] : []),
     ...content,
+    ...(feedbackLines.length === 0 ? [] : ["", ...feedbackLines]),
     ...(reviewLines.length > 0 ? ["", ...reviewLines] : []),
+    ...annotationLines,
+    ...feedbackComposerLines,
     ...composerLines,
   ];
   const headerLength = state.message ? 4 : 3;
@@ -3068,7 +3451,52 @@ function allReviewFeedbackItems(state: TuiState): ReviewFeedbackItem[] {
     (request) => request.documentId === reader.document.id,
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
-  return [...(request?.response?.items ?? []), ...reader.feedbackItems];
+  const persisted = reader.feedbackHistory.length > 0
+    ? tuiStoredDiffFeedback(
+        reader.feedbackHistory.filter(
+          ({ documentRevision }) => documentRevision === reader.document.revision,
+        ),
+      )
+    : request?.response?.items ?? [];
+  return [...persisted, ...reader.feedbackItems];
+}
+
+function tuiStoredDiffFeedback(
+  submissions: readonly PublicFeedbackSubmission[],
+): ReviewFeedbackItem[] {
+  return submissions.flatMap((submission) => submission.comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  }));
+}
+
+function tuiStoredFeedbackAnchorLabel(
+  comment: PublicFeedbackSubmission["comments"][number],
+): string {
+  const anchor = comment.anchor;
+  if (anchor.kind === "markdown-v1") {
+    return anchor.start.line === anchor.end.line
+      ? `document line ${anchor.start.line}`
+      : `document lines ${anchor.start.line}-${anchor.end.line}`;
+  }
+  if (anchor.kind === "diff-file-v1") return anchor.path;
+  return anchor.endLine === undefined
+    ? `${anchor.path}:${anchor.line} (${anchor.side})`
+    : `${anchor.path}:${anchor.line}-${anchor.endLine} (${anchor.side})`;
 }
 
 function reviewFeedbackLines(
@@ -3084,9 +3512,20 @@ function reviewFeedbackLines(
     (request) => request.documentId === reader.document.id,
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
-  const persisted = request?.response?.items ?? [];
+  const persisted = reader.feedbackHistory.length > 0
+    ? tuiStoredDiffFeedback(
+        reader.feedbackHistory.filter(
+          ({ documentRevision }) => documentRevision === reader.document.revision,
+        ),
+      )
+    : request?.response?.items ?? [];
   const lines: string[] = [""];
-  if (persisted.length > 0 || reader.feedbackItems.length > 0) {
+  if (
+    persisted.length > 0 ||
+    reader.feedbackItems.length > 0 ||
+    reader.markdownFeedbackItems.length > 0 ||
+    reader.feedbackGeneralMessage !== ""
+  ) {
     lines.push(theme.accent(theme.styles.bold("FEEDBACK")));
     for (const item of persisted) {
       const anchor = feedbackAnchorLabel(item);
@@ -3095,6 +3534,12 @@ function reviewFeedbackLines(
     for (const item of reader.feedbackItems) {
       const anchor = feedbackAnchorLabel(item);
       lines.push(`[ ] ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
+    }
+    if (reader.feedbackGeneralMessage !== "") {
+      lines.push(`[ ] general · ${sanitizeTerminalText(reader.feedbackGeneralMessage)}`);
+    }
+    for (const item of reader.markdownFeedbackItems) {
+      lines.push(`[ ] ${item.intent} · ${sanitizeTerminalText(item.message)} — document text`);
     }
     lines.push("");
   }
@@ -3113,11 +3558,25 @@ function reviewFeedbackLines(
     );
   }
   if (state.annotationComposer) {
-    const anchor = feedbackAnchorLabel(state.annotationComposer);
+    const anchor = state.annotationComposer.label ??
+      (state.annotationComposer.path
+        ? feedbackAnchorLabel({
+            ...state.annotationComposer,
+            path: state.annotationComposer.path,
+          })
+        : "selected document text");
     lines.push(
       theme.accent(`${state.annotationComposer.kind.toUpperCase()} · ${sanitizeTerminalText(anchor)}`),
       ...sanitizeTerminalText(state.annotationComposer.message || "_").split("\n"),
       theme.muted("ctrl-d save note · esc cancel"),
+      "",
+    );
+  }
+  if (state.feedbackComposer) {
+    lines.push(
+      theme.accent("GENERAL FEEDBACK"),
+      ...sanitizeTerminalText(state.feedbackComposer.message || "_").split("\n"),
+      theme.muted("ctrl-d save draft · esc cancel"),
       "",
     );
   }
@@ -3133,9 +3592,9 @@ function reviewFeedbackLines(
       "",
     );
   }
-  if (!state.annotationComposer && !state.reviewComposer && request?.status === "pending") {
+  if (!state.annotationComposer && !state.feedbackComposer && !state.reviewComposer) {
     lines.push(theme.muted(
-      `j/k select line · v mark range · f line/range feedback · t file feedback for ${file.path} · c general note + request changes · z undo note`,
+      `j/k select line · v mark range · f line/range comment · t file comment for ${file.path} · g general feedback · s send · z undo`,
     ));
   }
   return lines;

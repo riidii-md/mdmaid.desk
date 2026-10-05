@@ -18,6 +18,10 @@ import {
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type FeedbackAnchor,
+  type FeedbackComment,
+  type FeedbackStoragePage,
+  type FeedbackSubmissionFilters,
   type Project,
   type RepositoryIdentity,
   type RepositoryInventoryItem,
@@ -25,6 +29,7 @@ import {
   type ReviewFeedbackItem,
   type ReviewResponse,
   type StoredDocument,
+  type StoredFeedbackSubmission,
   type StoredReviewRequest,
   type Space,
   type SpaceMatcher,
@@ -32,7 +37,7 @@ import {
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 9;
+export const SQLITE_SCHEMA_VERSION = 10;
 
 interface WorkspaceRow {
   id: string;
@@ -142,13 +147,43 @@ interface ReviewRequestRow {
 
 interface ReviewResponseRow {
   outcome: string;
-  message: string;
-  items_json: string | null;
+  feedback_id: string | null;
   created_at: string;
 }
 
 interface ReviewResponseWithIdRow extends ReviewResponseRow {
   review_request_id: string;
+}
+
+interface LegacyReviewResponseRow {
+  review_request_id: string;
+  outcome: string;
+  message: string;
+  items_json: string | null;
+  created_at: string;
+  document_id: string;
+  document_revision: number;
+  document_content_hash: string;
+}
+
+interface FeedbackSubmissionRow {
+  id: string;
+  document_id: string;
+  document_revision: number;
+  document_content_hash: string;
+  general_message: string | null;
+  review_request_id: string | null;
+  created_at: string;
+}
+
+interface FeedbackCommentRow {
+  submission_id: string;
+  id: string;
+  ordinal: number;
+  intent: string;
+  anchor_kind: string;
+  anchor_json: string;
+  message: string;
 }
 
 const INITIAL_SCHEMA = `
@@ -229,11 +264,31 @@ const INITIAL_SCHEMA = `
     created_at TEXT NOT NULL
   ) STRICT;
 
+  CREATE TABLE feedback_submissions (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+    document_content_hash TEXT NOT NULL,
+    general_message TEXT,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE feedback_comments (
+    submission_id TEXT NOT NULL REFERENCES feedback_submissions(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    intent TEXT NOT NULL CHECK (intent IN ('feedback', 'todo')),
+    anchor_kind TEXT NOT NULL CHECK (anchor_kind IN ('markdown-v1', 'diff-file-v1', 'diff-lines-v1')),
+    anchor_json TEXT NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (submission_id, id),
+    UNIQUE (submission_id, ordinal)
+  ) STRICT;
+
   CREATE TABLE review_responses (
     review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
     outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
-    message TEXT NOT NULL,
-    items_json TEXT,
+    feedback_id TEXT UNIQUE REFERENCES feedback_submissions(id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -275,6 +330,8 @@ const INITIAL_SCHEMA = `
     ON review_requests(document_id, created_at DESC);
   CREATE INDEX review_requests_status_idx
     ON review_requests(status, created_at DESC);
+  CREATE INDEX feedback_submissions_document_idx
+    ON feedback_submissions(document_id, document_revision, created_at DESC, id DESC);
 `;
 
 const DOCUMENT_SELECT = `SELECT d.*,
@@ -877,6 +934,119 @@ export class SqliteCatalogStorage implements CatalogStorage {
     });
   }
 
+  listFeedbackSubmissions(
+    filters: FeedbackSubmissionFilters,
+    page: FeedbackStoragePage,
+    scope: ContentScope = {},
+  ): StoredFeedbackSubmission[] {
+    if (
+      !/^doc-[a-f0-9]{20}$/.test(filters.documentId) ||
+      (filters.documentRevision !== undefined &&
+        !isPositiveInteger(filters.documentRevision)) ||
+      !Number.isSafeInteger(page.limit) ||
+      page.limit < 1 ||
+      page.limit > 101 ||
+      (page.before !== undefined &&
+        (!isDate(page.before.createdAt) ||
+          !/^feedback-[a-f0-9]{20}$/.test(page.before.id)))
+    ) {
+      throw new Error("invalid feedback page query");
+    }
+    const clauses = ["fs.document_id = ?"];
+    const parameters: Array<string | number> = [filters.documentId];
+    if (filters.documentRevision !== undefined) {
+      clauses.push("fs.document_revision = ?");
+      parameters.push(filters.documentRevision);
+    }
+    if (page.before !== undefined) {
+      clauses.push("(fs.created_at < ? OR (fs.created_at = ? AND fs.id < ?))");
+      parameters.push(
+        page.before.createdAt,
+        page.before.createdAt,
+        page.before.id,
+      );
+    }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
+    parameters.push(page.limit);
+    const rows = this.#database
+      .prepare<Array<string | number>, FeedbackSubmissionRow>(
+        `SELECT fs.*, rr.review_request_id
+         FROM feedback_submissions fs
+         JOIN documents d ON d.id = fs.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY fs.created_at DESC, fs.id DESC
+         LIMIT ?`,
+      )
+      .all(...parameters);
+    return this.#mapFeedbackSubmissions(rows);
+  }
+
+  getFeedbackSubmission(
+    id: string,
+    scope: ContentScope = {},
+  ): StoredFeedbackSubmission | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
+    const row = this.#database
+      .prepare<string[], FeedbackSubmissionRow>(
+        `SELECT fs.*, rr.review_request_id
+         FROM feedback_submissions fs
+         JOIN documents d ON d.id = fs.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+         WHERE fs.id = ?${scoped}`,
+      )
+      .get(...parameters);
+    return row ? this.#mapFeedbackSubmission(row) : undefined;
+  }
+
+  saveFeedbackSubmission(submission: StoredFeedbackSubmission): boolean {
+    validateFeedbackSubmission(submission);
+    return this.transaction(() => {
+      const result = this.#database
+        .prepare(
+          `INSERT INTO feedback_submissions (
+             id, document_id, document_revision, document_content_hash,
+             general_message, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO NOTHING`,
+        )
+        .run(
+          submission.id,
+          submission.documentId,
+          submission.documentRevision,
+          submission.documentContentHash,
+          submission.generalMessage ?? null,
+          submission.createdAt,
+        );
+      if (result.changes === 0) return false;
+      const saveComment = this.#database.prepare(
+        `INSERT INTO feedback_comments (
+           submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const [ordinal, comment] of submission.comments.entries()) {
+        saveComment.run(
+          submission.id,
+          comment.id,
+          ordinal,
+          comment.intent,
+          comment.anchor.kind,
+          JSON.stringify(comment.anchor),
+          comment.message,
+        );
+      }
+      return true;
+    });
+  }
+
   listReviewRequests(
     filters: ReviewRequestFilters = {},
     scope: ContentScope = {},
@@ -947,7 +1117,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
       .run(request);
   }
 
-  completeReviewRequest(request: StoredReviewRequest): boolean {
+  completeReviewRequest(
+    request: StoredReviewRequest,
+    feedback?: StoredFeedbackSubmission,
+  ): boolean {
     if (request.response === null) {
       throw new Error("completed review request requires a response");
     }
@@ -966,17 +1139,26 @@ export class SqliteCatalogStorage implements CatalogStorage {
       if (result.changes !== 1) {
         return false;
       }
+      const linkedFeedback = feedback ?? feedbackFromReviewResponse(request, response);
+      if (linkedFeedback !== undefined) {
+        const created = this.saveFeedbackSubmission(linkedFeedback);
+        if (!created) {
+          const existing = this.getFeedbackSubmission(linkedFeedback.id);
+          if (!existing || !sameStoredFeedback(existing, linkedFeedback)) {
+            throw new Error("review feedback id conflicts with stored feedback");
+          }
+        }
+      }
       this.#database
         .prepare(
           `INSERT INTO review_responses (
-             review_request_id, outcome, message, items_json, created_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+             review_request_id, outcome, feedback_id, created_at
+           ) VALUES (?, ?, ?, ?)`,
         )
         .run(
           request.id,
           response.outcome,
-          response.message,
-          response.items === undefined ? null : JSON.stringify(response.items),
+          linkedFeedback?.id ?? null,
           response.createdAt,
         );
       return true;
@@ -1038,6 +1220,59 @@ export class SqliteCatalogStorage implements CatalogStorage {
       tagsByDocument.get(row.id) ?? [],
       sourceLinksByDocument.get(row.id) ?? [],
     ));
+  }
+
+  #mapFeedbackSubmissions(
+    rows: FeedbackSubmissionRow[],
+  ): StoredFeedbackSubmission[] {
+    if (rows.length === 0) return [];
+    const commentRows = this.#database
+      .prepare<[string], FeedbackCommentRow>(
+        `SELECT submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         FROM feedback_comments
+         WHERE submission_id IN (SELECT value FROM json_each(?))
+         ORDER BY submission_id, ordinal`,
+      )
+      .all(JSON.stringify(rows.map(({ id }) => id)));
+    const comments = new Map<string, FeedbackCommentRow[]>();
+    for (const row of commentRows) {
+      const submissionComments = comments.get(row.submission_id) ?? [];
+      submissionComments.push(row);
+      comments.set(row.submission_id, submissionComments);
+    }
+    return rows.map((row) =>
+      this.#mapFeedbackSubmission(row, comments.get(row.id) ?? [])
+    );
+  }
+
+  #mapFeedbackSubmission(
+    row: FeedbackSubmissionRow,
+    providedComments?: FeedbackCommentRow[],
+  ): StoredFeedbackSubmission {
+    const commentRows = providedComments ?? this.#database
+      .prepare<[string], FeedbackCommentRow>(
+        `SELECT submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         FROM feedback_comments
+         WHERE submission_id = ? ORDER BY ordinal`,
+      )
+      .all(row.id);
+    const comments = commentRows.map(mapFeedbackCommentRow);
+    const submission: StoredFeedbackSubmission = {
+      id: row.id,
+      documentId: row.document_id,
+      documentRevision: row.document_revision,
+      documentContentHash: row.document_content_hash,
+      ...(row.general_message === null
+        ? {}
+        : { generalMessage: row.general_message }),
+      comments,
+      ...(row.review_request_id === null
+        ? {}
+        : { reviewRequestId: row.review_request_id }),
+      createdAt: row.created_at,
+    };
+    validateFeedbackSubmission(submission);
+    return submission;
   }
 
   #mapDocument(
@@ -1107,7 +1342,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
     }
     const responseRows = this.#database
       .prepare<[string], ReviewResponseWithIdRow>(
-        `SELECT review_request_id, outcome, message, items_json, created_at
+        `SELECT review_request_id, outcome, feedback_id, created_at
          FROM review_responses
          WHERE review_request_id IN (SELECT value FROM json_each(?))`,
       )
@@ -1127,16 +1362,32 @@ export class SqliteCatalogStorage implements CatalogStorage {
     const responseRow = providedResponseRow === undefined
       ? this.#database
           .prepare<[string], ReviewResponseRow>(
-            `SELECT outcome, message, items_json, created_at
+            `SELECT outcome, feedback_id, created_at
              FROM review_responses WHERE review_request_id = ?`,
           )
           .get(row.id)
       : providedResponseRow;
+    const linkedFeedback = responseRow?.feedback_id === null || !responseRow
+      ? undefined
+      : this.#database
+          .prepare<[string], FeedbackSubmissionRow>(
+            `SELECT fs.*, rr.review_request_id
+             FROM feedback_submissions fs
+             LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+             WHERE fs.id = ?`,
+          )
+          .get(responseRow.feedback_id);
+    const storedFeedback = linkedFeedback
+      ? this.#mapFeedbackSubmission(linkedFeedback)
+      : undefined;
     const response: ReviewResponse | null = responseRow
       ? {
           outcome: responseRow.outcome as ReviewResponse["outcome"],
-          message: responseRow.message,
-          ...parseReviewFeedbackItems(responseRow.items_json),
+          message: storedFeedback?.generalMessage ?? "",
+          ...projectReviewFeedbackItems(storedFeedback?.comments ?? []),
+          ...(storedFeedback === undefined
+            ? {}
+            : { feedbackId: storedFeedback.id }),
           createdAt: responseRow.created_at,
         }
       : null;
@@ -1414,6 +1665,205 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 9");
     })();
   }
+  if (rawVersion < 10) {
+    database.transaction(() => {
+      const legacyResponses = database
+        .prepare<[], LegacyReviewResponseRow>(
+          `SELECT rr.review_request_id, rr.outcome, rr.message, rr.items_json,
+                  rr.created_at, rq.document_id, rq.document_revision,
+                  rq.document_content_hash
+           FROM review_responses rr
+           JOIN review_requests rq ON rq.id = rr.review_request_id
+           ORDER BY rr.review_request_id`,
+        )
+        .all();
+      const normalized = legacyResponses.map((row) => {
+        if (
+          !isReviewOutcome(row.outcome) ||
+          !isValidReviewMessage(row.message) ||
+          !isDate(row.created_at) ||
+          !/^review-[a-f0-9]{20}$/.test(row.review_request_id) ||
+          !/^doc-[a-f0-9]{20}$/.test(row.document_id) ||
+          !isPositiveInteger(row.document_revision) ||
+          !/^[a-f0-9]{64}$/.test(row.document_content_hash)
+        ) {
+          throw new Error(`invalid legacy review response ${row.review_request_id}`);
+        }
+        const { items } = parseReviewFeedbackItems(row.items_json);
+        return { row, items: items ?? [] };
+      });
+
+      database.exec(
+        `CREATE TABLE feedback_submissions (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           general_message TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE feedback_comments (
+           submission_id TEXT NOT NULL REFERENCES feedback_submissions(id) ON DELETE CASCADE,
+           id TEXT NOT NULL,
+           ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+           intent TEXT NOT NULL CHECK (intent IN ('feedback', 'todo')),
+           anchor_kind TEXT NOT NULL CHECK (anchor_kind IN ('markdown-v1', 'diff-file-v1', 'diff-lines-v1')),
+           anchor_json TEXT NOT NULL,
+           message TEXT NOT NULL,
+           PRIMARY KEY (submission_id, id),
+           UNIQUE (submission_id, ordinal)
+         ) STRICT;
+         CREATE TABLE review_responses_v10 (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
+           feedback_id TEXT UNIQUE REFERENCES feedback_submissions(id) ON DELETE RESTRICT,
+           created_at TEXT NOT NULL
+         ) STRICT;`,
+      );
+
+      const saveSubmission = database.prepare(
+        `INSERT INTO feedback_submissions (
+           id, document_id, document_revision, document_content_hash,
+           general_message, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      const saveComment = database.prepare(
+        `INSERT INTO feedback_comments (
+           submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const saveResponse = database.prepare(
+        `INSERT INTO review_responses_v10 (
+           review_request_id, outcome, feedback_id, created_at
+         ) VALUES (?, ?, ?, ?)`,
+      );
+
+      for (const { row, items } of normalized) {
+        const hasMessage = row.message.trim() !== "";
+        const feedbackId = hasMessage || items.length > 0
+          ? legacyFeedbackId(row.review_request_id)
+          : null;
+        if (feedbackId !== null) {
+          saveSubmission.run(
+            feedbackId,
+            row.document_id,
+            row.document_revision,
+            row.document_content_hash,
+            hasMessage ? row.message : null,
+            row.created_at,
+          );
+          for (const [ordinal, item] of items.entries()) {
+            const anchor: FeedbackAnchor = item.line === undefined
+              ? { kind: "diff-file-v1", path: item.path }
+              : {
+                  kind: "diff-lines-v1",
+                  path: item.path,
+                  hunkId: item.hunkId!,
+                  side: item.side!,
+                  line: item.line,
+                  ...(item.endLine === undefined
+                    ? {}
+                    : { endLine: item.endLine }),
+                };
+            saveComment.run(
+              feedbackId,
+              item.id,
+              ordinal,
+              item.kind,
+              anchor.kind,
+              JSON.stringify(anchor),
+              item.message,
+            );
+          }
+        }
+        saveResponse.run(
+          row.review_request_id,
+          row.outcome,
+          feedbackId,
+          row.created_at,
+        );
+      }
+
+      database.exec(
+        `DROP TABLE review_responses;
+         ALTER TABLE review_responses_v10 RENAME TO review_responses;
+         CREATE INDEX feedback_submissions_document_idx
+           ON feedback_submissions(document_id, document_revision, created_at DESC, id DESC);`,
+      );
+      database.pragma("user_version = 10");
+    })();
+  }
+}
+
+function feedbackFromReviewResponse(
+  request: StoredReviewRequest,
+  response: ReviewResponse,
+): StoredFeedbackSubmission | undefined {
+  const items = response.items ?? [];
+  const hasMessage = response.message.trim() !== "";
+  if (!hasMessage && items.length === 0) return undefined;
+  return {
+    id: response.feedbackId ?? legacyFeedbackId(request.id),
+    documentId: request.documentId,
+    documentRevision: request.documentRevision,
+    documentContentHash: request.documentContentHash,
+    ...(hasMessage ? { generalMessage: response.message } : {}),
+    comments: items.map((item): FeedbackComment => ({
+      id: item.id,
+      intent: item.kind,
+      anchor: item.line === undefined
+        ? { kind: "diff-file-v1", path: item.path }
+        : {
+            kind: "diff-lines-v1",
+            path: item.path,
+            hunkId: item.hunkId!,
+            side: item.side!,
+            line: item.line,
+            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          },
+      message: item.message,
+    })),
+    createdAt: response.createdAt,
+  };
+}
+
+function projectReviewFeedbackItems(
+  comments: readonly FeedbackComment[],
+): { items?: ReviewFeedbackItem[] } {
+  const items = comments.flatMap((comment): ReviewFeedbackItem[] => {
+    if (comment.anchor.kind === "markdown-v1") return [];
+    if (comment.anchor.kind === "diff-file-v1") {
+      return [{
+        id: comment.id.replace(/^comment-/, "feedback-"),
+        kind: comment.intent,
+        path: comment.anchor.path,
+        message: comment.message,
+      }];
+    }
+    if (comment.intent === "todo") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: comment.anchor.path,
+      hunkId: comment.anchor.hunkId,
+      side: comment.anchor.side,
+      line: comment.anchor.line,
+      ...(comment.anchor.endLine === undefined
+        ? {}
+        : { endLine: comment.anchor.endLine }),
+      message: comment.message,
+    }];
+  });
+  return items.length === 0 ? {} : { items };
+}
+
+function sameStoredFeedback(
+  left: StoredFeedbackSubmission,
+  right: StoredFeedbackSubmission,
+): boolean {
+  const { reviewRequestId: _leftReview, ...leftComparable } = left;
+  const { reviewRequestId: _rightReview, ...rightComparable } = right;
+  return JSON.stringify(leftComparable) === JSON.stringify(rightComparable);
 }
 
 function validateSpaceRow(
@@ -1506,6 +1956,14 @@ function projectId(repositoryKey: string, taskKey: string): string {
   return `project-${hash}`;
 }
 
+function legacyFeedbackId(reviewRequestId: string): string {
+  return `feedback-${createHash("sha256")
+    .update("review-feedback\0")
+    .update(reviewRequestId)
+    .digest("hex")
+    .slice(0, 20)}`;
+}
+
 function validateDocumentRow(
   row: DocumentRow,
   tags: string[],
@@ -1553,6 +2011,160 @@ function validateDocumentRow(
   }
 }
 
+function mapFeedbackCommentRow(row: FeedbackCommentRow): FeedbackComment {
+  let anchor: unknown;
+  try {
+    anchor = JSON.parse(row.anchor_json);
+  } catch {
+    throw new Error(`invalid stored feedback comment ${row.id}`);
+  }
+  const comment = {
+    id: row.id,
+    intent: row.intent,
+    anchor,
+    message: row.message,
+  };
+  if (
+    !Number.isSafeInteger(row.ordinal) ||
+    row.ordinal < 0 ||
+    !isValidFeedbackComment(comment) ||
+    comment.anchor.kind !== row.anchor_kind
+  ) {
+    throw new Error(`invalid stored feedback comment ${row.id}`);
+  }
+  return structuredClone(comment) as FeedbackComment;
+}
+
+function validateFeedbackSubmission(submission: StoredFeedbackSubmission): void {
+  if (
+    !/^feedback-[a-f0-9]{20}$/.test(submission.id) ||
+    !/^doc-[a-f0-9]{20}$/.test(submission.documentId) ||
+    !isPositiveInteger(submission.documentRevision) ||
+    !/^[a-f0-9]{64}$/.test(submission.documentContentHash) ||
+    (submission.generalMessage !== undefined &&
+      (!isValidFeedbackMessage(submission.generalMessage, 16 * 1024) ||
+        submission.generalMessage.trim() === "")) ||
+    !Array.isArray(submission.comments) ||
+    submission.comments.length > 32 ||
+    (submission.generalMessage === undefined && submission.comments.length === 0) ||
+    !submission.comments.every(isValidFeedbackComment) ||
+    new Set(submission.comments.map(({ id }) => id)).size !==
+      submission.comments.length ||
+    (submission.reviewRequestId !== undefined &&
+      !/^review-[a-f0-9]{20}$/.test(submission.reviewRequestId)) ||
+    !isDate(submission.createdAt)
+  ) {
+    throw new Error(`invalid feedback submission ${submission.id}`);
+  }
+}
+
+function isValidFeedbackComment(value: unknown): value is FeedbackComment {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const comment = value as Record<string, unknown>;
+  return Object.keys(comment).every((key) =>
+    ["id", "intent", "anchor", "message"].includes(key)
+  ) &&
+    typeof comment.id === "string" &&
+    /^(?:comment|feedback)-[a-f0-9]{20}$/.test(comment.id) &&
+    (comment.intent === "feedback" || comment.intent === "todo") &&
+    isValidFeedbackAnchor(comment.anchor) &&
+    typeof comment.message === "string" &&
+    comment.message.trim() !== "" &&
+    isValidFeedbackMessage(comment.message, 512);
+}
+
+function isValidFeedbackAnchor(value: unknown): value is FeedbackAnchor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const anchor = value as Record<string, unknown>;
+  if (anchor.kind === "markdown-v1") {
+    return hasOnlyRecordKeys(anchor, [
+      "kind",
+      "start",
+      "end",
+      "exact",
+      "prefix",
+      "suffix",
+    ]) &&
+      isValidMarkdownSourcePoint(anchor.start) &&
+      isValidMarkdownSourcePoint(anchor.end) &&
+      anchor.end.offset > anchor.start.offset &&
+      typeof anchor.exact === "string" &&
+      anchor.exact.length > 0 &&
+      anchor.exact.length <= 4_096 &&
+      typeof anchor.prefix === "string" &&
+      anchor.prefix.length <= 128 &&
+      typeof anchor.suffix === "string" &&
+      anchor.suffix.length <= 128 &&
+      isValidFeedbackMessage(anchor.exact, 4_096) &&
+      isValidFeedbackMessage(anchor.prefix, 128) &&
+      isValidFeedbackMessage(anchor.suffix, 128);
+  }
+  if (anchor.kind === "diff-file-v1") {
+    return hasOnlyRecordKeys(anchor, ["kind", "path"]) &&
+      typeof anchor.path === "string" &&
+      anchor.path.length <= 1_024 &&
+      isSafeFeedbackPath(anchor.path);
+  }
+  if (anchor.kind === "diff-lines-v1") {
+    return hasOnlyRecordKeys(anchor, [
+      "kind",
+      "path",
+      "hunkId",
+      "side",
+      "line",
+      "endLine",
+    ]) &&
+      typeof anchor.path === "string" &&
+      anchor.path.length <= 1_024 &&
+      isSafeFeedbackPath(anchor.path) &&
+      typeof anchor.hunkId === "string" &&
+      /^hunk-[a-f0-9]{16,64}$/.test(anchor.hunkId) &&
+      (anchor.side === "old" || anchor.side === "new") &&
+      typeof anchor.line === "number" &&
+      isPositiveInteger(anchor.line) &&
+      (anchor.endLine === undefined ||
+        (typeof anchor.endLine === "number" &&
+          isPositiveInteger(anchor.endLine) &&
+          anchor.endLine >= anchor.line));
+  }
+  return false;
+}
+
+function isValidMarkdownSourcePoint(value: unknown): value is {
+  offset: number;
+  line: number;
+  column: number;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const point = value as Record<string, unknown>;
+  return hasOnlyRecordKeys(point, ["offset", "line", "column"]) &&
+    typeof point.offset === "number" &&
+    Number.isSafeInteger(point.offset) &&
+    point.offset >= 0 &&
+    typeof point.line === "number" &&
+    isPositiveInteger(point.line) &&
+    typeof point.column === "number" &&
+    isPositiveInteger(point.column);
+}
+
+function hasOnlyRecordKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isValidFeedbackMessage(value: string, maximum: number): boolean {
+  return value.length <= maximum &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+
 function validateReviewRequestRow(
   row: ReviewRequestRow,
   response: ReviewResponse | null,
@@ -1574,9 +2186,7 @@ function validateReviewRequestRow(
       (!isReviewOutcome(response.outcome) ||
         !isValidReviewMessage(response.message) ||
         (response.items !== undefined &&
-          ((response.outcome !== "changes_requested" &&
-              response.outcome !== "approved") ||
-            !response.items.every(isValidReviewFeedbackItem))) ||
+          !response.items.every(isValidReviewFeedbackItem)) ||
         !isDate(response.createdAt) ||
         response.outcome !== row.status))
   ) {

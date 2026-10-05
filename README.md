@@ -32,6 +32,8 @@ The repository contains the first usable shared-service vertical slice:
 - Server-Sent Event refreshes for both clients;
 - explicit revision-bound human review requests with durable request/response
   text and conditional web/TUI actions;
+- durable feedback on every document, including general notes, selected
+  Markdown text, and native diff file/line/range comments;
 - first-class change-review documents with a dedicated terminal Changes space
   and revision-bound implementation decisions;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
@@ -39,10 +41,10 @@ The repository contains the first usable shared-service vertical slice:
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
 - stable port-80 default with explicit alternate ports for isolated testing;
-- `workspace`, `validate`, `register`, `import`, `review`, `list`, `web`, `tui`,
-  and `daemon` commands.
+- `workspace`, `validate`, `register`, `import`, `review`, `feedback`, `list`,
+  `web`, `tui`, and `daemon` commands.
 
-Stdin import, comments, and editing remain planned milestones. Document
+Stdin import and editing remain planned milestones. Document
 registration works without a daemon, but automatically
 uses its authenticated API when one is running. `web` reuses a daemon or runs
 the service in the foreground; `tui` attaches to it when present and uses a
@@ -60,6 +62,7 @@ session-scoped embedded loopback service otherwise.
 - local CLI and API access;
 - attention metadata;
 - explicit local human-review requests and their durable responses;
+- document feedback with stable IDs, routes, API reads, and CLI reads;
 - presentation security boundaries.
 
 It does not own:
@@ -213,6 +216,17 @@ mdmaid-desk review wait review-0123456789abcdefabcd --json
 mdmaid-desk review respond review-0123456789abcdefabcd \
   --outcome changes_requested \
   --message "Add a restore verification step."
+```
+
+Feedback does not require a review request and never changes decision state.
+Agents can retrieve a submission by stable ID or enumerate a document revision:
+
+```bash
+mdmaid-desk feedback show feedback-0123456789abcdefabcd --json
+mdmaid-desk feedback list \
+  --document doc-0123456789abcdefabcd \
+  --revision 3 \
+  --json
 ```
 
 Import a durable copy when the original file may disappear (for example, an
@@ -381,6 +395,12 @@ Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for
 Approve, Request changes, or Reject. The response composer uses `Enter` for a
 newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
+Feedback remains available whether or not a decision is pending. In a document
+reader, use `[`/`]` to choose a source row, `f` to comment on it, `g` for a
+general note, and `s` to submit. Native diffs use `f` for a line/range and `t`
+for a file comment. The browser exposes the same operations through text
+selection and visible `+` controls.
+
 Press `c` from the terminal queue to switch between Docs and Change reviews.
 This content mode is independent from the Actions filter, so “Waiting for you”
 can narrow either mode.
@@ -421,13 +441,11 @@ and press `f` to comment on a same-side range. Use `t` to add file feedback and
 `z` to undo the most recent unsent note. In the browser, click a visible `+` or
 Shift-click another same-side line to select a range. Anchored comments appear
 inline beside the related diff and in the feedback summary. They become durable
-structured response items when Approve or Request Changes
-is submitted, alongside a separate general note. Approval records them as
-non-blocking comments. Browser drafts survive reload and can be edited or
-removed before submission. `review wait --json` returns their file paths,
-stable hunk IDs, optional line, range end, and side, kinds, and messages. Open
-notes prevent accidental Reject or
-Supersede actions. The review surface is intentionally read-only:
+structured feedback when sent directly. If a decision is pending, the same
+draft can be stored atomically with that decision. Browser drafts survive
+reload and can be edited or removed before submission. Feedback has its own
+stable `/f/:id` route and can be fetched through the API or `feedback` CLI.
+The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings
 cannot be approved; the human can still Request Changes or Reject them.
@@ -481,6 +499,7 @@ Document registration and presentation never imply workflow approval.
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
 - [Human review requests](docs/REVIEW_REQUESTS.md)
+- [Document feedback](docs/DOCUMENT_FEEDBACK.md)
 - [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

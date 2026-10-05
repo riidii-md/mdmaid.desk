@@ -25,12 +25,18 @@ import {
 } from "node:path";
 
 import {
+  createMarkdownSourceMap,
+  resolveMarkdownSelection,
+  type MarkdownSelectionWitnessV1,
+} from "mdmaid";
+import {
   isAttention,
   isDocumentKind,
   isReviewKind,
   isReviewOutcome,
   isReviewStatus,
   presentDocument,
+  presentFeedbackSubmission,
   presentReviewRequest,
   projectDisplayName,
   type Attention,
@@ -40,6 +46,12 @@ import {
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type DiffFileFeedbackAnchor,
+  type DiffLinesFeedbackAnchor,
+  type FeedbackAnchor,
+  type FeedbackComment,
+  type FeedbackCommentIntent,
+  type FeedbackSubmission,
   type Project,
   type RepositoryInventoryItem,
   type RepositoryIdentity,
@@ -51,6 +63,7 @@ import {
   type ReviewResponse,
   type StoredReviewRequest,
   type StoredDocument,
+  type StoredFeedbackSubmission,
   type Space,
   type SpaceMatcher,
   type Workspace,
@@ -59,6 +72,10 @@ import { SqliteCatalogStorage } from "./sqlite-storage.js";
 import type { CatalogStorage } from "./storage.js";
 import { syncDirectory } from "./fs-durability.js";
 import { assertValidMermaidMarkdown } from "./mermaid-validation.js";
+import {
+  parseChangeReviewDiffs,
+  type ChangeReviewDiff,
+} from "./change-review.js";
 import {
   discoverDocumentSourceLinks,
   isSafeWorkspacePath,
@@ -72,6 +89,10 @@ export type {
   DocumentKind,
   DocumentSourceLink,
   DocumentStorage,
+  FeedbackAnchor,
+  FeedbackComment,
+  FeedbackCommentIntent,
+  FeedbackSubmission,
   ContentScope,
   ReadingStatus,
   ReviewKind,
@@ -199,6 +220,46 @@ export interface RespondToReviewRequestInput {
   outcome: ReviewOutcome;
   message: string;
   items?: ReviewFeedbackItem[];
+  feedback?: CreateFeedbackInput;
+}
+
+export interface MarkdownFeedbackSelectionInput {
+  kind: "markdown-selection-v1";
+  start: { ref: string; offset: number };
+  end: { ref: string; offset: number };
+}
+
+export type FeedbackAnchorInput =
+  | MarkdownFeedbackSelectionInput
+  | DiffFileFeedbackAnchor
+  | DiffLinesFeedbackAnchor;
+
+export interface CreateFeedbackCommentInput {
+  id: string;
+  intent: FeedbackCommentIntent;
+  anchor: FeedbackAnchorInput;
+  message: string;
+}
+
+export interface CreateFeedbackInput {
+  id: string;
+  documentId: string;
+  documentRevision: number;
+  sourceWitness?: string;
+  generalMessage?: string;
+  comments: CreateFeedbackCommentInput[];
+}
+
+export interface ListFeedbackInput {
+  documentId: string;
+  documentRevision?: number;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface FeedbackPage {
+  items: FeedbackSubmission[];
+  nextCursor?: string;
 }
 
 export interface DocumentSource {
@@ -264,6 +325,13 @@ export class ReviewConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ReviewConflictError";
+  }
+}
+
+export class FeedbackConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FeedbackConflictError";
   }
 }
 
@@ -493,6 +561,192 @@ export class Catalog {
         );
   }
 
+  getFeedback(
+    id: string,
+    scope: ContentScope = {},
+  ): FeedbackSubmission | undefined {
+    validateFeedbackId(id);
+    const submission = this.#storage.getFeedbackSubmission(
+      id,
+      this.#resolveScope(scope),
+    );
+    return submission ? presentFeedbackSubmission(submission) : undefined;
+  }
+
+  feedbackSourceWitness(
+    documentId: string,
+    scope: ContentScope = {},
+  ): string {
+    validateDocumentId(documentId);
+    const document = this.#storage.getDocument(
+      documentId,
+      this.#resolveScope(scope),
+    );
+    if (!document) throw new Error(`unknown document ${documentId}`);
+    return feedbackSourceWitness(document);
+  }
+
+  listFeedback(
+    input: ListFeedbackInput,
+    scope: ContentScope = {},
+  ): FeedbackPage {
+    const validated = validateListFeedbackInput(input);
+    const resolvedScope = this.#resolveScope(scope);
+    if (!this.#storage.getDocument(validated.documentId, resolvedScope)) {
+      throw new Error(`unknown document ${validated.documentId}`);
+    }
+    const limit = validated.limit ?? 50;
+    const rows = this.#storage.listFeedbackSubmissions(
+      {
+        documentId: validated.documentId,
+        ...(validated.documentRevision === undefined
+          ? {}
+          : { documentRevision: validated.documentRevision }),
+      },
+      {
+        limit: limit + 1,
+        ...(validated.cursor === undefined
+          ? {}
+          : { before: decodeFeedbackCursor(validated.cursor) }),
+      },
+      resolvedScope,
+    );
+    const hasMore = rows.length > limit;
+    const visible = rows.slice(0, limit);
+    const last = visible.at(-1);
+    return {
+      items: visible.map(presentFeedbackSubmission),
+      ...(hasMore && last
+        ? { nextCursor: encodeFeedbackCursor(last.createdAt, last.id) }
+        : {}),
+    };
+  }
+
+  async createFeedback(
+    input: CreateFeedbackInput,
+    scope: ContentScope = {},
+  ): Promise<FeedbackSubmission> {
+    const validated = validateCreateFeedbackInput(input);
+    const resolvedScope = this.#resolveScope(scope);
+    const initialDocument = this.#storage.getDocument(
+      validated.documentId,
+      resolvedScope,
+    );
+    if (!initialDocument) {
+      throw new Error(`unknown document ${validated.documentId}`);
+    }
+    if (initialDocument.revision !== validated.documentRevision) {
+      throw new FeedbackConflictError("document revision changed");
+    }
+    if (
+      validated.comments.length > 0 &&
+      validated.sourceWitness !== feedbackSourceWitness(initialDocument)
+    ) {
+      throw new FeedbackConflictError("feedback source witness changed");
+    }
+
+    const hasAnchors = validated.comments.length > 0;
+    let inspected: InspectedDocument | undefined;
+    try {
+      inspected = await this.#inspectStoredDocument(initialDocument);
+    } catch {
+      if (
+        hasAnchors ||
+        (initialDocument.missingAt === null && initialDocument.archivedAt === null)
+      ) {
+        throw new FeedbackConflictError(
+          "document source is unavailable for anchored feedback",
+        );
+      }
+    }
+    if (
+      inspected !== undefined &&
+      inspected.contentHash !== initialDocument.contentHash
+    ) {
+      throw new FeedbackConflictError(
+        "document content changed; re-register before feedback",
+      );
+    }
+    if (hasAnchors && inspected === undefined) {
+      throw new FeedbackConflictError(
+        "document source is unavailable for anchored feedback",
+      );
+    }
+
+    const markdown = inspected?.content.toString("utf8");
+    const sourceMap = markdown === undefined
+      ? undefined
+      : await createMarkdownSourceMap(markdown, {
+          ...(initialDocument.kind === "change-review"
+            ? { omitFencedCodeLanguages: ["diff"] }
+            : {}),
+        });
+    const diff = markdown !== undefined && initialDocument.kind === "change-review"
+      ? parseChangeReviewDiffs(markdown)
+      : undefined;
+    const comments = validated.comments.map((comment): FeedbackComment => ({
+      id: comment.id,
+      intent: comment.intent,
+      anchor: resolveFeedbackAnchor(
+        comment.anchor,
+        markdown,
+        sourceMap,
+        diff,
+      ),
+      message: comment.message,
+    }));
+    const candidate: StoredFeedbackSubmission = {
+      id: validated.id,
+      documentId: initialDocument.id,
+      documentRevision: initialDocument.revision,
+      documentContentHash: initialDocument.contentHash,
+      ...(validated.generalMessage === undefined
+        ? {}
+        : { generalMessage: validated.generalMessage }),
+      comments,
+      createdAt: new Date().toISOString(),
+    };
+
+    const result = this.#storage.transaction(() => {
+      const document = this.#storage.getDocument(
+        validated.documentId,
+        resolvedScope,
+      );
+      if (
+        !document ||
+        document.revision !== initialDocument.revision ||
+        document.contentHash !== initialDocument.contentHash ||
+        (inspected !== undefined && document.contentHash !== inspected.contentHash)
+      ) {
+        throw new FeedbackConflictError("document revision changed");
+      }
+      const existing = this.#storage.getFeedbackSubmission(
+        candidate.id,
+        resolvedScope,
+      );
+      if (existing) {
+        if (sameFeedbackPayload(existing, candidate)) {
+          return { submission: existing, changed: false };
+        }
+        throw new FeedbackConflictError(
+          "feedback id already has different content",
+        );
+      }
+      if (!this.#storage.saveFeedbackSubmission(candidate)) {
+        const winner = this.#storage.getFeedbackSubmission(candidate.id);
+        if (winner && sameFeedbackPayload(winner, candidate)) {
+          return { submission: winner, changed: false };
+        }
+        throw new FeedbackConflictError(
+          "feedback id already has different content",
+        );
+      }
+      return { submission: candidate, changed: true };
+    });
+    if (result.changed) this.#emitInvalidation();
+    return presentFeedbackSubmission(result.submission);
+  }
+
   listReviewRequests(
     filters: ReviewRequestFilters = {},
     scope: ContentScope = {},
@@ -643,7 +897,7 @@ export class Catalog {
     if (!initial) {
       throw new Error(`unknown review request ${id}`);
     }
-    if (initial.response !== null) {
+    if (initial.response !== null && validated.feedback === undefined) {
       if (
         initial.response.outcome === validated.outcome &&
         sameReviewResponse(initial.response, validated)
@@ -669,11 +923,17 @@ export class Catalog {
       initialDocument.contentHash !== initial.documentContentHash ||
       initialDocument.missingAt !== null
     ) {
+      if (initial.response !== null) {
+        throw new ReviewConflictError(
+          "review request already has a different response",
+        );
+      }
       this.#staleReviewRequest(id, resolvedScope);
       throw new ReviewConflictError("review request is stale");
     }
+    let inspected: InspectedDocument;
     try {
-      const inspected = await this.#inspectStoredDocument(initialDocument);
+      inspected = await this.#inspectStoredDocument(initialDocument);
       if (inspected.contentHash !== initial.documentContentHash) {
         this.#staleReviewRequest(id, resolvedScope);
         throw new ReviewConflictError("review request is stale");
@@ -689,6 +949,54 @@ export class Catalog {
       throw new ReviewConflictError("review request is stale");
     }
 
+    let linkedFeedback: StoredFeedbackSubmission | undefined;
+    if (validated.feedback !== undefined) {
+      if (
+        validated.feedback.documentId !== initial.documentId ||
+        validated.feedback.documentRevision !== initial.documentRevision
+      ) {
+        throw new ReviewConflictError(
+          "structured feedback must target the reviewed document revision",
+        );
+      }
+      if (
+        validated.feedback.comments.length > 0 &&
+        validated.feedback.sourceWitness !== feedbackSourceWitness(initialDocument)
+      ) {
+        throw new ReviewConflictError("feedback source witness changed");
+      }
+      const markdown = inspected.content.toString("utf8");
+      const sourceMap = await createMarkdownSourceMap(markdown, {
+        ...(initialDocument.kind === "change-review"
+          ? { omitFencedCodeLanguages: ["diff"] }
+          : {}),
+      });
+      const diff = initialDocument.kind === "change-review"
+        ? parseChangeReviewDiffs(markdown)
+        : undefined;
+      linkedFeedback = {
+        id: validated.feedback.id,
+        documentId: initial.documentId,
+        documentRevision: initial.documentRevision,
+        documentContentHash: initial.documentContentHash,
+        ...(validated.feedback.generalMessage === undefined
+          ? {}
+          : { generalMessage: validated.feedback.generalMessage }),
+        comments: validated.feedback.comments.map((comment): FeedbackComment => ({
+          id: comment.id,
+          intent: comment.intent,
+          anchor: resolveFeedbackAnchor(
+            comment.anchor,
+            markdown,
+            sourceMap,
+            diff,
+          ),
+          message: comment.message,
+        })),
+        createdAt: new Date().toISOString(),
+      };
+    }
+
     const result = this.#storage.transaction(():
       | { kind: "responded"; request: ReviewRequest; changed: boolean }
       | { kind: "stale"; changed: boolean } => {
@@ -697,9 +1005,17 @@ export class Catalog {
         throw new Error(`unknown review request ${id}`);
       }
       if (request.response !== null) {
+        const storedLinkedFeedback = linkedFeedback === undefined
+          ? undefined
+          : this.#storage.getFeedbackSubmission(linkedFeedback.id, resolvedScope);
         if (
           request.response.outcome === validated.outcome &&
-          sameReviewResponse(request.response, validated)
+          sameReviewResponse(
+            request.response,
+            validated,
+            storedLinkedFeedback,
+            linkedFeedback,
+          )
         ) {
           return {
             kind: "responded",
@@ -738,11 +1054,19 @@ export class Catalog {
         response: {
           outcome: validated.outcome,
           message: validated.message,
-          ...(validated.items === undefined ? {} : { items: validated.items }),
+          ...(linkedFeedback === undefined
+            ? validated.items === undefined ? {} : { items: validated.items }
+            : reviewItemsFromFeedbackComments(linkedFeedback.comments)),
+          ...(linkedFeedback !== undefined
+            ? { feedbackId: linkedFeedback.id }
+            : validated.message.trim() === "" &&
+              (validated.items === undefined || validated.items.length === 0)
+            ? {}
+            : { feedbackId: reviewFeedbackId(request.id) }),
           createdAt: new Date().toISOString(),
         },
       };
-      if (this.#storage.completeReviewRequest(responded)) {
+      if (this.#storage.completeReviewRequest(responded, linkedFeedback)) {
         return {
           kind: "responded",
           request: presentReviewRequest(responded),
@@ -2223,12 +2547,289 @@ function validateCreateReviewRequestInput(
   };
 }
 
+function validateCreateFeedbackInput(
+  input: CreateFeedbackInput,
+): CreateFeedbackInput {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, [
+      "id",
+      "documentId",
+      "documentRevision",
+      "sourceWitness",
+      "generalMessage",
+      "comments",
+    ]) ||
+    typeof input.id !== "string" ||
+    !/^feedback-[a-f0-9]{20}$/.test(input.id) ||
+    typeof input.documentId !== "string" ||
+    !/^doc-[a-f0-9]{20}$/.test(input.documentId) ||
+    typeof input.documentRevision !== "number" ||
+    !Number.isSafeInteger(input.documentRevision) ||
+    input.documentRevision <= 0 ||
+    (input.sourceWitness !== undefined &&
+      (typeof input.sourceWitness !== "string" ||
+        !/^witness-[a-f0-9]{64}$/.test(input.sourceWitness))) ||
+    (input.generalMessage !== undefined &&
+      typeof input.generalMessage !== "string") ||
+    !Array.isArray(input.comments) ||
+    input.comments.length > MAX_REVIEW_FEEDBACK_ITEMS
+  ) {
+    throw new Error("invalid feedback input");
+  }
+  const generalMessage = input.generalMessage === undefined
+    ? undefined
+    : normalizeReviewMessage(input.generalMessage);
+  if (generalMessage !== undefined && generalMessage.trim() === "") {
+    throw new Error("feedback general message cannot be blank");
+  }
+  const comments = input.comments.map(validateCreateFeedbackCommentInput);
+  if (generalMessage === undefined && comments.length === 0) {
+    throw new Error("feedback requires a general message or comment");
+  }
+  if (comments.length > 0 && input.sourceWitness === undefined) {
+    throw new Error("anchored feedback requires a source witness");
+  }
+  if (new Set(comments.map(({ id }) => id)).size !== comments.length) {
+    throw new Error("feedback comment ids must be unique");
+  }
+  return {
+    id: input.id,
+    documentId: input.documentId,
+    documentRevision: input.documentRevision,
+    ...(input.sourceWitness === undefined
+      ? {}
+      : { sourceWitness: input.sourceWitness }),
+    ...(generalMessage === undefined ? {} : { generalMessage }),
+    comments,
+  };
+}
+
+function validateCreateFeedbackCommentInput(
+  value: unknown,
+): CreateFeedbackCommentInput {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["id", "intent", "anchor", "message"]) ||
+    typeof value.id !== "string" ||
+    !/^comment-[a-f0-9]{20}$/.test(value.id) ||
+    (value.intent !== "feedback" && value.intent !== "todo") ||
+    typeof value.message !== "string" ||
+    value.message.trim() === "" ||
+    value.message.length > MAX_REVIEW_FEEDBACK_MESSAGE_LENGTH ||
+    !isRecord(value.anchor)
+  ) {
+    throw new Error("invalid feedback comment");
+  }
+  const message = normalizeReviewMessage(value.message);
+  const anchor = validateFeedbackAnchorInput(value.anchor);
+  return {
+    id: value.id,
+    intent: value.intent,
+    anchor,
+    message,
+  };
+}
+
+function validateFeedbackAnchorInput(
+  anchor: Record<string, unknown>,
+): FeedbackAnchorInput {
+  if (anchor.kind === "markdown-selection-v1") {
+    if (
+      !hasOnlyKeys(anchor, ["kind", "start", "end"]) ||
+      !isFeedbackSelectionBoundary(anchor.start) ||
+      !isFeedbackSelectionBoundary(anchor.end)
+    ) {
+      throw new Error("invalid Markdown feedback selection");
+    }
+    return {
+      kind: "markdown-selection-v1",
+      start: anchor.start,
+      end: anchor.end,
+    };
+  }
+  if (anchor.kind === "diff-file-v1") {
+    if (
+      !hasOnlyKeys(anchor, ["kind", "path"]) ||
+      typeof anchor.path !== "string" ||
+      !isSafeReviewPath(anchor.path)
+    ) {
+      throw new Error("invalid diff-file feedback anchor");
+    }
+    return { kind: "diff-file-v1", path: anchor.path };
+  }
+  if (anchor.kind === "diff-lines-v1") {
+    if (
+      !hasOnlyKeys(anchor, [
+        "kind",
+        "path",
+        "hunkId",
+        "side",
+        "line",
+        "endLine",
+      ]) ||
+      typeof anchor.path !== "string" ||
+      !isSafeReviewPath(anchor.path) ||
+      typeof anchor.hunkId !== "string" ||
+      !/^hunk-[a-f0-9]{20}$/.test(anchor.hunkId) ||
+      (anchor.side !== "old" && anchor.side !== "new") ||
+      typeof anchor.line !== "number" ||
+      !Number.isSafeInteger(anchor.line) ||
+      anchor.line <= 0 ||
+      (anchor.endLine !== undefined &&
+        (typeof anchor.endLine !== "number" ||
+          !Number.isSafeInteger(anchor.endLine) ||
+          anchor.endLine < anchor.line))
+    ) {
+      throw new Error("invalid diff-lines feedback anchor");
+    }
+    return {
+      kind: "diff-lines-v1",
+      path: anchor.path,
+      hunkId: anchor.hunkId,
+      side: anchor.side,
+      line: anchor.line,
+      ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+    };
+  }
+  throw new Error("unknown feedback anchor kind");
+}
+
+function isFeedbackSelectionBoundary(
+  value: unknown,
+): value is { ref: string; offset: number } {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ["ref", "offset"]) &&
+    typeof value.ref === "string" &&
+    /^m1-s[1-9][0-9]*$/.test(value.ref) &&
+    typeof value.offset === "number" &&
+    Number.isSafeInteger(value.offset) &&
+    value.offset >= 0;
+}
+
+function validateListFeedbackInput(input: ListFeedbackInput): ListFeedbackInput {
+  if (
+    !isRecord(input) ||
+    !hasOnlyKeys(input, ["documentId", "documentRevision", "cursor", "limit"]) ||
+    typeof input.documentId !== "string" ||
+    !/^doc-[a-f0-9]{20}$/.test(input.documentId) ||
+    (input.documentRevision !== undefined &&
+      (typeof input.documentRevision !== "number" ||
+        !Number.isSafeInteger(input.documentRevision) ||
+        input.documentRevision <= 0)) ||
+    (input.cursor !== undefined && typeof input.cursor !== "string") ||
+    (input.limit !== undefined &&
+      (typeof input.limit !== "number" ||
+        !Number.isSafeInteger(input.limit) ||
+        input.limit < 1 ||
+        input.limit > 100))
+  ) {
+    throw new Error("invalid feedback list input");
+  }
+  if (input.cursor !== undefined) decodeFeedbackCursor(input.cursor);
+  return { ...input };
+}
+
+function resolveFeedbackAnchor(
+  anchor: FeedbackAnchorInput,
+  markdown: string | undefined,
+  sourceMap: Awaited<ReturnType<typeof createMarkdownSourceMap>> | undefined,
+  diff: ChangeReviewDiff | undefined,
+): FeedbackAnchor {
+  if (anchor.kind === "markdown-selection-v1") {
+    if (markdown === undefined || sourceMap === undefined) {
+      throw new Error("Markdown feedback requires readable source content");
+    }
+    return resolveMarkdownSelection(
+      markdown,
+      sourceMap,
+      anchor as MarkdownSelectionWitnessV1 & { kind: "markdown-selection-v1" },
+    );
+  }
+  if (diff === undefined) {
+    throw new Error("diff feedback requires a change-review document");
+  }
+  const file = diff.files.find(({ path }) => path === anchor.path);
+  if (!file) throw new Error("feedback anchor references an unknown diff file");
+  if (anchor.kind === "diff-file-v1") return anchor;
+  const hunk = file.hunks.find(({ id }) => id === anchor.hunkId);
+  if (!hunk) throw new Error("feedback anchor references an unknown diff hunk");
+  const endLine = anchor.endLine ?? anchor.line;
+  const available = new Set(
+    hunk.lines.flatMap((line) => {
+      const number = anchor.side === "old" ? line.oldLine : line.newLine;
+      return number === null ? [] : [number];
+    }),
+  );
+  for (let line = anchor.line; line <= endLine; line += 1) {
+    if (!available.has(line)) {
+      throw new Error("feedback anchor references an unknown diff line");
+    }
+  }
+  return anchor;
+}
+
+function sameFeedbackPayload(
+  left: StoredFeedbackSubmission,
+  right: StoredFeedbackSubmission,
+): boolean {
+  return left.id === right.id &&
+    left.documentId === right.documentId &&
+    left.documentRevision === right.documentRevision &&
+    left.documentContentHash === right.documentContentHash &&
+    left.generalMessage === right.generalMessage &&
+    JSON.stringify(left.comments) === JSON.stringify(right.comments);
+}
+
+function feedbackSourceWitness(
+  document: Pick<StoredDocument, "id" | "revision" | "contentHash">,
+): string {
+  return `witness-${createHash("sha256")
+    .update("mdmaid-feedback-source-v1\0")
+    .update(document.id)
+    .update("\0")
+    .update(String(document.revision))
+    .update("\0")
+    .update(document.contentHash)
+    .digest("hex")}`;
+}
+
+function validateFeedbackId(id: string): void {
+  if (typeof id !== "string" || !/^feedback-[a-f0-9]{20}$/.test(id)) {
+    throw new Error("invalid feedback id");
+  }
+}
+
+function encodeFeedbackCursor(createdAt: string, id: string): string {
+  return Buffer.from(JSON.stringify({ createdAt, id }), "utf8").toString("base64url");
+}
+
+function decodeFeedbackCursor(cursor: string): { createdAt: string; id: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("invalid feedback cursor");
+  }
+  if (
+    !isRecord(parsed) ||
+    !hasOnlyKeys(parsed, ["createdAt", "id"]) ||
+    typeof parsed.createdAt !== "string" ||
+    !Number.isFinite(Date.parse(parsed.createdAt)) ||
+    typeof parsed.id !== "string" ||
+    !/^feedback-[a-f0-9]{20}$/.test(parsed.id)
+  ) {
+    throw new Error("invalid feedback cursor");
+  }
+  return { createdAt: parsed.createdAt, id: parsed.id };
+}
+
 function validateRespondToReviewRequestInput(
   input: RespondToReviewRequestInput,
 ): RespondToReviewRequestInput {
   if (
     !isRecord(input) ||
-    !hasOnlyKeys(input, ["outcome", "message", "items"]) ||
+    !hasOnlyKeys(input, ["outcome", "message", "items", "feedback"]) ||
     typeof input.outcome !== "string" ||
     !isReviewOutcome(input.outcome) ||
     typeof input.message !== "string"
@@ -2237,10 +2838,20 @@ function validateRespondToReviewRequestInput(
   }
   const message = normalizeReviewMessage(input.message);
   const items = validateReviewFeedbackItems(input.items);
+  const feedback = input.feedback === undefined
+    ? undefined
+    : validateCreateFeedbackInput(input.feedback);
+  if (feedback !== undefined && items.length > 0) {
+    throw new Error("review response cannot contain legacy items and structured feedback");
+  }
+  if (feedback !== undefined && (feedback.generalMessage ?? "") !== message) {
+    throw new Error("review response message must match structured feedback");
+  }
   if (
     input.outcome === "changes_requested" &&
     message.trim() === "" &&
-    items.length === 0
+    items.length === 0 &&
+    (feedback === undefined || feedback.comments.length === 0)
   ) {
     throw new Error(
       "response message or anchored feedback is required for requested changes",
@@ -2259,6 +2870,7 @@ function validateRespondToReviewRequestInput(
     outcome: input.outcome,
     message,
     ...(items.length === 0 ? {} : { items }),
+    ...(feedback === undefined ? {} : { feedback }),
   };
 }
 
@@ -2352,10 +2964,58 @@ function isSafeReviewPath(value: string): boolean {
 function sameReviewResponse(
   response: ReviewResponse,
   input: RespondToReviewRequestInput,
+  storedFeedback?: StoredFeedbackSubmission,
+  candidateFeedback?: StoredFeedbackSubmission,
 ): boolean {
+  if (input.feedback !== undefined) {
+    return response.outcome === input.outcome &&
+      response.message === input.message &&
+      response.feedbackId === input.feedback.id &&
+      storedFeedback !== undefined &&
+      candidateFeedback !== undefined &&
+      sameFeedbackPayload(storedFeedback, candidateFeedback);
+  }
   return response.outcome === input.outcome &&
     response.message === input.message &&
     JSON.stringify(response.items ?? []) === JSON.stringify(input.items ?? []);
+}
+
+function reviewItemsFromFeedbackComments(
+  comments: readonly FeedbackComment[],
+): { items?: ReviewFeedbackItem[] } {
+  const items = comments.flatMap((comment): ReviewFeedbackItem[] => {
+    if (comment.anchor.kind === "markdown-v1") return [];
+    if (comment.anchor.kind === "diff-file-v1") {
+      return [{
+        id: comment.id.replace(/^comment-/, "feedback-"),
+        kind: comment.intent,
+        path: comment.anchor.path,
+        message: comment.message,
+      }];
+    }
+    if (comment.intent === "todo") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: comment.anchor.path,
+      hunkId: comment.anchor.hunkId,
+      side: comment.anchor.side,
+      line: comment.anchor.line,
+      ...(comment.anchor.endLine === undefined
+        ? {}
+        : { endLine: comment.anchor.endLine }),
+      message: comment.message,
+    }];
+  });
+  return items.length === 0 ? {} : { items };
+}
+
+function reviewFeedbackId(reviewRequestId: string): string {
+  return `feedback-${createHash("sha256")
+    .update("review-feedback\0")
+    .update(reviewRequestId)
+    .digest("hex")
+    .slice(0, 20)}`;
 }
 
 function normalizeReviewMessage(value: string): string {

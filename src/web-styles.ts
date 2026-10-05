@@ -649,6 +649,38 @@ button.diff-line-number.selected-range {
   box-shadow: 4px 4px 0 var(--ink);
 }
 .review-panel h2 { margin: 8px 0 14px; font-size: 22px; }
+.feedback-panel {
+  border-color: var(--reading);
+  background: var(--reading-soft);
+  box-shadow: 4px 4px 0 var(--ink);
+}
+.document-feedback-add-selection {
+  position: sticky;
+  bottom: 18px;
+  z-index: 6;
+  margin: 10px 0 16px;
+  border-color: var(--reading);
+  background: var(--surface);
+}
+.feedback-history {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+.feedback-history a { overflow-wrap: anywhere; }
+.feedback-history-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.feedback-history-item:target { background: var(--reading-soft); }
+.feedback-history-item p {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .review-panel label { display: block; margin: 18px 0 7px; font-size: 10px; text-transform: uppercase; }
 .review-message, .review-status { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
 .review-status { color: var(--muted); font-size: 11px; text-transform: uppercase; }

@@ -126,6 +126,7 @@ test("serves health publicly and protects catalog APIs", async () => {
           "spaces-v1",
           "scoped-content-v1",
           "workspace-reconciliation-v1",
+          "document-feedback-v1",
         ],
       },
     });
@@ -137,6 +138,14 @@ test("serves health publicly and protects catalog APIs", async () => {
     assert.deepEqual(await unauthorized.json(), {
       error: { code: "unauthorized", message: "Authentication required" },
     });
+    const unauthorizedFeedback = await fetch(
+      new URL("/api/v1/feedback/feedback-0123456789abcdef0123", value.server.url),
+    );
+    assert.equal(unauthorizedFeedback.status, 401);
+    const unauthorizedFeedbackRoute = await fetch(
+      new URL("/f/feedback-0123456789abcdef0123", value.server.url),
+    );
+    assert.equal(unauthorizedFeedbackRoute.status, 401);
     const unauthorizedReconciliation = await fetch(
       new URL(
         "/api/v1/workspaces/example/reconcile",
@@ -148,6 +157,45 @@ test("serves health publicly and protects catalog APIs", async () => {
     assert.deepEqual(await unauthorizedReconciliation.json(), {
       error: { code: "unauthorized", message: "Authentication required" },
     });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("stable feedback routes resolve existence and Space scope before serving the workspace", async () => {
+  const value = await fixture();
+  try {
+    const submission = await value.catalog.createFeedback({
+      id: "feedback-aaaaaaaaaaaaaaaaaaaa",
+      documentId: value.document.id,
+      documentRevision: value.document.revision,
+      generalMessage: "Route-scoped note.",
+      comments: [],
+    });
+    value.catalog.createSpace({
+      id: "empty",
+      name: "Empty",
+      matchers: [{ kind: "tag", value: "not-present" }],
+    });
+
+    assert.equal((await authorized(value, submission.route)).status, 200);
+    const bootstrap = await fetch(
+      new URL(`${submission.route}?token=${value.server.token}`, value.server.url),
+      { redirect: "manual" },
+    );
+    assert.equal(bootstrap.status, 303);
+    assert.equal(bootstrap.headers.get("location"), submission.route);
+    const unknown = await authorized(
+      value,
+      "/f/feedback-bbbbbbbbbbbbbbbbbbbb",
+    );
+    const outOfScope = await authorized(
+      value,
+      `${submission.route}?space=empty`,
+    );
+    assert.equal(unknown.status, 404);
+    assert.equal(outOfScope.status, 404);
+    assert.deepEqual(await unknown.json(), await outOfScope.json());
   } finally {
     await closeFixture(value);
   }
@@ -1425,6 +1473,9 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(pageContent, /id="review-panel"/);
     assert.match(pageContent, /id="review-feedback-section"/);
     assert.match(pageContent, /id="review-feedback-message"/);
+    assert.match(pageContent, /id="feedback-panel"/);
+    assert.match(pageContent, /id="feedback-general-message"/);
+    assert.match(pageContent, /id="document-feedback-add-selection"/);
     assert.match(pageContent, /id="review-response"/);
     assert.match(pageContent, /id="review-approve"/);
     assert.match(pageContent, /id="review-changes"/);

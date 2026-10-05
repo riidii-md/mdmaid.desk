@@ -3,7 +3,10 @@
 import type {
   BulkDocumentResult,
   ChangeReviewDiff,
+  FeedbackSubmissionRegistration,
   PublicDocument,
+  PublicFeedbackPage,
+  PublicFeedbackSubmission,
   PublicReviewRequest,
   PublicSpace,
   PublicWorkspace,
@@ -16,6 +19,7 @@ import type {
   ChangeReviewHunk,
   ChangeReviewLine,
 } from "./change-review.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
 
 export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
@@ -146,6 +150,22 @@ export interface WebReviewDraftActivation {
   requestId: string;
   resetComposer: true;
   draft: WebReviewDraft;
+}
+
+export type WebFeedbackAnchorInput =
+  FeedbackSubmissionRegistration["comments"][number]["anchor"];
+
+export interface WebFeedbackCommentDraft {
+  id: string;
+  intent: "feedback" | "todo";
+  anchor: WebFeedbackAnchorInput;
+  label: string;
+  message: string;
+}
+
+export interface WebDocumentFeedbackDraft {
+  generalMessage: string;
+  comments: WebFeedbackCommentDraft[];
 }
 
 interface DocumentHeading {
@@ -379,6 +399,8 @@ interface RenderedDocument {
   document: WebDocument;
   target: "web";
   content: string;
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 
@@ -400,6 +422,95 @@ export interface WebFeedbackAnchor {
   line?: number;
   endLine?: number;
   side?: "old" | "new";
+}
+
+type WebFeedbackDraftAnchor = WebFeedbackAnchor |
+  Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>;
+
+function isMarkdownFeedbackAnchor(
+  anchor: WebFeedbackDraftAnchor,
+): anchor is Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> {
+  return "kind" in anchor && anchor.kind === "markdown-selection-v1";
+}
+
+function diffFeedbackAnchorInput(anchor: WebFeedbackAnchor): WebFeedbackAnchorInput {
+  return anchor.line === undefined
+    ? { kind: "diff-file-v1", path: anchor.path }
+    : {
+        kind: "diff-lines-v1",
+        path: anchor.path,
+        hunkId: anchor.hunkId!,
+        side: anchor.side!,
+        line: anchor.line,
+        ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+      };
+}
+
+function draftDiffItems(
+  comments: readonly WebFeedbackCommentDraft[],
+): ReviewFeedbackItem[] {
+  return comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-selection-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  });
+}
+
+function storedDiffItems(
+  submissions: readonly PublicFeedbackSubmission[],
+): ReviewFeedbackItem[] {
+  return submissions.flatMap((submission) => submission.comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  }));
+}
+
+function storedFeedbackAnchorLabel(
+  comment: PublicFeedbackSubmission["comments"][number],
+): string {
+  const anchor = comment.anchor;
+  if (anchor.kind === "markdown-v1") {
+    const lines = anchor.start.line === anchor.end.line
+      ? `line ${anchor.start.line}`
+      : `lines ${anchor.start.line}-${anchor.end.line}`;
+    return `${lines} · “${anchor.exact.slice(0, 160)}”`;
+  }
+  return feedbackAnchorLabel(anchor.kind === "diff-file-v1"
+    ? { path: anchor.path }
+    : {
+        path: anchor.path,
+        hunkId: anchor.hunkId,
+        side: anchor.side,
+        line: anchor.line,
+        ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+      });
 }
 
 class WebApiError extends Error {
@@ -980,6 +1091,140 @@ function reviewDraftStorageKey(requestId: string): string {
 
 const REVIEW_DRAFT_STORAGE_PREFIX = "mdmaid-desk-review-draft:";
 
+const DOCUMENT_FEEDBACK_DRAFT_STORAGE_PREFIX =
+  "mdmaid-desk-feedback-draft:";
+
+export function documentFeedbackDraftStorageKey(
+  document: Pick<WebDocument, "id" | "revision">,
+): string {
+  return `${DOCUMENT_FEEDBACK_DRAFT_STORAGE_PREFIX}${document.id}:${document.revision}`;
+}
+
+export function markdownSelectionWitness(
+  sourceMap: MarkdownSourceMapV1,
+  startRef: string,
+  startOffset: number,
+  endRef: string,
+  endOffset: number,
+): Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> | undefined {
+  const startIndex = sourceMap.segments.findIndex(({ ref }) => ref === startRef);
+  const endIndex = sourceMap.segments.findIndex(({ ref }) => ref === endRef);
+  const start = sourceMap.segments[startIndex];
+  const end = sourceMap.segments[endIndex];
+  if (
+    !start ||
+    !end ||
+    start.blockRef !== end.blockRef ||
+    !Number.isSafeInteger(startOffset) ||
+    !Number.isSafeInteger(endOffset) ||
+    startOffset < 0 ||
+    startOffset > start.text.length ||
+    endOffset < 0 ||
+    endOffset > end.text.length ||
+    (startIndex > endIndex || (startIndex === endIndex && startOffset >= endOffset))
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "markdown-selection-v1",
+    start: { ref: startRef, offset: startOffset },
+    end: { ref: endRef, offset: endOffset },
+  };
+}
+
+export function loadDocumentFeedbackDraft(
+  storage: ReviewDraftStorage,
+  document: Pick<WebDocument, "id" | "revision">,
+): WebDocumentFeedbackDraft {
+  const empty = { generalMessage: "", comments: [] };
+  try {
+    const raw = storage.getItem(documentFeedbackDraftStorageKey(document));
+    if (raw === null) return empty;
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !hasOnlyKeys(value, ["version", "documentId", "documentRevision", "generalMessage", "comments"]) ||
+      value.version !== 1 ||
+      value.documentId !== document.id ||
+      value.documentRevision !== document.revision ||
+      typeof value.generalMessage !== "string" ||
+      value.generalMessage.length > 16 * 1024 ||
+      !isSafeReviewMessage(value.generalMessage) ||
+      !Array.isArray(value.comments) ||
+      value.comments.length > 32 ||
+      !value.comments.every(isStoredDocumentFeedbackComment)
+    ) return empty;
+    return {
+      generalMessage: value.generalMessage,
+      comments: value.comments.map((comment) => ({ ...comment })),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function persistDocumentFeedbackDraft(
+  storage: ReviewDraftStorage,
+  document: Pick<WebDocument, "id" | "revision">,
+  draft: WebDocumentFeedbackDraft,
+): void {
+  const key = documentFeedbackDraftStorageKey(document);
+  if (draft.generalMessage === "" && draft.comments.length === 0) {
+    storage.removeItem(key);
+    return;
+  }
+  storage.setItem(key, JSON.stringify({
+    version: 1,
+    documentId: document.id,
+    documentRevision: document.revision,
+    generalMessage: draft.generalMessage,
+    comments: draft.comments,
+  }));
+}
+
+function isStoredDocumentFeedbackComment(
+  value: unknown,
+): value is WebFeedbackCommentDraft {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["id", "intent", "anchor", "label", "message"]) ||
+    typeof value.id !== "string" ||
+    !/^comment-[a-f0-9]{20}$/.test(value.id) ||
+    (value.intent !== "feedback" && value.intent !== "todo") ||
+    typeof value.label !== "string" ||
+    value.label.length > 512 ||
+    typeof value.message !== "string" ||
+    value.message.trim() === "" ||
+    value.message.length > 512 ||
+    !isSafeReviewMessage(value.message) ||
+    !isRecord(value.anchor)
+  ) return false;
+  const anchor = value.anchor;
+  if (anchor.kind === "markdown-selection-v1") {
+    return isStoredSelectionBoundary(anchor.start) &&
+      isStoredSelectionBoundary(anchor.end) &&
+      hasOnlyKeys(anchor, ["kind", "start", "end"]);
+  }
+  if (anchor.kind === "diff-file-v1") {
+    return hasOnlyKeys(anchor, ["kind", "path"]) &&
+      typeof anchor.path === "string" && isSafeReviewPath(anchor.path);
+  }
+  return anchor.kind === "diff-lines-v1" &&
+    hasOnlyKeys(anchor, ["kind", "path", "hunkId", "side", "line", "endLine"]) &&
+    typeof anchor.path === "string" && isSafeReviewPath(anchor.path) &&
+    typeof anchor.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(anchor.hunkId) &&
+    (anchor.side === "old" || anchor.side === "new") &&
+    typeof anchor.line === "number" && Number.isSafeInteger(anchor.line) && anchor.line > 0 &&
+    (anchor.endLine === undefined ||
+      (typeof anchor.endLine === "number" && Number.isSafeInteger(anchor.endLine) && anchor.endLine > anchor.line));
+}
+
+function isStoredSelectionBoundary(value: unknown): boolean {
+  return isRecord(value) && hasOnlyKeys(value, ["ref", "offset"]) &&
+    typeof value.ref === "string" && /^m1-s[1-9][0-9]*$/.test(value.ref) &&
+    typeof value.offset === "number" && Number.isSafeInteger(value.offset) && value.offset >= 0;
+}
+
 function isStoredReviewFeedbackItem(
   value: unknown,
 ): value is ReviewFeedbackItem {
@@ -1436,6 +1681,12 @@ async function boot(): Promise<void> {
   const readerTocList = element("reader-toc-list");
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
+  const feedbackPanel = element("feedback-panel");
+  const feedbackGeneralMessage = element("feedback-general-message") as HTMLTextAreaElement;
+  const feedbackError = element("feedback-error");
+  const feedbackSend = element("feedback-send") as HTMLButtonElement;
+  const feedbackHistoryElement = element("feedback-history");
+  const feedbackAddSelection = element("document-feedback-add-selection") as HTMLButtonElement;
   const reviewPanel = element("review-panel");
   const reviewRequestMessage = element("review-request-message");
   const reviewStatus = element("review-status");
@@ -1487,14 +1738,22 @@ async function boot(): Promise<void> {
     document.querySelectorAll<HTMLButtonElement>("[data-grouping]"),
   );
   let renderedRevision: number | undefined;
+  let renderedSourceWitness: string | undefined;
+  let feedbackDraftRevision: number | undefined;
   let renderedChangeReview: ChangeReviewDiff | undefined;
+  let renderedSourceMap: MarkdownSourceMapV1 | undefined;
   let changeFileIndex = 0;
   let changeReviewLayout: "unified" | "side-by-side" = "side-by-side";
   let changeReviewView: "diff" | "document" = "diff";
-  let feedbackItems: ReviewFeedbackItem[] = [];
-  let feedbackDraft: WebFeedbackAnchor | undefined;
+  let feedbackComments: WebFeedbackCommentDraft[] = [];
+  let feedbackHistory: PublicFeedbackSubmission[] = [];
+  let feedbackDraft: WebFeedbackDraftAnchor | undefined;
   let feedbackRangeStart: WebFeedbackAnchor | undefined;
   let feedbackEditingId: string | undefined;
+  let selectedMarkdownWitness:
+    | Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>
+    | undefined;
+  let selectedMarkdownLabel = "";
   let activeReviewDraftId: string | undefined;
   let renderSequence = 0;
   let loadSequence = 0;
@@ -1976,6 +2235,14 @@ async function boot(): Promise<void> {
       queuePanel.removeAttribute("hidden");
       render();
     }
+    const routedFeedbackId = document.body.dataset.feedbackId;
+    if (state.selectedId === undefined && routedFeedbackId) {
+      const submission = await api<PublicFeedbackSubmission>(
+        `/api/v1/feedback/${routedFeedbackId}`,
+      );
+      state.selectedId = submission.documentId;
+      feedbackHistory = [submission];
+    }
     let loaded: [WebDocument[], WebWorkspace[], WebReviewRequest[], PublicSpace[]];
     try {
       const documentsPath = state.filters.contentMode === "archive"
@@ -2167,25 +2434,31 @@ async function boot(): Promise<void> {
   }
 
   function openFeedbackComposer(
-    anchor: WebFeedbackAnchor,
-    item?: ReviewFeedbackItem,
-    rangeStart: WebFeedbackAnchor = anchor,
+    anchor: WebFeedbackDraftAnchor,
+    item?: WebFeedbackCommentDraft | ReviewFeedbackItem,
+    rangeStart?: WebFeedbackAnchor,
     preserveMessage = false,
+    label?: string,
   ): void {
-    if (!state.selectedId || !pendingReviewForDocument(
-      state.reviewRequests,
-      state.selectedId,
-    )) {
-      return;
-    }
+    if (!state.selectedId) return;
+    const storedItem = item && "anchor" in item
+      ? item
+      : item
+        ? feedbackComments.find(({ id }) =>
+            id === item.id.replace(/^feedback-/, "comment-"))
+        : undefined;
     feedbackDraft = anchor;
-    feedbackRangeStart = rangeStart;
+    feedbackRangeStart = rangeStart ?? (isMarkdownFeedbackAnchor(anchor)
+      ? undefined
+      : anchor);
     if (!preserveMessage) {
-      feedbackEditingId = item?.id;
+      feedbackEditingId = storedItem?.id;
     }
-    reviewFeedbackAnchor.textContent = `Feedback on ${feedbackAnchorLabel(anchor)}`;
+    const anchorLabel = label ?? storedItem?.label ??
+      (isMarkdownFeedbackAnchor(anchor) ? "selected document text" : feedbackAnchorLabel(anchor));
+    reviewFeedbackAnchor.textContent = `Feedback on ${anchorLabel}`;
     if (!preserveMessage) {
-      reviewFeedbackMessage.value = item?.message ?? "";
+      reviewFeedbackMessage.value = storedItem?.message ?? "";
     }
     reviewFeedbackSave.textContent = feedbackEditingId
       ? "update feedback"
@@ -2205,19 +2478,31 @@ async function boot(): Promise<void> {
     reviewFeedbackComposer.setAttribute("hidden", "");
   }
 
-  function persistCurrentReviewDraft(
-    current?: WebReviewRequest,
-  ): void {
+  function persistCurrentFeedbackDraft(): void {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) return;
+    try {
+      persistDocumentFeedbackDraft(localStorage, {
+        id: selected.id,
+        revision: feedbackDraftRevision ?? selected.revision,
+      }, {
+        generalMessage: feedbackGeneralMessage.value,
+        comments: feedbackComments,
+      });
+    } catch {
+      // An unavailable browser store must not block feedback submission.
+    }
+  }
+
+  function persistCurrentReviewDraft(current?: WebReviewRequest): void {
     const request = current ?? (state.selectedId
       ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
       : undefined);
-    if (!request) {
-      return;
-    }
+    if (!request) return;
     try {
       persistReviewDraft(localStorage, request, {
         message: reviewResponse.value,
-        items: feedbackItems,
+        items: [],
       });
     } catch {
       // An unavailable browser store must not block the review decision.
@@ -2234,64 +2519,85 @@ async function boot(): Promise<void> {
 
   function renderFeedbackPanel(current: WebReviewRequest | undefined): void {
     const selected = state.documents.find(({ id }) => id === state.selectedId);
-    const show = selected?.kind === "change-review" && current !== undefined;
+    const show = selected !== undefined;
+    feedbackPanel.toggleAttribute("hidden", !show);
     reviewFeedbackSection.toggleAttribute("hidden", !show);
     reviewFeedbackList.replaceChildren();
-    if (feedbackDraft?.line === undefined) {
+    if (!feedbackDraft || isMarkdownFeedbackAnchor(feedbackDraft) || feedbackDraft.line === undefined) {
       reviewFeedbackComposer.classList.remove("diff-inline-composer");
       reviewFeedbackSection.append(reviewFeedbackComposer);
     }
-    if (!show || !current) {
+    if (!show) {
       closeFeedbackComposer();
       return;
     }
-    const pending = current.status === "pending";
-    const items = pending ? feedbackItems : current.response?.items ?? [];
-    for (const item of items) {
+    for (const item of feedbackComments) {
       const row = document.createElement("div");
       row.className = "review-feedback-item";
       const content = document.createElement("span");
-      content.textContent = `${feedbackAnchorLabel(item)} — ${item.message}`;
+      content.textContent = `${item.label} — ${item.message}`;
       row.append(content);
-      if (pending) {
-        const edit = document.createElement("button");
-        edit.type = "button";
-        edit.className = "action";
-        edit.textContent = "edit";
-        edit.setAttribute("aria-label", `Edit feedback on ${feedbackAnchorLabel(item)}`);
-        edit.setAttribute("aria-label", `Edit feedback on ${feedbackAnchorLabel(item)}`);
-        edit.addEventListener("click", () => {
-          openFeedbackComposer({
-            path: item.path,
-            ...(item.hunkId === undefined ? {} : { hunkId: item.hunkId }),
-            ...(item.line === undefined ? {} : { line: item.line }),
-            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
-            ...(item.side === undefined ? {} : { side: item.side }),
-          }, item);
-        });
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.className = "action";
-        remove.textContent = "remove";
-        remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
-        remove.setAttribute("aria-label", `Remove feedback on ${feedbackAnchorLabel(item)}`);
-        remove.addEventListener("click", () => {
-          feedbackItems = removeReviewDraftFeedback({
-            message: reviewResponse.value,
-            items: feedbackItems,
-          }, item.id).items;
-          if (feedbackEditingId === item.id) {
-            closeFeedbackComposer();
-          }
-          persistCurrentReviewDraft(current);
-          renderFeedbackPanel(current);
-          renderChangeReview();
-        });
-        row.append(edit, remove);
-      }
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "action";
+      edit.textContent = "edit";
+      edit.setAttribute("aria-label", `Edit feedback on ${item.label}`);
+      edit.addEventListener("click", () => openFeedbackComposer(
+        item.anchor.kind === "markdown-selection-v1"
+          ? item.anchor
+          : item.anchor.kind === "diff-file-v1"
+            ? { path: item.anchor.path }
+            : {
+                path: item.anchor.path,
+                hunkId: item.anchor.hunkId,
+                side: item.anchor.side,
+                line: item.anchor.line,
+                ...(item.anchor.endLine === undefined ? {} : { endLine: item.anchor.endLine }),
+              },
+        item,
+        undefined,
+        false,
+        item.label,
+      ));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "action";
+      remove.textContent = "remove";
+      remove.setAttribute("aria-label", `Remove feedback on ${item.label}`);
+      remove.addEventListener("click", () => {
+        feedbackComments = feedbackComments.filter(({ id }) => id !== item.id);
+        if (feedbackEditingId === item.id) closeFeedbackComposer();
+        persistCurrentFeedbackDraft();
+        renderFeedbackPanel(current);
+        renderChangeReview();
+      });
+      row.append(edit, remove);
       reviewFeedbackList.append(row);
     }
-    reviewFeedbackComposer.toggleAttribute("hidden", !pending || !feedbackDraft);
+    reviewFeedbackComposer.toggleAttribute("hidden", !feedbackDraft);
+    feedbackHistoryElement.replaceChildren();
+    for (const submission of feedbackHistory) {
+      const entry = document.createElement("section");
+      entry.className = "feedback-history-item";
+      entry.id = `feedback-history-${submission.id}`;
+      const link = document.createElement("a");
+      link.href = currentRoute(submission.route);
+      const historical = submission.documentRevision !== selected.revision;
+      link.textContent = `${submission.id} · revision ${submission.documentRevision}${historical ? " · historical" : " · current"} · ${submission.createdAt} · ${submission.comments.length} comment${submission.comments.length === 1 ? "" : "s"}`;
+      entry.append(link);
+      if (submission.generalMessage) {
+        const general = document.createElement("p");
+        general.textContent = submission.generalMessage;
+        entry.append(general);
+      }
+      for (const comment of submission.comments) {
+        const detail = document.createElement("p");
+        detail.textContent = `${storedFeedbackAnchorLabel(comment)} — ${comment.message}`;
+        entry.append(detail);
+      }
+      feedbackHistoryElement.append(entry);
+    }
+    feedbackHistoryElement.toggleAttribute("hidden", feedbackHistory.length === 0);
   }
 
   function saveFeedback(): void {
@@ -2300,35 +2606,196 @@ async function boot(): Promise<void> {
     }
     const message = reviewFeedbackMessage.value.trim();
     if (message === "") {
-      reviewError.textContent = "Feedback text is required.";
+      feedbackError.textContent = "Feedback text is required.";
       reviewFeedbackMessage.focus();
       return;
     }
-    if (!feedbackEditingId && feedbackItems.length >= 32) {
-      reviewError.textContent = "A review can contain at most 32 feedback items.";
+    if (!feedbackEditingId && feedbackComments.length >= 32) {
+      feedbackError.textContent = "A feedback submission can contain at most 32 comments.";
       return;
     }
-    const item: ReviewFeedbackItem = {
+    const label = reviewFeedbackAnchor.textContent?.replace(/^Feedback on /, "") ?? "selection";
+    const item: WebFeedbackCommentDraft = {
       id: feedbackEditingId ??
-        `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
-      kind: "feedback",
-      ...feedbackDraft,
+        `comment-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      intent: "feedback",
+      anchor: isMarkdownFeedbackAnchor(feedbackDraft)
+        ? feedbackDraft
+        : diffFeedbackAnchorInput(feedbackDraft),
+      label,
       message,
     };
-    feedbackItems = upsertReviewDraftFeedback({
-      message: reviewResponse.value,
-      items: feedbackItems,
-    }, item).items;
-    reviewError.textContent = "";
+    const existingIndex = feedbackComments.findIndex(({ id }) => id === item.id);
+    feedbackComments = existingIndex < 0
+      ? [...feedbackComments, item]
+      : feedbackComments.map((candidate, index) => index === existingIndex ? item : candidate);
+    feedbackError.textContent = "";
     closeFeedbackComposer();
     if (state.selectedId) {
       const current = pendingReviewForDocument(
         state.reviewRequests,
         state.selectedId,
       );
-      persistCurrentReviewDraft(current);
+      persistCurrentFeedbackDraft();
       renderFeedbackPanel(current);
       renderChangeReview();
+    }
+  }
+
+  function mappedSourceSpan(node: Node): HTMLElement | undefined {
+    const element = node instanceof HTMLElement ? node : node.parentElement;
+    const span = element?.closest<HTMLElement>("[data-mdmaid-source-ref]");
+    return span && readerContent.contains(span) ? span : undefined;
+  }
+
+  function localTextOffset(
+    span: HTMLElement,
+    node: Node,
+    offset: number,
+  ): number | undefined {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(span);
+      range.setEnd(node, offset);
+      return range.toString().length;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function captureMarkdownSelection(): void {
+    selectedMarkdownWitness = undefined;
+    selectedMarkdownLabel = "";
+    feedbackAddSelection.setAttribute("hidden", "");
+    if (!renderedSourceMap || readerContent.hasAttribute("hidden")) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return;
+    const range = selection.getRangeAt(0);
+    const startSpan = mappedSourceSpan(range.startContainer);
+    const endSpan = mappedSourceSpan(range.endContainer);
+    if (!startSpan || !endSpan) return;
+    const startRef = startSpan.dataset.mdmaidSourceRef;
+    const endRef = endSpan.dataset.mdmaidSourceRef;
+    const startOffset = localTextOffset(startSpan, range.startContainer, range.startOffset);
+    const endOffset = localTextOffset(endSpan, range.endContainer, range.endOffset);
+    if (!startRef || !endRef || startOffset === undefined || endOffset === undefined) return;
+    const witness = markdownSelectionWitness(
+      renderedSourceMap,
+      startRef,
+      startOffset,
+      endRef,
+      endOffset,
+    );
+    if (!witness) return;
+    selectedMarkdownWitness = witness;
+    selectedMarkdownLabel = selection.toString().trim().slice(0, 160);
+    if (selectedMarkdownLabel === "") return;
+    feedbackAddSelection.removeAttribute("hidden");
+  }
+
+  async function loadFeedbackHistory(documentId: string): Promise<void> {
+    const selected = state.documents.find(({ id }) => id === documentId);
+    if (!selected) return;
+    try {
+      const loaded: PublicFeedbackSubmission[] = [];
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      do {
+        const page = await api<PublicFeedbackPage>(
+          `/api/v1/feedback?document=${encodeURIComponent(documentId)}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        );
+        loaded.push(...page.items);
+        cursor = page.nextCursor;
+        if (cursor && seenCursors.has(cursor)) {
+          throw new Error("Feedback history returned a repeated cursor.");
+        }
+        if (cursor) seenCursors.add(cursor);
+      } while (cursor);
+      if (state.selectedId !== documentId) return;
+      const routedFeedbackId = document.body.dataset.feedbackId;
+      feedbackHistory = [
+        ...feedbackHistory.filter(({ id }) => id === routedFeedbackId),
+        ...loaded.filter(({ id }, index) =>
+          id !== routedFeedbackId && loaded.findIndex((item) => item.id === id) === index
+        ),
+      ];
+      if (routedFeedbackId) {
+        feedbackHistory.sort((left, right) =>
+          left.id === routedFeedbackId ? -1 : right.id === routedFeedbackId ? 1 : 0
+        );
+      }
+      renderFeedbackPanel(pendingReviewForDocument(state.reviewRequests, documentId));
+      if (routedFeedbackId) {
+        document.getElementById(`feedback-history-${routedFeedbackId}`)
+          ?.scrollIntoView({ block: "center" });
+      }
+    } catch (error) {
+      if (state.selectedId === documentId) {
+        feedbackError.textContent = error instanceof Error
+          ? error.message
+          : "Could not load feedback history";
+      }
+    }
+  }
+
+  function currentFeedbackRegistration(
+    selected: WebDocument,
+    generalMessage: string,
+  ): FeedbackSubmissionRegistration {
+    if (feedbackComments.length > 0 && renderedSourceWitness === undefined) {
+      throw new Error("The rendered document changed; reopen it before sending anchored feedback.");
+    }
+    return {
+      id: `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      documentId: selected.id,
+      documentRevision: selected.revision,
+      ...(feedbackComments.length === 0 || renderedSourceWitness === undefined
+        ? {}
+        : { sourceWitness: renderedSourceWitness }),
+      ...(generalMessage === "" ? {} : { generalMessage }),
+      comments: feedbackComments.map(({ label: _label, ...comment }) => comment),
+    };
+  }
+
+  async function submitFeedback(): Promise<void> {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) return;
+    const generalMessage = feedbackGeneralMessage.value.trim();
+    if (generalMessage === "" && feedbackComments.length === 0) {
+      feedbackError.textContent = "Add general feedback or at least one specific comment.";
+      feedbackGeneralMessage.focus();
+      return;
+    }
+    feedbackError.textContent = "";
+    feedbackSend.disabled = true;
+    try {
+      const submission = await api<PublicFeedbackSubmission>("/api/v1/feedback", {
+        method: "POST",
+        body: JSON.stringify(currentFeedbackRegistration(selected, generalMessage)),
+      });
+      feedbackComments = [];
+      feedbackGeneralMessage.value = "";
+      closeFeedbackComposer();
+      try {
+        localStorage.removeItem(documentFeedbackDraftStorageKey(selected));
+      } catch {
+        // Submission succeeded even when browser draft cleanup is unavailable.
+      }
+      feedbackHistory = [submission, ...feedbackHistory.filter(({ id }) => id !== submission.id)];
+      renderFeedbackPanel(pendingReviewForDocument(state.reviewRequests, selected.id));
+      feedbackError.replaceChildren();
+      const confirmation = document.createTextNode("Feedback saved: ");
+      const link = document.createElement("a");
+      link.href = currentRoute(submission.route);
+      link.textContent = submission.id;
+      feedbackError.append(confirmation, link);
+      renderChangeReview();
+    } catch (error) {
+      feedbackError.textContent = error instanceof Error
+        ? error.message
+        : "Could not submit feedback";
+    } finally {
+      feedbackSend.disabled = false;
     }
   }
 
@@ -2379,13 +2846,6 @@ async function boot(): Promise<void> {
       warningElement.textContent = `warning: ${warning}`;
       changeDiffStage.append(warningElement);
     }
-    const pendingReview = state.selectedId
-      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
-      : undefined;
-    const requests = state.reviewRequests.filter(
-      (request) => request.documentId === state.selectedId,
-    );
-    const currentReview = pendingReview ?? requests[0];
     const heading = document.createElement("header");
     heading.className = "change-file-heading";
     const path = document.createElement("strong");
@@ -2395,23 +2855,19 @@ async function boot(): Promise<void> {
       ? `renamed from ${file.previousPath}`
       : file.status;
     heading.append(path, details);
-    if (pendingReview) {
-      const fileFeedback = document.createElement("button");
-      fileFeedback.type = "button";
-      fileFeedback.className = "action change-feedback-button";
-      fileFeedback.textContent = "feedback on file";
-      fileFeedback.addEventListener("click", () => {
-        openFeedbackComposer({ path: file.path });
-      });
-      heading.append(fileFeedback);
-    }
+    const fileFeedback = document.createElement("button");
+    fileFeedback.type = "button";
+    fileFeedback.className = "action change-feedback-button";
+    fileFeedback.textContent = "feedback on file";
+    fileFeedback.addEventListener("click", () => {
+      openFeedbackComposer({ path: file.path });
+    });
+    heading.append(fileFeedback);
     changeDiffStage.append(heading);
-    if (pendingReview) {
-      const feedbackHint = document.createElement("p");
-      feedbackHint.className = "change-line-feedback-hint";
-      feedbackHint.textContent = WEB_LINE_FEEDBACK_HINT;
-      changeDiffStage.append(feedbackHint);
-    }
+    const feedbackHint = document.createElement("p");
+    feedbackHint.className = "change-line-feedback-hint";
+    feedbackHint.textContent = WEB_LINE_FEEDBACK_HINT;
+    changeDiffStage.append(feedbackHint);
     if (file.hunks.length === 0) {
       const emptyHunk = document.createElement("p");
       emptyHunk.className = "change-empty";
@@ -2420,9 +2876,12 @@ async function boot(): Promise<void> {
       restoreDetachedFeedbackComposer();
       return;
     }
-    const inlineFeedback = currentReview?.status === "pending"
-      ? feedbackItems
-      : currentReview?.response?.items ?? [];
+    const inlineFeedback = [
+      ...storedDiffItems(feedbackHistory.filter(
+        ({ documentRevision }) => documentRevision === renderedRevision,
+      )),
+      ...draftDiffItems(feedbackComments),
+    ];
     for (const hunk of file.hunks) {
       const region = document.createElement("section");
       region.className = "change-region";
@@ -2466,7 +2925,7 @@ async function boot(): Promise<void> {
                   line: row.new.line,
                   side: "new",
                 })),
-          ], currentReview?.status === "pending");
+          ], true);
           appendInlineComposer(table, [
             ...(row.old?.line === null || row.old?.line === undefined
               ? []
@@ -2486,7 +2945,7 @@ async function boot(): Promise<void> {
               row.new?.line ?? null,
               file.path,
               hunk.id,
-            ), currentReview?.status === "pending");
+            ), true);
             appendInlineComposer(table, [
               ...(row.old.line === null
                 ? []
@@ -2504,7 +2963,7 @@ async function boot(): Promise<void> {
                 null,
                 file.path,
                 hunk.id,
-              ), currentReview?.status === "pending");
+              ), true);
               appendInlineComposer(table, row.old.line === null ? [] : [
                 { line: row.old.line, side: "old" },
               ], file.path, hunk.id);
@@ -2517,7 +2976,7 @@ async function boot(): Promise<void> {
                 row.new.line,
                 file.path,
                 hunk.id,
-              ), currentReview?.status === "pending");
+              ), true);
               appendInlineComposer(table, row.new.line === null ? [] : [
                 { line: row.new.line, side: "new" },
               ], file.path, hunk.id);
@@ -2574,7 +3033,8 @@ async function boot(): Promise<void> {
       message.textContent = item.message;
       content.append(label, message);
       block.append(content);
-      if (editable) {
+      const draftId = item.id.replace(/^feedback-/, "comment-");
+      if (editable && feedbackComments.some(({ id }) => id === draftId)) {
         const actions = document.createElement("div");
         actions.className = "diff-inline-feedback-actions";
         const edit = document.createElement("button");
@@ -2593,12 +3053,10 @@ async function boot(): Promise<void> {
         remove.className = "action";
         remove.textContent = "remove";
         remove.addEventListener("click", () => {
-          feedbackItems = removeReviewDraftFeedback({
-            message: reviewResponse.value,
-            items: feedbackItems,
-          }, item.id).items;
-          if (feedbackEditingId === item.id) closeFeedbackComposer();
-          persistCurrentReviewDraft();
+          const commentId = item.id.replace(/^feedback-/, "comment-");
+          feedbackComments = feedbackComments.filter(({ id }) => id !== commentId);
+          if (feedbackEditingId === commentId) closeFeedbackComposer();
+          persistCurrentFeedbackDraft();
           if (state.selectedId) {
             renderFeedbackPanel(pendingReviewForDocument(
               state.reviewRequests,
@@ -2620,13 +3078,16 @@ async function boot(): Promise<void> {
     path: string,
     hunkId: string,
   ): void {
+    const draft = feedbackDraft;
     if (
-      feedbackDraft?.line === undefined ||
-      feedbackDraft.path !== path ||
-      feedbackDraft.hunkId !== hunkId ||
+      !draft ||
+      isMarkdownFeedbackAnchor(draft) ||
+      draft.line === undefined ||
+      draft.path !== path ||
+      draft.hunkId !== hunkId ||
       !endpoints.some(({ line, side }) =>
-        line === (feedbackDraft?.endLine ?? feedbackDraft?.line) &&
-        side === feedbackDraft?.side
+        line === (draft.endLine ?? draft.line) &&
+        side === draft.side
       )
     ) return;
     reviewFeedbackComposer.classList.add("diff-inline-composer");
@@ -2676,10 +3137,7 @@ async function boot(): Promise<void> {
       side: "old" | "new";
     },
   ): HTMLElement {
-    const pending = state.selectedId
-      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
-      : undefined;
-    const model = webDiffLineControlModel(line, anchor.side, Boolean(pending));
+    const model = webDiffLineControlModel(line, anchor.side, state.selectedId !== undefined);
     const value = document.createElement(model.feedbackLabel ? "button" : "span");
     value.className = "diff-line-number";
     const number = document.createElement("span");
@@ -2699,6 +3157,7 @@ async function boot(): Promise<void> {
       value.classList.toggle(
         "selected-range",
         feedbackDraft !== undefined &&
+          !isMarkdownFeedbackAnchor(feedbackDraft) &&
           feedbackAnchorContainsLine(feedbackDraft, clickedAnchor),
       );
       const feedbackLabel = `${model.feedbackLabel}; Shift-click another line to select a range`;
@@ -2853,6 +3312,16 @@ async function boot(): Promise<void> {
       }
       setMissingReader(false);
       renderedChangeReview = rendered.changeReview;
+      if (feedbackDraftRevision !== rendered.document.revision) {
+        persistCurrentFeedbackDraft();
+        const draft = loadDocumentFeedbackDraft(localStorage, rendered.document);
+        feedbackComments = draft.comments;
+        feedbackGeneralMessage.value = draft.generalMessage;
+        feedbackDraftRevision = rendered.document.revision;
+        closeFeedbackComposer();
+      }
+      renderedSourceWitness = rendered.sourceWitness;
+      renderedSourceMap = rendered.sourceMap;
       changeFileIndex = 0;
       changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
@@ -2917,6 +3386,7 @@ async function boot(): Promise<void> {
           ?.scrollIntoView({ block: "start" });
       }
       renderedRevision = rendered.document.revision;
+      void loadFeedbackHistory(id);
       if (!options.markOpened) {
         return;
       }
@@ -2970,11 +3440,21 @@ async function boot(): Promise<void> {
 
   async function openDocument(id: string, pushHistory = true): Promise<void> {
     if (state.selectedId !== id) {
-      feedbackItems = [];
+      feedbackComments = [];
+      feedbackHistory = [];
+      feedbackGeneralMessage.value = "";
       activeReviewDraftId = undefined;
       closeFeedbackComposer();
+      renderedSourceWitness = undefined;
     }
     state.selectedId = id;
+    const selected = state.documents.find((item) => item.id === id);
+    if (selected) {
+      const draft = loadDocumentFeedbackDraft(localStorage, selected);
+      feedbackComments = draft.comments;
+      feedbackGeneralMessage.value = draft.generalMessage;
+      feedbackDraftRevision = selected.revision;
+    }
     workspace.classList.add("reader-open");
     sidebar.removeAttribute("hidden");
     queuePanel.setAttribute("hidden", "");
@@ -3027,14 +3507,11 @@ async function boot(): Promise<void> {
     );
     if (activation) {
       closeFeedbackComposer();
-      feedbackItems = activation.draft.items;
       reviewResponse.value = activation.draft.message;
       activeReviewDraftId = activation.requestId;
     } else if (!pending) {
       clearStoredReviewDraft(current.id);
-      feedbackItems = [];
       activeReviewDraftId = undefined;
-      closeFeedbackComposer();
     }
     renderFeedbackPanel(current);
     reviewResponse.toggleAttribute("hidden", !pending);
@@ -3062,15 +3539,27 @@ async function boot(): Promise<void> {
     if (!request) {
       return;
     }
-    const message = reviewResponse.value;
     const selected = state.documents.find(({ id }) => id === state.selectedId);
-    const validation = outcome !== "changes_requested" &&
-        outcome !== "approved" && feedbackItems.length > 0
-      ? "Request changes or remove the anchored feedback before deciding."
-      : selected?.kind === "change-review" && outcome === "approved"
+    if (!selected) return;
+    const decisionMessage = reviewResponse.value.trim();
+    const feedbackMessage = feedbackGeneralMessage.value.trim();
+    const hasFeedbackDraft = feedbackMessage !== "" || feedbackComments.length > 0;
+    const message = decisionMessage === ""
+      ? feedbackMessage
+      : feedbackMessage === "" || feedbackMessage === decisionMessage
+        ? decisionMessage
+        : `Feedback:\n${feedbackMessage}\n\nDecision:\n${decisionMessage}`;
+    const structuredFeedback = hasFeedbackDraft
+      ? currentFeedbackRegistration(selected, message)
+      : undefined;
+    const validation = selected?.kind === "change-review" && outcome === "approved"
         ? changeReviewApprovalError(renderedChangeReview) ??
-          reviewResponseError(outcome, message, feedbackItems)
-        : reviewResponseError(outcome, message, feedbackItems);
+          reviewResponseError(outcome, message, feedbackComments.length > 0
+            ? draftDiffItems(feedbackComments)
+            : [])
+        : outcome === "changes_requested" && message === "" && feedbackComments.length > 0
+          ? undefined
+          : reviewResponseError(outcome, message);
     if (validation) {
       reviewError.textContent = validation;
       reviewResponse.focus();
@@ -3085,7 +3574,6 @@ async function boot(): Promise<void> {
     ]) {
       button.disabled = true;
     }
-    const responseItems = reviewFeedbackItemsForOutcome(outcome, feedbackItems);
     try {
       const updated = await api<WebReviewRequest>(
         `/api/v1/review-requests/${request.id}/respond`,
@@ -3094,7 +3582,7 @@ async function boot(): Promise<void> {
           body: JSON.stringify({
             outcome,
             message,
-            ...(responseItems === undefined ? {} : { items: responseItems }),
+            ...(structuredFeedback === undefined ? {} : { feedback: structuredFeedback }),
           }),
         },
       );
@@ -3102,7 +3590,16 @@ async function boot(): Promise<void> {
         item.id === updated.id ? updated : item,
       );
       reviewResponse.value = "";
-      feedbackItems = [];
+      if (structuredFeedback !== undefined) {
+        feedbackComments = [];
+        feedbackGeneralMessage.value = "";
+        try {
+          localStorage.removeItem(documentFeedbackDraftStorageKey(selected));
+        } catch {
+          // The decision and feedback were already stored atomically.
+        }
+        void loadFeedbackHistory(selected.id);
+      }
       clearStoredReviewDraft(request.id);
       activeReviewDraftId = undefined;
       closeFeedbackComposer();
@@ -3152,7 +3649,14 @@ async function boot(): Promise<void> {
   function closeReader(pushHistory = true): void {
     renderSequence += 1;
     renderedRevision = undefined;
+    renderedSourceWitness = undefined;
+    feedbackDraftRevision = undefined;
     renderedChangeReview = undefined;
+    renderedSourceMap = undefined;
+    selectedMarkdownWitness = undefined;
+    feedbackAddSelection.setAttribute("hidden", "");
+    feedbackPanel.setAttribute("hidden", "");
+    reviewPanel.setAttribute("hidden", "");
     state.selectedId = undefined;
     workspace.classList.remove("reader-open");
     sidebar.setAttribute("hidden", "");
@@ -3558,6 +4062,21 @@ async function boot(): Promise<void> {
     closeFeedbackComposer();
     renderChangeReview();
   });
+  feedbackAddSelection.addEventListener("click", () => {
+    if (!selectedMarkdownWitness) return;
+    openFeedbackComposer(
+      selectedMarkdownWitness,
+      undefined,
+      undefined,
+      false,
+      `“${selectedMarkdownLabel}”`,
+    );
+    feedbackAddSelection.setAttribute("hidden", "");
+  });
+  readerContent.addEventListener("mouseup", captureMarkdownSelection);
+  readerContent.addEventListener("keyup", captureMarkdownSelection);
+  feedbackGeneralMessage.addEventListener("input", persistCurrentFeedbackDraft);
+  feedbackSend.addEventListener("click", () => void submitFeedback());
   reviewResponse.addEventListener("input", () => persistCurrentReviewDraft());
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
