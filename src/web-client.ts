@@ -1679,6 +1679,9 @@ async function boot(): Promise<void> {
   const changeViewDocument = element("change-view-document") as HTMLButtonElement;
   const readerToc = element("reader-toc");
   const readerTocList = element("reader-toc-list");
+  const contentsToggle = element("contents-toggle") as HTMLButtonElement;
+  const compactViewport = window.matchMedia("(max-width: 1024px)");
+  let contentsPreference: boolean | undefined;
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
   const feedbackPanel = element("feedback-panel");
@@ -2180,10 +2183,46 @@ async function boot(): Promise<void> {
     }
   }
 
-  function render(): void {
+  function renderReaderLayout(): void {
     const readerOpen = state.selectedId !== undefined;
+    const hasContents =
+      readerOpen && !readerToc.hidden && readerTocList.childElementCount > 0;
+    const contentsOpen =
+      hasContents && (contentsPreference ?? !compactViewport.matches);
     workspace.classList.toggle("reader-open", readerOpen);
-    sidebar.toggleAttribute("hidden", !readerOpen);
+    workspace.classList.toggle("contents-open", contentsOpen);
+    sidebar.toggleAttribute("hidden", !contentsOpen);
+    contentsToggle.toggleAttribute("hidden", !hasContents);
+    contentsToggle.setAttribute("aria-expanded", String(contentsOpen));
+    contentsToggle.textContent = contentsOpen ? "hide contents" : "show contents";
+  }
+
+  contentsToggle.addEventListener("click", () => {
+    contentsPreference = sidebar.hidden;
+    renderReaderLayout();
+  });
+  compactViewport.addEventListener("change", renderReaderLayout);
+  const topbar = document.querySelector<HTMLElement>(".topbar");
+  const readerToolbar = document.querySelector<HTMLElement>(".reader-toolbar");
+  if (topbar) {
+    const observer = new ResizeObserver(() => {
+      document.documentElement.style.setProperty(
+        "--topbar-height",
+        `${Math.ceil(topbar.getBoundingClientRect().height)}px`,
+      );
+      if (readerToolbar) {
+        document.documentElement.style.setProperty(
+          "--reader-toolbar-height",
+          `${Math.ceil(readerToolbar.getBoundingClientRect().height)}px`,
+        );
+      }
+    });
+    observer.observe(topbar);
+    if (readerToolbar) observer.observe(readerToolbar);
+  }
+
+  function render(): void {
+    renderReaderLayout();
     renderProjects();
     renderStatusCounts();
     renderPendingDecisions();
@@ -2193,7 +2232,7 @@ async function boot(): Promise<void> {
 
   function renderDocumentOutline(): void {
     readerTocList.replaceChildren();
-    const outline = documentOutline(
+    const outline = readerContent.classList.contains("source-missing") ? [] : documentOutline(
       Array.from(
         readerContent.querySelectorAll<HTMLElement>(
           "h1, h2, h3, h4, h5, h6",
@@ -2217,6 +2256,7 @@ async function boot(): Promise<void> {
       entry.append(link);
       readerTocList.append(entry);
     }
+    renderReaderLayout();
   }
 
   async function load(
@@ -2812,6 +2852,7 @@ async function boot(): Promise<void> {
     changeViewDocument.toggleAttribute("hidden", !review);
     if (showDiff) {
       readerToc.setAttribute("hidden", "");
+      renderReaderLayout();
     } else {
       renderDocumentOutline();
     }
@@ -3455,12 +3496,11 @@ async function boot(): Promise<void> {
       feedbackGeneralMessage.value = draft.generalMessage;
       feedbackDraftRevision = selected.revision;
     }
-    workspace.classList.add("reader-open");
-    sidebar.removeAttribute("hidden");
     queuePanel.setAttribute("hidden", "");
     reader.removeAttribute("hidden");
     readerToc.setAttribute("hidden", "");
     readerTocList.replaceChildren();
+    renderReaderLayout();
     setMissingReader(false);
     await renderSelectedDocument(id, {
       markOpened: true,
@@ -3643,6 +3683,7 @@ async function boot(): Promise<void> {
     if (missing) {
       readerToc.setAttribute("hidden", "");
       readerTocList.replaceChildren();
+      renderReaderLayout();
     }
   }
 
@@ -3658,11 +3699,10 @@ async function boot(): Promise<void> {
     feedbackPanel.setAttribute("hidden", "");
     reviewPanel.setAttribute("hidden", "");
     state.selectedId = undefined;
-    workspace.classList.remove("reader-open");
-    sidebar.setAttribute("hidden", "");
     reader.setAttribute("hidden", "");
     readerToc.setAttribute("hidden", "");
     readerTocList.replaceChildren();
+    renderReaderLayout();
     queuePanel.removeAttribute("hidden");
     if (pushHistory) {
       const workspaces = currentVisibleWorkspaces(

@@ -87,7 +87,8 @@ test("selects, persists, and renders a review comment inline", async ({ page }) 
       "Keep this validation block together.",
     );
   } finally {
-    await server.close();
+    await test.step("close browser connections", () => page.context().close());
+    await test.step("close fixture server", () => server.close());
     catalog.close();
     await rm(root, { recursive: true, force: true });
   }
