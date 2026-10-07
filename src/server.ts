@@ -11,8 +11,8 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { renderMarkdown } from "mdmaid";
-import { renderMarkdownToTui } from "mdmaid/tui";
+import { renderMarkdownWithSourceMap } from "mdmaid";
+import { renderMarkdownToTuiWithSourceMap } from "mdmaid/tui";
 import sanitizeHtml from "sanitize-html";
 
 import {
@@ -24,6 +24,8 @@ import {
   type DocumentFilters,
   DocumentSourceLinkNotFoundError,
   DocumentSourceMissingError,
+  FeedbackConflictError,
+  type CreateFeedbackInput,
   LinkedSourceMissingError,
   LinkedSourceUnavailableError,
   type RegisterDocumentInput,
@@ -48,7 +50,6 @@ import {
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import {
-  changeReviewNarrative,
   parseChangeReviewDiffs,
 } from "./change-review.js";
 import {
@@ -276,6 +277,7 @@ async function handleRequest(
           "spaces-v1",
           "scoped-content-v1",
           "workspace-reconciliation-v1",
+          "document-feedback-v1",
         ],
       },
     });
@@ -286,6 +288,7 @@ async function handleRequest(
     request.method === "GET" &&
     (url.pathname === "/" ||
       /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
+      /^\/f\/feedback-[a-f0-9]{20}$/.test(url.pathname) ||
       /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
       /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname)) &&
     url.searchParams.has("token")
@@ -310,6 +313,19 @@ async function handleRequest(
     throw new HttpError(401, "unauthorized", "Authentication required");
   }
   authorizeOrigin(request, auth, baseUrl);
+
+  const feedbackRouteMatch = url.pathname.match(
+    /^\/f\/(feedback-[a-f0-9]{20})$/,
+  );
+  if (request.method === "GET" && feedbackRouteMatch) {
+    const scope = parseWorkspaceQueryState(url.searchParams, catalog);
+    const submission = catalog.getFeedback(feedbackRouteMatch[1] ?? "", scope);
+    if (!submission) {
+      throw new HttpError(404, "not_found", "Feedback not found");
+    }
+    sendHtml(response, 200, workspaceHtml(url.pathname));
+    return;
+  }
 
   const sourceMatch = url.pathname.match(
     /^\/d\/(doc-[a-f0-9]{20})\/source\/(source-[a-f0-9]{20})$/,
@@ -360,6 +376,7 @@ async function handleRequest(
     request.method === "GET" &&
     (url.pathname === "/" ||
       /^\/d\/doc-[a-f0-9]{20}$/.test(url.pathname) ||
+      /^\/f\/feedback-[a-f0-9]{20}$/.test(url.pathname) ||
       /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
       /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname))
   ) {
@@ -635,6 +652,65 @@ async function handleRequest(
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/api/v1/feedback") {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const documentId = url.searchParams.get("document");
+    if (documentId === null) {
+      throw new HttpError(400, "validation_error", "document is required");
+    }
+    const revisionValue = url.searchParams.get("revision");
+    const limitValue = url.searchParams.get("limit");
+    try {
+      sendJson(response, 200, {
+        data: catalog.listFeedback({
+          documentId,
+          ...(revisionValue === null
+            ? {}
+            : { documentRevision: Number(revisionValue) }),
+          ...(limitValue === null ? {} : { limit: Number(limitValue) }),
+          ...(url.searchParams.get("cursor") === null
+            ? {}
+            : { cursor: url.searchParams.get("cursor")! }),
+        }, scope),
+      });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/v1/feedback") {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const body = await readJson(request);
+    if (!isRecord(body)) {
+      throw new HttpError(422, "validation_error", "Invalid feedback submission");
+    }
+    try {
+      const submission = await catalog.createFeedback(
+        body as unknown as CreateFeedbackInput,
+        scope,
+      );
+      response.setHeader("location", `/api/v1/feedback/${submission.id}`);
+      sendJson(response, 201, { data: submission });
+    } catch (error) {
+      throw mapCatalogError(error);
+    }
+    return;
+  }
+
+  const feedbackMatch = url.pathname.match(
+    /^\/api\/v1\/feedback\/(feedback-[a-f0-9]{20})$/,
+  );
+  if (request.method === "GET" && feedbackMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const submission = catalog.getFeedback(feedbackMatch[1] ?? "", scope);
+    if (!submission) {
+      throw new HttpError(404, "not_found", "Feedback not found");
+    }
+    sendJson(response, 200, { data: submission });
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/api/v1/review-requests") {
     const scope = parseContentScope(url.searchParams, catalog);
     const documentId = url.searchParams.get("document") ?? undefined;
@@ -749,18 +825,20 @@ async function handleRequest(
     const changeReview = document.kind === "change-review"
       ? parseChangeReviewDiffs(content)
       : undefined;
-    const narrative = document.kind === "change-review"
-      ? changeReviewNarrative(content)
-      : content;
     if (target === "web") {
-      const renderedMarkdown = await renderMarkdown(narrative, { sanitize: false });
+      const renderedMarkdown = await renderMarkdownWithSourceMap(content, {
+        sanitize: false,
+        ...(document.kind === "change-review"
+          ? { omitFencedCodeLanguages: ["diff"] }
+          : {}),
+      });
       const current = catalog.getDocument(id, scope);
       if (!current) {
         throw new HttpError(404, "not_found", "Document not found");
       }
       const documentTargets = catalog.resolveDocumentSourceTargets(current.id, scope);
       const rendered = sanitizeRenderedHtml(
-        renderedMarkdown,
+        renderedMarkdown.html,
         current,
         documentTargets,
         querySuffix,
@@ -770,6 +848,8 @@ async function handleRequest(
           document: publicDocument(current),
           target,
           content: rendered,
+          sourceWitness: catalog.feedbackSourceWitness(current.id, scope),
+          sourceMap: renderedMarkdown.sourceMap,
           ...(changeReview === undefined ? {} : { changeReview }),
         },
       });
@@ -782,11 +862,14 @@ async function handleRequest(
       "unicode",
       true,
     );
-    const rendered = await renderMarkdownToTui(narrative, {
+    const rendered = await renderMarkdownToTuiWithSourceMap(content, {
       backend: "beautiful-mermaid",
       color,
       unicode,
       width,
+      ...(document.kind === "change-review"
+        ? { omitFencedCodeLanguages: ["diff"] }
+        : {}),
     });
     const current = catalog.getDocument(id, scope);
     if (!current) {
@@ -799,6 +882,8 @@ async function handleRequest(
         content: sanitizeTerminalText(rendered.output, { preserveSgr: true }),
         backend: rendered.backend,
         warnings: rendered.warnings.map((warning) => sanitizeTerminalText(warning)),
+        sourceWitness: catalog.feedbackSourceWitness(current.id, scope),
+        sourceMap: rendered.sourceMap,
         ...(changeReview === undefined ? {} : { changeReview }),
       },
     });
@@ -1130,6 +1215,9 @@ function mapCatalogError(error: unknown): HttpError {
   if (error instanceof ReviewConflictError) {
     return new HttpError(409, "review_conflict", error.message);
   }
+  if (error instanceof FeedbackConflictError) {
+    return new HttpError(409, "feedback_conflict", error.message);
+  }
   if (error instanceof DocumentSourceMissingError) {
     return new HttpError(410, "source_missing", "Document source is missing");
   }
@@ -1291,7 +1379,7 @@ function sanitizeRenderedHtml(
       h5: ["id"],
       h6: ["id"],
       img: ["src", "alt", "title", "width", "height"],
-      span: ["class", "aria-hidden"],
+      span: ["class", "aria-hidden", "data-mdmaid-source-ref"],
     },
     allowedClasses: {
       code: [/^language-[a-z0-9_-]+$/],
@@ -1560,10 +1648,11 @@ function isReviewRequestResponse(
 ): value is ReviewRequestResponse {
   return (
     isRecord(value) &&
-    hasOnlyKeys(value, ["outcome", "message", "items"]) &&
+    hasOnlyKeys(value, ["outcome", "message", "items", "feedback"]) &&
     typeof value.outcome === "string" &&
     typeof value.message === "string" &&
-    (value.items === undefined || Array.isArray(value.items))
+    (value.items === undefined || Array.isArray(value.items)) &&
+    (value.feedback === undefined || isRecord(value.feedback))
   );
 }
 
@@ -1690,6 +1779,7 @@ function sendDocumentMedia(
 
 function workspaceHtml(pathname: string): string {
   const documentId = pathname.startsWith("/d/") ? pathname.slice(3) : "";
+  const feedbackId = pathname.startsWith("/f/") ? pathname.slice(3) : "";
   const workspaceId = pathname.startsWith("/w/") ? pathname.slice(3) : "";
   const projectId = pathname.startsWith("/p/") ? pathname.slice(3) : "";
   return `<!doctype html>
@@ -1704,7 +1794,7 @@ function workspaceHtml(pathname: string): string {
     <script defer src="/assets/mermaid.min.js"></script>
     <script type="module" src="/assets/app.js"></script>
   </head>
-  <body data-document-id="${documentId}" data-workspace-id="${workspaceId}" data-project-id="${projectId}">
+  <body data-document-id="${documentId}" data-feedback-id="${feedbackId}" data-workspace-id="${workspaceId}" data-project-id="${projectId}">
     <header class="topbar">
       <a class="brand" href="/">
         <strong>mdmaid.desk</strong>
@@ -1834,15 +1924,15 @@ function workspaceHtml(pathname: string): string {
             </div>
           </section>
           <div id="reader-content" class="reader-content"></div>
-          <section id="review-panel" class="review-panel" aria-labelledby="review-title" hidden>
-            <span class="eyebrow">action required</span>
-            <h2 id="review-title">Human decision</h2>
-            <p id="review-request-message" class="review-message"></p>
-            <p id="review-status" class="review-status"></p>
+          <button id="document-feedback-add-selection" class="action document-feedback-add-selection" type="button" hidden>+ comment on selection</button>
+          <section id="feedback-panel" class="review-panel feedback-panel" aria-labelledby="feedback-title" hidden>
+            <span class="eyebrow">feedback</span>
+            <h2 id="feedback-title">Comment on this document</h2>
+            <p class="review-status">Feedback is saved independently. The agent can fetch it by ID or URL.</p>
             <div id="review-feedback-section" class="review-feedback-section" hidden>
               <div class="review-feedback-heading">
-                <strong>Anchored feedback</strong>
-                <span>Click a line; Shift-click another line for a range.</span>
+                <strong>Specific comments</strong>
+                <span>Select document text, or click + beside a diff line.</span>
               </div>
               <div id="review-feedback-list" class="review-feedback-list"></div>
               <div id="review-feedback-composer" class="review-feedback-composer" hidden>
@@ -1854,7 +1944,20 @@ function workspaceHtml(pathname: string): string {
                 </div>
               </div>
             </div>
-            <label for="review-response">General note</label>
+            <label for="feedback-general-message">General feedback</label>
+            <textarea id="feedback-general-message" rows="5" maxlength="16384" placeholder="Add overall feedback for the agent…"></textarea>
+            <p id="feedback-error" class="review-error" role="alert"></p>
+            <div class="review-actions">
+              <button id="feedback-send" class="action" type="button">send feedback</button>
+            </div>
+            <div id="feedback-history" class="feedback-history" hidden></div>
+          </section>
+          <section id="review-panel" class="review-panel" aria-labelledby="review-title" hidden>
+            <span class="eyebrow">action required</span>
+            <h2 id="review-title">Human decision</h2>
+            <p id="review-request-message" class="review-message"></p>
+            <p id="review-status" class="review-status"></p>
+            <label for="review-response">Decision note</label>
             <textarea id="review-response" rows="5" maxlength="16384" placeholder="Add overall context for the agent…"></textarea>
             <p id="review-error" class="review-error" role="alert"></p>
             <div id="review-actions" class="review-actions">

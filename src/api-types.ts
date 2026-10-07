@@ -1,6 +1,7 @@
 import type {
   Attention,
   DocumentKind,
+  FeedbackSubmission,
   ReadingStatus,
   ReviewKind,
   ReviewFeedbackItem,
@@ -11,6 +12,11 @@ import type {
   Space,
   SpaceMatcher,
 } from "./domain.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
+import type {
+  CreateFeedbackInput,
+  FeedbackPage,
+} from "./catalog.js";
 import type { ChangeReviewDiff } from "./change-review.js";
 
 export type {
@@ -116,6 +122,9 @@ export interface DocumentRegistration {
 export type DocumentImport = DocumentRegistration;
 
 export type PublicReviewRequest = ReviewRequest;
+export type PublicFeedbackSubmission = FeedbackSubmission;
+export type FeedbackSubmissionRegistration = CreateFeedbackInput;
+export type PublicFeedbackPage = FeedbackPage;
 
 export interface ReviewRequestRegistration {
   documentId: string;
@@ -128,6 +137,7 @@ export interface ReviewRequestResponse {
   outcome: ReviewOutcome;
   message: string;
   items?: ReviewFeedbackItem[];
+  feedback?: FeedbackSubmissionRegistration;
 }
 
 export interface HealthData {
@@ -148,6 +158,8 @@ export interface WebRender {
   document: PublicDocument;
   target: "web";
   content: string;
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 
@@ -157,6 +169,8 @@ export interface TerminalRender {
   content: string;
   backend: string;
   warnings: string[];
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 

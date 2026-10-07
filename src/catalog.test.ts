@@ -2580,7 +2580,13 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   versionOne.exec("ALTER TABLE documents DROP COLUMN source_path");
   versionOne.exec("ALTER TABLE documents DROP COLUMN storage_kind");
   versionOne.exec(
-    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     DROP TABLE review_requests;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
   );
   versionOne.pragma("user_version = 1");
   versionOne.close();
@@ -2590,7 +2596,13 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const versionTwo = new Database(databasePath);
   versionTwo.exec("DROP TABLE document_source_links");
   versionTwo.exec(
-    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     DROP TABLE review_requests;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
   );
   versionTwo.pragma("user_version = 2");
   versionTwo.close();
@@ -2601,6 +2613,8 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
 
   const versionThree = new Database(databasePath);
   versionThree.exec("DROP TABLE review_responses");
+  versionThree.exec("DROP TABLE feedback_comments");
+  versionThree.exec("DROP TABLE feedback_submissions");
   versionThree.exec("DROP TABLE review_requests");
   versionThree.exec(
     "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
@@ -2613,7 +2627,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 9);
+  assert.equal(database.pragma("user_version", { simple: true }), 10);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -2634,6 +2648,8 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       "document_source_links",
       "document_tags",
       "documents",
+      "feedback_comments",
+      "feedback_submissions",
       "projects",
       "review_requests",
       "review_responses",
@@ -2745,8 +2761,39 @@ test("migrates version four review requests without losing decisions", async () 
   catalog.close();
 
   const versionFour = new Database(statePath);
+  const existingResponse = versionFour.prepare<[], {
+    outcome: string;
+    message: string;
+    created_at: string;
+  }>(
+    `SELECT rr.outcome, fs.general_message AS message, rr.created_at
+     FROM review_responses rr
+     JOIN feedback_submissions fs ON fs.id = rr.feedback_id`,
+  ).get();
+  assert.ok(existingResponse);
   versionFour.exec(
-    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     CREATE TABLE review_responses (
+       review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+       outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+       message TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     ) STRICT;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
+  );
+  versionFour.prepare(
+    `INSERT INTO review_responses (
+       review_request_id, outcome, message, created_at
+     ) VALUES (?, ?, ?, ?)`,
+  ).run(
+    request.id,
+    existingResponse.outcome,
+    existingResponse.message,
+    existingResponse.created_at,
   );
   versionFour.pragma("user_version = 4");
   versionFour.close();
@@ -2760,7 +2807,7 @@ test("migrates version four review requests without losing decisions", async () 
   migrated.close();
 
   const database = new Database(statePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 9);
+  assert.equal(database.pragma("user_version", { simple: true }), 10);
   const schema = database
     .prepare<[], { sql: string }>(
       "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",

@@ -1,12 +1,15 @@
 import type {
   ContentScope,
   DocumentFilters,
+  FeedbackStoragePage,
+  FeedbackSubmissionFilters,
   ReviewRequestFilters,
   Project,
   RepositoryInventoryItem,
   RepositoryIdentity,
   Space,
   StoredDocument,
+  StoredFeedbackSubmission,
   StoredReviewRequest,
   Workspace,
 } from "./domain.js";
@@ -41,12 +44,25 @@ export interface CatalogStorage {
   ): string | undefined;
   saveDocument(document: StoredDocument): void;
   deleteDocuments(ids: readonly string[]): number;
+  listFeedbackSubmissions(
+    filters: FeedbackSubmissionFilters,
+    page: FeedbackStoragePage,
+    scope?: ContentScope,
+  ): StoredFeedbackSubmission[];
+  getFeedbackSubmission(
+    id: string,
+    scope?: ContentScope,
+  ): StoredFeedbackSubmission | undefined;
+  saveFeedbackSubmission(submission: StoredFeedbackSubmission): boolean;
   listReviewRequests(
     filters?: ReviewRequestFilters,
     scope?: ContentScope,
   ): StoredReviewRequest[];
   getReviewRequest(id: string, scope?: ContentScope): StoredReviewRequest | undefined;
   saveReviewRequest(request: StoredReviewRequest): void;
-  completeReviewRequest(request: StoredReviewRequest): boolean;
+  completeReviewRequest(
+    request: StoredReviewRequest,
+    feedback?: StoredFeedbackSubmission,
+  ): boolean;
   staleReviewRequest(id: string, staleAt: string): boolean;
 }

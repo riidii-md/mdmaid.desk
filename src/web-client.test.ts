@@ -7,6 +7,7 @@ import {
   bulkDocumentIds,
   changeReviewApprovalError,
   cleanupReviewDrafts,
+  documentFeedbackDraftStorageKey,
   documentHistoryState,
   documentFragmentId,
   documentOutline,
@@ -31,6 +32,9 @@ import {
   queueCounts,
   requestDocumentPrint,
   loadReviewDraft,
+  loadDocumentFeedbackDraft,
+  markdownSelectionWitness,
+  persistDocumentFeedbackDraft,
   persistReviewDraft,
   removeReviewDraftFeedback,
   reviewFeedbackItemsForOutcome,
@@ -50,6 +54,7 @@ import {
   workspaceRouteWithState,
   upsertReviewDraftFeedback,
   type ReviewDraftStorage,
+  type WebDocumentFeedbackDraft,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
@@ -1375,6 +1380,92 @@ test("requests the browser print dialog for PDF export", () => {
     },
   });
   assert.equal(calls, 1);
+});
+
+test("builds Markdown selection witnesses only within one mapped block", () => {
+  const sourceMap = {
+    version: 1 as const,
+    coordinateSystem: "utf16-code-units" as const,
+    sourceLength: 12,
+    segments: [
+      {
+        ref: "m1-s1",
+        blockRef: "m1-b1",
+        text: "hello ",
+        sourceStart: { offset: 0, line: 1, column: 1 },
+        sourceEnd: { offset: 6, line: 1, column: 7 },
+        mapping: "identity" as const,
+      },
+      {
+        ref: "m1-s2",
+        blockRef: "m1-b1",
+        text: "world",
+        sourceStart: { offset: 6, line: 1, column: 7 },
+        sourceEnd: { offset: 11, line: 1, column: 12 },
+        mapping: "identity" as const,
+      },
+      {
+        ref: "m1-s3",
+        blockRef: "m1-b2",
+        text: "next",
+        sourceStart: { offset: 12, line: 2, column: 1 },
+        sourceEnd: { offset: 16, line: 2, column: 5 },
+        mapping: "identity" as const,
+      },
+    ],
+    logicalLines: [],
+    exclusions: [],
+  };
+  assert.deepEqual(
+    markdownSelectionWitness(sourceMap, "m1-s1", 2, "m1-s2", 3),
+    {
+      kind: "markdown-selection-v1",
+      start: { ref: "m1-s1", offset: 2 },
+      end: { ref: "m1-s2", offset: 3 },
+    },
+  );
+  assert.equal(
+    markdownSelectionWitness(sourceMap, "m1-s1", 2, "m1-s3", 3),
+    undefined,
+  );
+  assert.equal(
+    markdownSelectionWitness(sourceMap, "m1-s1", 7, "m1-s2", 3),
+    undefined,
+  );
+});
+
+test("persists document feedback drafts by document revision", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => void values.delete(key),
+  };
+  const draft: WebDocumentFeedbackDraft = {
+    generalMessage: "Overall note",
+    comments: [{
+      id: "comment-11111111111111111111",
+      intent: "feedback",
+      anchor: {
+        kind: "markdown-selection-v1",
+        start: { ref: "m1-s1", offset: 0 },
+        end: { ref: "m1-s1", offset: 5 },
+      },
+      label: "hello",
+      message: "Clarify this.",
+    }],
+  };
+  persistDocumentFeedbackDraft(storage, documents[0]!, draft);
+  assert.deepEqual(loadDocumentFeedbackDraft(storage, documents[0]!), draft);
+  assert.equal(
+    documentFeedbackDraftStorageKey(documents[0]!),
+    `mdmaid-desk-feedback-draft:${documents[0]!.id}:1`,
+  );
+  persistDocumentFeedbackDraft(storage, documents[0]!, {
+    generalMessage: "",
+    comments: [],
+  });
+  assert.equal(values.size, 0);
 });
 
 test("explains how to recover when the browser session expires", () => {

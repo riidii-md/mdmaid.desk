@@ -11,8 +11,11 @@ import type {
   DocumentAction,
   DocumentImport,
   DocumentRegistration,
+  FeedbackSubmissionRegistration,
   HealthData,
   PublicDocument,
+  PublicFeedbackPage,
+  PublicFeedbackSubmission,
   PublicProject,
   PublicRepository,
   PublicReviewRequest,
@@ -356,6 +359,58 @@ export class DeskApiClient {
     );
     if (!isPublicReviewRequest(value)) {
       throw new Error("Daemon returned an invalid review request");
+    }
+    return value;
+  }
+
+  async createFeedback(
+    input: FeedbackSubmissionRegistration,
+    scope: ContentScope = {},
+  ): Promise<PublicFeedbackSubmission> {
+    const value = await this.#request(withScope("/api/v1/feedback", scope), {
+      method: "POST",
+      body: input,
+    });
+    if (!isPublicFeedbackSubmission(value)) {
+      throw new Error("Daemon returned an invalid feedback submission");
+    }
+    return value;
+  }
+
+  async getFeedback(
+    id: string,
+    scope: ContentScope = {},
+  ): Promise<PublicFeedbackSubmission> {
+    assertFeedbackId(id);
+    const value = await this.#request(
+      withScope(`/api/v1/feedback/${encodeURIComponent(id)}`, scope),
+    );
+    if (!isPublicFeedbackSubmission(value)) {
+      throw new Error("Daemon returned an invalid feedback submission");
+    }
+    return value;
+  }
+
+  async listFeedback(
+    input: {
+      documentId: string;
+      documentRevision?: number;
+      cursor?: string;
+      limit?: number;
+    },
+    scope: ContentScope = {},
+  ): Promise<PublicFeedbackPage> {
+    assertDocumentId(input.documentId);
+    const query = new URLSearchParams({ document: input.documentId });
+    if (input.documentRevision !== undefined) {
+      query.set("revision", String(input.documentRevision));
+    }
+    if (input.cursor !== undefined) query.set("cursor", input.cursor);
+    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    addScope(query, scope);
+    const value = await this.#request(`/api/v1/feedback?${query.toString()}`);
+    if (!isPublicFeedbackPage(value)) {
+      throw new Error("Daemon returned an invalid feedback page");
     }
     return value;
   }
@@ -743,6 +798,9 @@ export function isPublicReviewRequest(value: unknown): value is PublicReviewRequ
       (value.response.items === undefined ||
         (Array.isArray(value.response.items) &&
           value.response.items.every(isReviewFeedbackItem))) &&
+      (value.response.feedbackId === undefined ||
+        (typeof value.response.feedbackId === "string" &&
+          /^feedback-[a-f0-9]{20}$/.test(value.response.feedbackId))) &&
       typeof value.response.createdAt === "string");
   return (
     typeof value.id === "string" &&
@@ -821,6 +879,9 @@ function isWebRender(value: unknown): value is WebRender {
     isRecord(value) &&
     value.target === "web" &&
     typeof value.content === "string" &&
+    typeof value.sourceWitness === "string" &&
+    /^witness-[a-f0-9]{64}$/.test(value.sourceWitness) &&
+    isMarkdownSourceMap(value.sourceMap) &&
     (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
@@ -834,9 +895,91 @@ function isTerminalRender(value: unknown): value is TerminalRender {
     typeof value.backend === "string" &&
     Array.isArray(value.warnings) &&
     value.warnings.every((warning) => typeof warning === "string") &&
+    typeof value.sourceWitness === "string" &&
+    /^witness-[a-f0-9]{64}$/.test(value.sourceWitness) &&
+    isMarkdownSourceMap(value.sourceMap) &&
     (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
+}
+
+export function isPublicFeedbackSubmission(
+  value: unknown,
+): value is PublicFeedbackSubmission {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    /^feedback-[a-f0-9]{20}$/.test(value.id) &&
+    typeof value.documentId === "string" &&
+    isDocumentId(value.documentId) &&
+    isInteger(value.documentRevision) &&
+    (value.generalMessage === undefined || typeof value.generalMessage === "string") &&
+    Array.isArray(value.comments) &&
+    value.comments.every(isFeedbackComment) &&
+    (value.reviewRequestId === undefined ||
+      (typeof value.reviewRequestId === "string" &&
+        /^review-[a-f0-9]{20}$/.test(value.reviewRequestId))) &&
+    typeof value.createdAt === "string" &&
+    value.route === `/f/${value.id}`;
+}
+
+function isPublicFeedbackPage(value: unknown): value is PublicFeedbackPage {
+  return isRecord(value) &&
+    Array.isArray(value.items) &&
+    value.items.every(isPublicFeedbackSubmission) &&
+    (value.nextCursor === undefined || typeof value.nextCursor === "string");
+}
+
+function isFeedbackComment(value: unknown): boolean {
+  return isRecord(value) &&
+    typeof value.id === "string" &&
+    /^(?:comment|feedback)-[a-f0-9]{20}$/.test(value.id) &&
+    (value.intent === "feedback" || value.intent === "todo") &&
+    typeof value.message === "string" &&
+    isFeedbackAnchor(value.anchor);
+}
+
+function isFeedbackAnchor(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.kind === "markdown-v1") {
+    return isSourcePoint(value.start) &&
+      isSourcePoint(value.end) &&
+      typeof value.exact === "string" &&
+      typeof value.prefix === "string" &&
+      typeof value.suffix === "string";
+  }
+  if (value.kind === "diff-file-v1") return typeof value.path === "string";
+  return value.kind === "diff-lines-v1" &&
+    typeof value.path === "string" &&
+    typeof value.hunkId === "string" &&
+    (value.side === "old" || value.side === "new") &&
+    isInteger(value.line) &&
+    (value.endLine === undefined || isInteger(value.endLine));
+}
+
+function isMarkdownSourceMap(value: unknown): boolean {
+  return isRecord(value) &&
+    value.version === 1 &&
+    value.coordinateSystem === "utf16-code-units" &&
+    isInteger(value.sourceLength) &&
+    Array.isArray(value.segments) &&
+    value.segments.every((segment) =>
+      isRecord(segment) &&
+      typeof segment.ref === "string" &&
+      typeof segment.blockRef === "string" &&
+      typeof segment.text === "string" &&
+      isSourcePoint(segment.sourceStart) &&
+      isSourcePoint(segment.sourceEnd) &&
+      (segment.mapping === "identity" || segment.mapping === "atomic")
+    ) &&
+    Array.isArray(value.logicalLines) &&
+    Array.isArray(value.exclusions);
+}
+
+function isSourcePoint(value: unknown): boolean {
+  return isRecord(value) &&
+    isInteger(value.offset) &&
+    isInteger(value.line) &&
+    isInteger(value.column);
 }
 
 function isErrorEnvelope(value: unknown): value is ErrorEnvelope {
@@ -959,6 +1102,12 @@ function assertDocumentId(id: string): void {
 function assertReviewRequestId(id: string): void {
   if (!/^review-[a-f0-9]{20}$/.test(id)) {
     throw new Error("invalid review request id");
+  }
+}
+
+function assertFeedbackId(id: string): void {
+  if (!/^feedback-[a-f0-9]{20}$/.test(id)) {
+    throw new Error("invalid feedback id");
   }
 }
 

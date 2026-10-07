@@ -224,6 +224,61 @@ test("refuses a live daemon without Space capabilities without local fallback", 
   await assert.rejects(readFile(statePath), /ENOENT/);
 });
 
+test("shows and lists durable feedback as stable JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-feedback-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "brief.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Brief\n", "utf8");
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  const feedback = await catalog.createFeedback({
+    id: "feedback-0123456789abcdef0123",
+    documentId: document.id,
+    documentRevision: document.revision,
+    generalMessage: "Read this later.",
+    comments: [],
+  });
+  catalog.close();
+
+  const shown = output();
+  assert.equal(await run(
+    ["feedback", "show", feedback.id, "--json"],
+    shown,
+    output(),
+    { statePath, connectDaemon: async () => undefined },
+  ), 0);
+  assert.deepEqual(JSON.parse(shown.text()), {
+    schemaVersion: 1,
+    feedback,
+  });
+
+  const listed = output();
+  assert.equal(await run(
+    ["feedback", "list", "--document", document.id, "--json"],
+    listed,
+    output(),
+    { statePath, connectDaemon: async () => undefined },
+  ), 0);
+  assert.deepEqual(JSON.parse(listed.text()), {
+    schemaVersion: 1,
+    page: { items: [feedback] },
+  });
+});
+
 test("preflights Mermaid and returns every issue as JSON", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-validate-"));
   const documentPath = join(root, "review.md");
