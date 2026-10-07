@@ -1793,7 +1793,10 @@ function workspaceHtml(pathname: string): string {
         </section>
         <article id="document-reader" class="reader" data-testid="document-reader" hidden>
           <div class="reader-toolbar">
-            <button id="reader-back" class="action" type="button">← queue</button>
+            <div class="reader-navigation">
+              <button id="reader-back" class="action" type="button">← queue</button>
+              <button id="contents-toggle" class="action" type="button" aria-controls="sidebar" aria-expanded="false" hidden>show contents</button>
+            </div>
             <div class="reader-actions">
               <button id="mark-read" class="action" type="button">✓ mark read</button>
               <button id="mark-unread" class="action" type="button">○ unread</button>

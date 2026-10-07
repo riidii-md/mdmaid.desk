@@ -1726,9 +1726,9 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(cssText, /Departure Mono/);
     assert.match(
       cssText,
-      /\.reader\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1600px;/,
+      /\.reader\s*\{[^}]*width:\s*100%;/,
     );
-    assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
+    assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*\d/);
     assert.match(cssText, /\.reader-toc/);
     assert.match(cssText, /\.syntax-keyword/);
     assert.match(cssText, /\.diff-line-feedback-marker/);
