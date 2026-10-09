@@ -664,12 +664,74 @@ button.diff-line-number.selected-range {
   box-shadow: 4px 4px 0 var(--ink);
 }
 .document-feedback-add-selection {
-  position: sticky;
-  bottom: 18px;
-  z-index: 6;
-  margin: 10px 0 16px;
+  position: fixed;
+  z-index: 20;
+  margin: 0;
+  max-width: calc(100vw - 16px);
   border-color: var(--reading);
   background: var(--surface);
+}
+.document-feedback-popup {
+  position: fixed;
+  z-index: 21;
+  width: 360px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+  margin: 0;
+  padding: 16px;
+  border: 2px solid var(--reading);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 4px 4px 0 var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.document-feedback-popup p { white-space: pre-wrap; margin: 10px 0 0; }
+.document-feedback-popup label { display: block; margin-bottom: 10px; }
+.document-feedback-popup textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 10px;
+  border: 1px solid var(--ink);
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+}
+.document-feedback-popup textarea:focus { outline: 2px solid var(--reading); }
+.review-feedback-composer .review-error:empty { display: none; }
+.document-feedback-draft-label { color: var(--muted); font-size: 10px; }
+.document-feedback-marker {
+  display: inline-flex;
+  vertical-align: middle;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: 0 3px;
+  padding: 3px;
+  border: 1px solid var(--reading);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--reading);
+  cursor: pointer;
+  user-select: none;
+}
+.document-feedback-marker::before {
+  content: "";
+  width: 12px;
+  height: 10px;
+  border: 1.5px solid currentColor;
+  border-radius: 3px 3px 3px 0;
+}
+.document-feedback-marker:hover, .document-feedback-marker:focus-visible,
+.document-feedback-marker[aria-expanded="true"] {
+  outline: 2px solid var(--reading);
+  outline-offset: 2px;
+}
+@media print {
+  .document-feedback-popup, .document-feedback-marker, .document-feedback-add-selection { display: none !important; }
 }
 .feedback-history {
   display: grid;
@@ -717,6 +779,7 @@ button.diff-line-number.selected-range {
 }
 .review-feedback-item span { overflow-wrap: anywhere; }
 .review-feedback-composer { margin-top: 10px; }
+.review-feedback-composer.document-feedback-popup { margin: 0; }
 .review-feedback-actions { justify-content: flex-start; margin-top: 8px; }
 .review-panel textarea {
   width: 100%;
