@@ -1938,6 +1938,7 @@ function workspaceHtml(pathname: string): string {
               <div id="review-feedback-composer" class="review-feedback-composer" hidden>
                 <label id="review-feedback-anchor" for="review-feedback-message"></label>
                 <textarea id="review-feedback-message" rows="3" maxlength="512" placeholder="Describe the specific issue…"></textarea>
+                <p id="review-feedback-error" class="review-error" role="alert"></p>
                 <div class="review-feedback-actions">
                   <button id="review-feedback-save" class="action" type="button">save feedback</button>
                   <button id="review-feedback-cancel" class="action" type="button">cancel</button>

@@ -20,6 +20,7 @@ import type {
   ChangeReviewLine,
 } from "./change-review.js";
 import type { MarkdownSourceMapV1 } from "mdmaid";
+import type { MarkdownFeedbackAnchor } from "./domain.js";
 
 export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
@@ -1132,6 +1133,33 @@ export function markdownSelectionWitness(
   };
 }
 
+export function markdownFeedbackWitness(
+  sourceMap: MarkdownSourceMapV1,
+  anchor: MarkdownFeedbackAnchor,
+): Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> | undefined {
+  const boundary = (offset: number, end: boolean) => {
+    const segment = sourceMap.segments.find((segment) => end
+      ? segment.sourceStart.offset < offset && offset <= segment.sourceEnd.offset
+      : segment.sourceStart.offset <= offset && offset < segment.sourceEnd.offset);
+    if (!segment) return undefined;
+    if (segment.mapping === "atomic" &&
+        offset !== segment.sourceStart.offset && offset !== segment.sourceEnd.offset) {
+      return undefined;
+    }
+    return {
+      ref: segment.ref,
+      offset: segment.mapping === "identity"
+        ? offset - segment.sourceStart.offset
+        : offset === segment.sourceStart.offset ? 0 : segment.text.length,
+    };
+  };
+  const start = boundary(anchor.start.offset, false);
+  const end = boundary(anchor.end.offset, true);
+  return start && end
+    ? markdownSelectionWitness(sourceMap, start.ref, start.offset, end.ref, end.offset)
+    : undefined;
+}
+
 export function loadDocumentFeedbackDraft(
   storage: ReviewDraftStorage,
   document: Pick<WebDocument, "id" | "revision">,
@@ -1701,6 +1729,14 @@ async function boot(): Promise<void> {
   const reviewFeedbackMessage = element("review-feedback-message") as HTMLTextAreaElement;
   const reviewFeedbackSave = element("review-feedback-save") as HTMLButtonElement;
   const reviewFeedbackCancel = element("review-feedback-cancel") as HTMLButtonElement;
+  const reviewFeedbackError = element("review-feedback-error");
+  const markdownFeedbackPopup = document.createElement("div");
+  markdownFeedbackPopup.id = "document-feedback-popup";
+  markdownFeedbackPopup.className = "document-feedback-popup";
+  markdownFeedbackPopup.setAttribute("role", "dialog");
+  markdownFeedbackPopup.setAttribute("aria-label", "Comments on selected text");
+  markdownFeedbackPopup.hidden = true;
+  document.body.append(markdownFeedbackPopup);
   const reviewError = element("review-error");
   const reviewActions = element("review-actions");
   const reviewApprove = element("review-approve") as HTMLButtonElement;
@@ -1757,6 +1793,10 @@ async function boot(): Promise<void> {
     | Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>
     | undefined;
   let selectedMarkdownLabel = "";
+  let markdownPopupMarker: HTMLButtonElement | undefined;
+  let markdownPopupFocused = false;
+  let markdownPopupTimer: ReturnType<typeof setTimeout> | undefined;
+  let markdownFeedbackSignature = "";
   let activeReviewDraftId: string | undefined;
   let renderSequence = 0;
   let loadSequence = 0;
@@ -2487,6 +2527,8 @@ async function boot(): Promise<void> {
         ? feedbackComments.find(({ id }) =>
             id === item.id.replace(/^feedback-/, "comment-"))
         : undefined;
+    closeMarkdownFeedbackPopup();
+    reviewFeedbackError.textContent = "";
     feedbackDraft = anchor;
     feedbackRangeStart = rangeStart ?? (isMarkdownFeedbackAnchor(anchor)
       ? undefined
@@ -2505,8 +2547,25 @@ async function boot(): Promise<void> {
       : "save feedback";
     reviewFeedbackComposer.removeAttribute("hidden");
     renderChangeReview();
-    reviewFeedbackMessage.focus();
-    reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const range = isMarkdownFeedbackAnchor(anchor) ? markdownFeedbackRange(anchor) : undefined;
+    reviewFeedbackComposer.classList.toggle("document-feedback-popup", Boolean(range));
+    if (range) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackComposer.setAttribute("role", "dialog");
+      reviewFeedbackComposer.setAttribute("aria-labelledby", "review-feedback-anchor");
+      document.body.append(reviewFeedbackComposer);
+      const bounds = markdownRangeEnd(range);
+      if (bounds.bottom < 0 || bounds.top > window.innerHeight) {
+        range.startContainer.parentElement?.scrollIntoView({ block: "center" });
+      }
+      positionMarkdownPopup(reviewFeedbackComposer, markdownRangeEnd(range));
+      reviewFeedbackMessage.focus({ preventScroll: true });
+    } else {
+      reviewFeedbackComposer.removeAttribute("role");
+      reviewFeedbackComposer.removeAttribute("aria-labelledby");
+      reviewFeedbackMessage.focus();
+      reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
   }
 
   function closeFeedbackComposer(): void {
@@ -2516,6 +2575,13 @@ async function boot(): Promise<void> {
     reviewFeedbackMessage.value = "";
     reviewFeedbackSave.textContent = "save feedback";
     reviewFeedbackComposer.setAttribute("hidden", "");
+    reviewFeedbackComposer.classList.remove("document-feedback-popup");
+    reviewFeedbackComposer.removeAttribute("role");
+    reviewFeedbackComposer.removeAttribute("aria-labelledby");
+    reviewFeedbackComposer.style.removeProperty("top");
+    reviewFeedbackComposer.style.removeProperty("left");
+    reviewFeedbackError.textContent = "";
+    reviewFeedbackSection.append(reviewFeedbackComposer);
   }
 
   function persistCurrentFeedbackDraft(): void {
@@ -2563,7 +2629,7 @@ async function boot(): Promise<void> {
     feedbackPanel.toggleAttribute("hidden", !show);
     reviewFeedbackSection.toggleAttribute("hidden", !show);
     reviewFeedbackList.replaceChildren();
-    if (!feedbackDraft || isMarkdownFeedbackAnchor(feedbackDraft) || feedbackDraft.line === undefined) {
+    if (!feedbackDraft || (!isMarkdownFeedbackAnchor(feedbackDraft) && feedbackDraft.line === undefined)) {
       reviewFeedbackComposer.classList.remove("diff-inline-composer");
       reviewFeedbackSection.append(reviewFeedbackComposer);
     }
@@ -2638,6 +2704,7 @@ async function boot(): Promise<void> {
       feedbackHistoryElement.append(entry);
     }
     feedbackHistoryElement.toggleAttribute("hidden", feedbackHistory.length === 0);
+    renderMarkdownFeedback();
   }
 
   function saveFeedback(): void {
@@ -2646,12 +2713,12 @@ async function boot(): Promise<void> {
     }
     const message = reviewFeedbackMessage.value.trim();
     if (message === "") {
-      feedbackError.textContent = "Feedback text is required.";
+      reviewFeedbackError.textContent = "Feedback text is required.";
       reviewFeedbackMessage.focus();
       return;
     }
     if (!feedbackEditingId && feedbackComments.length >= 32) {
-      feedbackError.textContent = "A feedback submission can contain at most 32 comments.";
+      reviewFeedbackError.textContent = "A feedback submission can contain at most 32 comments.";
       return;
     }
     const label = reviewFeedbackAnchor.textContent?.replace(/^Feedback on /, "") ?? "selection";
@@ -2688,6 +2755,182 @@ async function boot(): Promise<void> {
     return span && readerContent.contains(span) ? span : undefined;
   }
 
+  // Keep icons textless so source-map offsets and later selections stay intact.
+  function markdownFeedbackRange(
+    anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>,
+  ): Range | undefined {
+    const spans = Array.from(readerContent.querySelectorAll<HTMLElement>("[data-mdmaid-source-ref]"));
+    const point = (boundary: { ref: string; offset: number }) => {
+      const span = spans.find((span) => span.dataset.mdmaidSourceRef === boundary.ref);
+      if (!span) return undefined;
+      const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT);
+      let remaining = boundary.offset;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const length = node.textContent?.length ?? 0;
+        if (remaining <= length) return { node, offset: remaining };
+        remaining -= length;
+      }
+      return undefined;
+    };
+    const start = point(anchor.start);
+    const end = point(anchor.end);
+    if (!start || !end) return undefined;
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    return range;
+  }
+
+  function markdownRangeEnd(range: Range): DOMRect {
+    return Array.from(range.getClientRects()).filter(({ width }) => width > 0).at(-1)
+      ?? range.getBoundingClientRect();
+  }
+
+  function positionMarkdownPopup(popup: HTMLElement, anchor: DOMRect): void {
+    const margin = 8;
+    const bounds = popup.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(anchor.right, window.innerWidth - bounds.width - margin));
+    const below = anchor.bottom + margin;
+    const top = below + bounds.height <= window.innerHeight - margin
+      ? below
+      : Math.max(margin, anchor.top - bounds.height - margin);
+    popup.style.left = `${left}px`;
+    popup.style.top = `${top}px`;
+  }
+
+  function closeMarkdownFeedbackPopup(): void {
+    clearTimeout(markdownPopupTimer);
+    markdownFeedbackPopup.hidden = true;
+    markdownPopupMarker?.setAttribute("aria-expanded", "false");
+    markdownPopupMarker = undefined;
+    markdownPopupFocused = false;
+  }
+
+  function deferCloseMarkdownFeedbackPopup(): void {
+    clearTimeout(markdownPopupTimer);
+    markdownPopupTimer = setTimeout(() => {
+      if (!markdownFeedbackPopup.matches(":hover") &&
+          !markdownPopupMarker?.matches(":hover, :focus") &&
+          !markdownFeedbackPopup.contains(document.activeElement)) {
+        closeMarkdownFeedbackPopup();
+      }
+    }, 180);
+  }
+
+  function renderMarkdownFeedback(): void {
+    if (!renderedSourceMap || !renderedSourceWitness || readerContent.hidden || reader.hidden) {
+      closeMarkdownFeedbackPopup();
+      readerContent.querySelectorAll(".document-feedback-marker").forEach((marker) => marker.remove());
+      markdownFeedbackSignature = "";
+      return;
+    }
+    type InlineComment = { message: string; draft: boolean };
+    const groups = new Map<string, {
+      anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>;
+      comments: InlineComment[];
+    }>();
+    const add = (
+      anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>,
+      comment: InlineComment,
+    ) => {
+      const key = `${anchor.end.ref}:${anchor.end.offset}`;
+      const group = groups.get(key) ?? { anchor, comments: [] };
+      group.comments.push(comment);
+      groups.set(key, group);
+    };
+    for (const submission of feedbackHistory) {
+      if (submission.documentId !== state.selectedId || submission.documentRevision !== feedbackDraftRevision) continue;
+      for (const comment of submission.comments) {
+        if (comment.anchor.kind !== "markdown-v1") continue;
+        const witness = markdownFeedbackWitness(renderedSourceMap, comment.anchor);
+        if (witness) add(witness, { message: comment.message, draft: false });
+      }
+    }
+    for (const comment of feedbackComments) {
+      if (comment.anchor.kind === "markdown-selection-v1") {
+        add(comment.anchor, { message: comment.message, draft: true });
+      }
+    }
+    const signature = JSON.stringify(Array.from(groups));
+    if (signature === markdownFeedbackSignature) {
+      repositionMarkdownFeedback();
+      return;
+    }
+    markdownFeedbackSignature = signature;
+    const activePopupKey = markdownPopupMarker?.dataset.feedbackKey;
+    const restoreFocus = markdownPopupFocused;
+    closeMarkdownFeedbackPopup();
+    readerContent.querySelectorAll(".document-feedback-marker").forEach((marker) => marker.remove());
+    for (const [key, { anchor, comments }] of groups) {
+      const range = markdownFeedbackRange(anchor);
+      if (!range) continue;
+      const quote = range.toString().trim().slice(0, 160);
+      const marker = document.createElement("button");
+      marker.type = "button";
+      marker.className = "document-feedback-marker";
+      marker.dataset.feedbackKey = key;
+      marker.setAttribute("aria-label", `${comments.length} comment${comments.length === 1 ? "" : "s"} on “${quote}”`);
+      marker.setAttribute("aria-haspopup", "dialog");
+      marker.setAttribute("aria-controls", markdownFeedbackPopup.id);
+      marker.setAttribute("aria-expanded", "false");
+      const open = () => {
+        if (feedbackDraft) return;
+        closeMarkdownFeedbackPopup();
+        markdownPopupMarker = marker;
+        markdownPopupFocused = document.activeElement === marker;
+        markdownFeedbackPopup.replaceChildren();
+        const heading = document.createElement("strong");
+        heading.textContent = `${comments.length} comment${comments.length === 1 ? "" : "s"}`;
+        markdownFeedbackPopup.append(heading);
+        for (const comment of comments) {
+          const entry = document.createElement("p");
+          entry.textContent = comment.message;
+          if (comment.draft) {
+            const label = document.createElement("span");
+            label.className = "document-feedback-draft-label";
+            label.textContent = "Draft · ";
+            entry.prepend(label);
+          }
+          markdownFeedbackPopup.append(entry);
+        }
+        markdownFeedbackPopup.hidden = false;
+        marker.setAttribute("aria-expanded", "true");
+        positionMarkdownPopup(markdownFeedbackPopup, marker.getBoundingClientRect());
+      };
+      marker.addEventListener("mouseenter", open);
+      marker.addEventListener("focus", open);
+      marker.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        open();
+      });
+      marker.addEventListener("mouseleave", deferCloseMarkdownFeedbackPopup);
+      marker.addEventListener("blur", deferCloseMarkdownFeedbackPopup);
+      range.collapse(false);
+      range.insertNode(marker);
+      if (key === activePopupKey) {
+        if (restoreFocus) marker.focus({ preventScroll: true });
+        else open();
+      }
+    }
+    repositionMarkdownFeedback();
+  }
+
+  function repositionMarkdownFeedback(): void {
+    if (selectedMarkdownWitness && !feedbackAddSelection.hidden) {
+      const range = markdownFeedbackRange(selectedMarkdownWitness);
+      if (range) positionMarkdownPopup(feedbackAddSelection, markdownRangeEnd(range));
+    }
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft) &&
+        reviewFeedbackComposer.classList.contains("document-feedback-popup")) {
+      const range = markdownFeedbackRange(feedbackDraft);
+      if (range) positionMarkdownPopup(reviewFeedbackComposer, markdownRangeEnd(range));
+    }
+    if (markdownPopupMarker?.isConnected) {
+      positionMarkdownPopup(markdownFeedbackPopup, markdownPopupMarker.getBoundingClientRect());
+    }
+  }
+
   function localTextOffset(
     span: HTMLElement,
     node: Node,
@@ -2704,6 +2947,7 @@ async function boot(): Promise<void> {
   }
 
   function captureMarkdownSelection(): void {
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) return;
     selectedMarkdownWitness = undefined;
     selectedMarkdownLabel = "";
     feedbackAddSelection.setAttribute("hidden", "");
@@ -2731,6 +2975,8 @@ async function boot(): Promise<void> {
     selectedMarkdownLabel = selection.toString().trim().slice(0, 160);
     if (selectedMarkdownLabel === "") return;
     feedbackAddSelection.removeAttribute("hidden");
+    closeMarkdownFeedbackPopup();
+    positionMarkdownPopup(feedbackAddSelection, markdownRangeEnd(range));
   }
 
   async function loadFeedbackHistory(documentId: string): Promise<void> {
@@ -2846,6 +3092,12 @@ async function boot(): Promise<void> {
     );
     changeReviewViewer.toggleAttribute("hidden", !showDiff);
     readerContent.toggleAttribute("hidden", showDiff);
+    if (showDiff) {
+      feedbackAddSelection.hidden = true;
+      closeMarkdownFeedbackPopup();
+      if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) closeFeedbackComposer();
+    }
+    renderMarkdownFeedback();
     changeViewDiff.classList.toggle("active", showDiff);
     changeViewDocument.classList.toggle("active", !showDiff);
     changeViewDiff.toggleAttribute("hidden", !review);
@@ -3363,9 +3615,12 @@ async function boot(): Promise<void> {
       }
       renderedSourceWitness = rendered.sourceWitness;
       renderedSourceMap = rendered.sourceMap;
+      selectedMarkdownWitness = undefined;
+      feedbackAddSelection.hidden = true;
       changeFileIndex = 0;
       changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
+      markdownFeedbackSignature = "";
       for (const link of Array.from(
         readerContent.querySelectorAll<HTMLAnchorElement>("a[href^='/d/']"),
       )) {
@@ -3662,6 +3917,12 @@ async function boot(): Promise<void> {
   }
 
   function showMissingSource(item: WebDocument): void {
+    closeFeedbackComposer();
+    closeMarkdownFeedbackPopup();
+    feedbackAddSelection.hidden = true;
+    selectedMarkdownWitness = undefined;
+    renderedSourceMap = undefined;
+    renderedSourceWitness = undefined;
     setMissingReader(true);
     renderedChangeReview = undefined;
     renderChangeReview();
@@ -3688,6 +3949,8 @@ async function boot(): Promise<void> {
   }
 
   function closeReader(pushHistory = true): void {
+    closeFeedbackComposer();
+    closeMarkdownFeedbackPopup();
     renderSequence += 1;
     renderedRevision = undefined;
     renderedSourceWitness = undefined;
@@ -4098,6 +4361,9 @@ async function boot(): Promise<void> {
     void respondToReview("superseded"),
   );
   reviewFeedbackSave.addEventListener("click", saveFeedback);
+  reviewFeedbackMessage.addEventListener("input", () => {
+    reviewFeedbackError.textContent = "";
+  });
   reviewFeedbackCancel.addEventListener("click", () => {
     closeFeedbackComposer();
     renderChangeReview();
@@ -4115,6 +4381,31 @@ async function boot(): Promise<void> {
   });
   readerContent.addEventListener("mouseup", captureMarkdownSelection);
   readerContent.addEventListener("keyup", captureMarkdownSelection);
+  markdownFeedbackPopup.addEventListener("mouseenter", () => clearTimeout(markdownPopupTimer));
+  markdownFeedbackPopup.addEventListener("mouseleave", deferCloseMarkdownFeedbackPopup);
+  window.addEventListener("resize", repositionMarkdownFeedback);
+  window.addEventListener("scroll", repositionMarkdownFeedback, true);
+  const markdownFeedbackResize = new ResizeObserver(repositionMarkdownFeedback);
+  markdownFeedbackResize.observe(readerContent);
+  markdownFeedbackResize.observe(reviewFeedbackComposer);
+  markdownFeedbackResize.observe(markdownFeedbackPopup);
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (markdownFeedbackPopup.hidden && feedbackAddSelection.hidden &&
+        !(feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft))) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeMarkdownFeedbackPopup();
+    feedbackAddSelection.hidden = true;
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) closeFeedbackComposer();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!(event.target instanceof Node)) return;
+    if (!markdownFeedbackPopup.contains(event.target) && !markdownPopupMarker?.contains(event.target)) {
+      closeMarkdownFeedbackPopup();
+    }
+    if (!feedbackAddSelection.contains(event.target)) feedbackAddSelection.hidden = true;
+  });
   feedbackGeneralMessage.addEventListener("input", persistCurrentFeedbackDraft);
   feedbackSend.addEventListener("click", () => void submitFeedback());
   reviewResponse.addEventListener("input", () => persistCurrentReviewDraft());

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createMarkdownSourceMap, resolveMarkdownSelection } from "mdmaid";
 
 import {
   actionsQueueTransition,
@@ -34,6 +35,7 @@ import {
   loadReviewDraft,
   loadDocumentFeedbackDraft,
   markdownSelectionWitness,
+  markdownFeedbackWitness,
   persistDocumentFeedbackDraft,
   persistReviewDraft,
   removeReviewDraftFeedback,
@@ -1432,6 +1434,32 @@ test("builds Markdown selection witnesses only within one mapped block", () => {
     markdownSelectionWitness(sourceMap, "m1-s1", 7, "m1-s2", 3),
     undefined,
   );
+});
+
+test("restores exact Markdown feedback selections across formatting and escaped text", async () => {
+  const source = "Repeated **phrase** &amp; again.\n\nRepeated **phrase** &amp; again.";
+  const map = await createMarkdownSourceMap(source);
+  for (const segment of map.segments) {
+    const witness = {
+      kind: "markdown-selection-v1" as const,
+      start: { ref: segment.ref, offset: 0 },
+      end: { ref: segment.ref, offset: segment.text.length },
+    };
+    const anchor = resolveMarkdownSelection(source, map, witness);
+    assert.deepEqual(markdownFeedbackWitness(map, anchor), witness);
+  }
+  const anchor = resolveMarkdownSelection(source, map, {
+    start: { ref: map.segments[0]!.ref, offset: 2 },
+    end: { ref: map.segments[1]!.ref, offset: 3 },
+  });
+  assert.deepEqual(markdownFeedbackWitness(map, anchor), {
+    kind: "markdown-selection-v1",
+    start: { ref: map.segments[0]!.ref, offset: 2 },
+    end: { ref: map.segments[1]!.ref, offset: 3 },
+  });
+  assert.equal(markdownFeedbackWitness(map, {
+    ...anchor, end: { ...anchor.end, offset: source.length + 1 },
+  }), undefined);
 });
 
 test("persists document feedback drafts by document revision", () => {
