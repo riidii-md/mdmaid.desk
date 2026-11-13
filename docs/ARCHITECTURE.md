@@ -51,7 +51,11 @@ on the document or its reading progress.
 ## Current Foundation
 
 The catalog uses a versioned SQLite database behind a storage interface.
-Workspaces authorize canonical artifact roots. Documents retain stable IDs,
+Workspaces authorize canonical artifact roots. Logical projects are separate
+presentation records keyed by normalized repository identity and task ID.
+Their visible labels combine the grounded repository/task values with the
+first concise feature name supplied by the producing agent. Project membership
+never expands workspace filesystem authority. Documents retain stable IDs,
 content hashes, revisions, reading progress, tags, archive state, missing
 state, a storage mode (`reference` or `managed`), and private local-source link
 mappings. Reading status is
@@ -78,9 +82,12 @@ the source or managed filesystem paths.
 Review requests bind the document ID, revision, and private content hash at
 creation. Only one request may be pending for a document. A content change or
 missing source makes that request stale. Responses are immutable, exactly-once
-decisions with optional text, except that requested changes require an
-explanation. Request and response text are plain text and are never interpreted
-as HTML, terminal control data, callback configuration, or executable commands.
+resolutions with optional text: approve, request changes, reject, or supersede
+an obsolete request. Superseding is terminal but carries no approval or
+rejection meaning, so a waiting producer can ignore the old version. Requested
+changes require an explanation. Request and response text is plain text and is
+never interpreted as HTML, terminal control data, callback configuration, or
+executable commands.
 
 Change reviews reuse this revision-safe lifecycle without overloading a
 workspace. A workspace remains the repository and filesystem authorization
@@ -88,6 +95,17 @@ boundary; a `change-review` document represents one implementation snapshot,
 and its `change-decision` request represents the human gate for that exact
 content. The TUI presents those documents in a dedicated filtered space while
 the catalog and API retain one generic document lifecycle.
+
+Workspace identity is stable at the canonical repository/worktree-root level.
+Registration rejects a second workspace ID for an already claimed canonical
+root; a task or ticket ID cannot create another authorization boundary for the
+same root. Legacy duplicate-root records are repaired through the authenticated
+workspace reconciliation operation. Reconciliation is dry-run-first,
+transactionally moves non-conflicting documents without changing their stable
+IDs, preserves review records, and removes the obsolete workspace only after a
+successful commit. Conflicting document paths stop the operation unless the
+obsolete record is archived, has no review history, and the operator explicitly
+allows archived-conflict disposal. SQLite is never an operator repair surface.
 
 Standard Git patches inside fenced `diff` blocks are parsed into a bounded,
 path-safe Change Review model. The parser supplies file status, line numbers,
@@ -97,9 +115,12 @@ length keep rendering bounded. Unsupported or unsafe entries produce warnings.
 The Markdown remains the source artifact, while the parsed model is a derived
 render response and is not stored as a second approval identity.
 
-Requested-change responses may include bounded structured feedback items.
-`feedback` items require a safe relative file path and stable hunk ID; `todo`
-items require a file path and deliberately have no hunk ID. Items are stored
+Approved and requested-change responses may include bounded structured
+feedback items. Approval treats them as non-blocking comments.
+`feedback` items require a safe relative file path and may add a stable hunk ID
+or a hunk plus line/side anchor with an optional inclusive same-side `endLine`;
+path-only items are file-level. Legacy `todo`
+items require a file path and deliberately have no finer anchor. Items are stored
 atomically with the immutable response. Draft TUI notes stay in the current
 reader session until the human submits Request Changes.
 
@@ -107,6 +128,12 @@ Registration and import parse Markdown links on every ingress. Relative local
 links and image references are resolved from the original Markdown path,
 authorized against the canonical workspace root, and persisted only as
 workspace-relative paths.
+They also parse every Mermaid fence before any catalog mutation. Invalid
+diagrams return a versioned validation report with the total diagram count and
+every issue's block number, Markdown line, and bounded parser diagnostic. The
+API exposes it as `error.validation`, and JSON CLI callers preserve the same
+data. `mdmaid-desk validate <file.md>` provides the check without a catalog
+mutation. Live reference reconciliation applies the same validation.
 Rendered web links use opaque, document-scoped identifiers under
 `/d/:document/source/:source`. The authenticated source viewer repeats
 realpath, regular-file, symlink, size, and UTF-8 checks on every read. It does
@@ -193,7 +220,8 @@ a clamped line offset. Linked source pages and SVG media remain live on request
 but are not watched in this release.
 
 `daemon start` is idempotent. The daemon publishes its PID, loopback host,
-port, and protocol version through `daemon.json`. `daemon install` explicitly
+actual port, public browser origin, and protocol version through `daemon.json`.
+`daemon install` explicitly
 configures a user service for people who want an always-available browser URL;
 installation or registration must not silently leave a permanent background
 process running. The npm CLI installs a LaunchAgent on macOS or systemd user
@@ -202,17 +230,22 @@ service on Linux; a future Homebrew service uses the same lifecycle contract.
 Both foreground `mdmaid-desk web` and the background daemon atomically publish
 a mode-`0600` descriptor. CLI writes, web, and TUI health-check and reuse it.
 The TUI starts a session-scoped embedded loopback server when no daemon exists.
-A user can select a port, while an unpinned daemon falls back from `43127` to an
-available loopback port and reports the actual value through `daemon status`.
+A user can select a port for an isolated instance. The default daemon tries
+port `80` first; when that fails, it uses fixed port `43127` through an existing
+compatible Traefik or as a direct URL with a port suffix. It never selects a
+random port. A healthy descriptor remains the attach-first authority for CLI
+and TUI clients.
 
 `web` should attach to and open an existing healthy daemon when one exists. If
 none exists, it starts the service in the foreground until interrupted. The
 TUI follows the same attach-first policy without leaving its fallback server
 running after the terminal session ends.
 
-The foreground browser service uses the stable direct origin
-`http://mdmaid.desk.localhost:43127/`. The special-use `.localhost` name maps
-back to loopback, so it needs no DNS, hosts-file, proxy, or certificate setup.
+The foreground browser service prefers the stable origin
+`http://mdmaid.desk.localhost/`. The special-use `.localhost` name maps
+back to loopback, so it needs no DNS, hosts-file, or certificate setup. When
+Traefik already owns port 80, a labeled mdmaid route container on its Docker
+network forwards to the loopback-only backend through OrbStack's host gateway.
 Browser origin checks use that explicit origin rather than forwarding headers.
 The daemon keeps a stable random mode-`0600` authentication token so browser
 sessions and local API authentication survive service restarts. Its browser
@@ -339,13 +372,16 @@ Status: complete for registered Markdown sources.
 - filtered and debounced change, unlink, replacement, and restore
   reconciliation;
 - path re-authorization and atomic revision/link/review persistence;
-- document-scoped path-free events;
+- one metadata-free catalog invalidation after each committed change;
 - watcher reconstruction from persisted active references after restart.
 
 ### 5. Web and TUI Workspaces
 
-- task and workspace navigation;
-- attention queue;
+- global named Spaces with dynamic repository, namespace, and tag matchers;
+- a global project combobox with case-insensitive substring filtering;
+- independent Docs / Change reviews content mode;
+- “Waiting for you” as an intersecting Actions filter;
+- task, project, and workspace navigation within the selected Space;
 - recent documents;
 - title and task search;
 - missing and superseded states.

@@ -4,19 +4,22 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  realpath,
   readdir,
+  rename,
   rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import test from "node:test";
 
 import Database from "better-sqlite3";
 
 import { Catalog, DocumentSourceMissingError } from "./catalog.js";
+import { SqliteCatalogStorage } from "./sqlite-storage.js";
 
 async function fixture(): Promise<{
   catalog: Catalog;
@@ -69,6 +72,744 @@ test("registers documents idempotently and persists the catalog", async () => {
   assert.deepEqual(restored.listDocuments(), catalog.listDocuments());
 
   assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+});
+
+test("rejects registration when a Mermaid block is invalid", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "broken-diagram.md");
+  await writeFile(documentPath, [
+    "# Broken diagram",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+  ].join("\n"), "utf8");
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      kind: "review",
+      title: "Broken diagram",
+      path: documentPath,
+      attention: "review",
+    }),
+    /Mermaid diagram 1.*line 3.*parse error/is,
+  );
+  assert.equal(catalog.listDocuments().length, 0);
+  catalog.close();
+});
+
+test("reuses one AI-named project across workspaces for the same repository task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-projects-"));
+  const firstWorkspace = join(root, "first");
+  const secondWorkspace = join(root, "second");
+  const statePath = join(root, "catalog.sqlite3");
+  await mkdir(firstWorkspace);
+  await mkdir(secondWorkspace);
+  const firstPath = join(firstWorkspace, "plan.md");
+  const secondPath = join(secondWorkspace, "review.md");
+  await writeFile(firstPath, "# Plan\n", "utf8");
+  await writeFile(secondPath, "# Review\n", "utf8");
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  for (const [id, workspace] of [
+    ["first", firstWorkspace],
+    ["second", secondWorkspace],
+  ] as const) {
+    await catalog.addWorkspace({
+      id,
+      name: id,
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/riidii-md/eywizards",
+      repositoryName: "EyWizards",
+    });
+  }
+
+  const first = await catalog.registerDocument({
+    workspaceId: "first",
+    taskId: "sa-2913",
+    featureName: "COA Worker Continuity",
+    kind: "plan",
+    title: "Plan",
+    path: firstPath,
+    attention: "none",
+  });
+  const second = await catalog.registerDocument({
+    workspaceId: "second",
+    taskId: "SA-2913",
+    featureName: "Different AI wording",
+    kind: "review",
+    title: "Review",
+    path: secondPath,
+    attention: "none",
+  });
+
+  assert.equal(second.projectId, first.projectId);
+  assert.equal(first.projectName, "EyWizards / SA-2913 (COA Worker Continuity)");
+  assert.equal(second.projectName, first.projectName);
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(
+    restored.listDocuments().map(({ projectId, projectName }) => ({
+      projectId,
+      projectName,
+    })),
+    [
+      { projectId: first.projectId, projectName: first.projectName },
+      { projectId: first.projectId, projectName: first.projectName },
+    ],
+  );
+  restored.close();
+});
+
+test("normalizes repository URLs without persisting credentials", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-repository-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  await mkdir(workspace);
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "https://private-user:private-token@GitHub.com/Riidii-MD/EyWizards.git",
+    repositoryName: "EyWizards",
+  });
+  catalog.close();
+
+  const database = new Database(statePath, { readonly: true });
+  const repository = database
+    .prepare<[], { repository_key: string }>(
+      "SELECT repository_key FROM workspace_repositories",
+    )
+    .get();
+  assert.equal(repository?.repository_key, "github.com/riidii-md/eywizards");
+  assert.doesNotMatch(JSON.stringify(repository), /private-user|private-token/);
+  database.close();
+});
+
+test("supports SSH repository identity, ticketless projects, and late AI naming", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-ticketless-"));
+  const workspace = join(root, "workspace");
+  const documentPath = join(workspace, "brief.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Brief\n", "utf8");
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Temporary workspace name",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "git@GitHub.com:Riidii-MD/EyWizards.git",
+  });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Renamed workspace",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+
+  const unnamed = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  assert.equal(unnamed.projectName, "eywizards");
+
+  const named = await catalog.registerDocument({
+    workspaceId: "example",
+    featureName: "Ticketless Work",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  assert.equal(named.projectId, unnamed.projectId);
+  assert.equal(named.projectName, "eywizards (Ticketless Work)");
+
+  await assert.rejects(
+    catalog.registerDocument({
+      workspaceId: "example",
+      featureName: "Unsafe\nName",
+      kind: "brief",
+      title: "Brief",
+      path: documentPath,
+      attention: "none",
+    }),
+    /invalid document registration input/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid",
+      name: "Invalid",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "not a repository?secret=yes",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "missing-host",
+      name: "Missing host",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "file:///repository",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "missing-name",
+      name: "Missing name",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "https://github.com/.git",
+    }),
+    /repository identity has no name/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid-url",
+      name: "Invalid URL",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "https://[",
+    }),
+    /invalid repository identity/,
+  );
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "invalid-name",
+      name: "Invalid name",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/example/repository",
+      repositoryName: "Unsafe\nRepository",
+    }),
+    /invalid repository name/,
+  );
+  catalog.close();
+});
+
+test("manages normalized Spaces and sanitized repository inventory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-spaces-"));
+  const firstRoot = join(root, "first");
+  const secondRoot = join(root, "second");
+  await mkdir(firstRoot);
+  await mkdir(secondRoot);
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "first",
+    name: "First workspace",
+    root: firstRoot,
+    artifactRoots: [firstRoot],
+    repository: "https://github.com/Acme/App.git",
+    repositoryName: "Zulu",
+  });
+  await catalog.addWorkspace({
+    id: "second",
+    name: "Second workspace",
+    root: secondRoot,
+    artifactRoots: [secondRoot],
+    repository: "git@github.com:acme/app.git",
+    repositoryName: "Alpha",
+  });
+
+  assert.deepEqual(catalog.listRepositories(), [
+    {
+      key: "github.com/acme/app",
+      name: "Alpha",
+      workspaceIds: ["first", "second"],
+      kind: "remote",
+    },
+  ]);
+
+  const work = catalog.createSpace({
+    id: "work",
+    name: " Work ",
+    matchers: [
+      { kind: "repository", value: "https://github.com/Acme/App.git" },
+      { kind: "repository", value: "git@github.com:acme/app.git" },
+      { kind: "repository-namespace", value: "GitHub.com/Acme" },
+      { kind: "tag", value: " Client-Work " },
+    ],
+  });
+  assert.deepEqual(work, {
+    id: "work",
+    name: "Work",
+    matchers: [
+      { kind: "repository", value: "github.com/acme/app" },
+      { kind: "repository-namespace", value: "github.com/acme" },
+      { kind: "tag", value: "client-work" },
+    ],
+  });
+  catalog.createSpace({
+    id: "home",
+    name: "Home",
+    matchers: [{ kind: "tag", value: "home" }],
+  });
+  assert.deepEqual(catalog.listSpaces().map(({ id }) => id), ["home", "work"]);
+
+  assert.deepEqual(catalog.renameSpace("work", "Client work").name, "Client work");
+  assert.deepEqual(
+    catalog.replaceSpaceMatchers("work", {
+      matchers: [{ kind: "repository", value: "github.com/acme/app" }],
+    }).matchers,
+    [{ kind: "repository", value: "github.com/acme/app" }],
+  );
+  assert.throws(
+    () => catalog.replaceSpaceMatchers("work", { matchers: [] }),
+    /at least one matcher/,
+  );
+  assert.deepEqual(catalog.getSpace("work")?.matchers, [
+    { kind: "repository", value: "github.com/acme/app" },
+  ]);
+
+  assert.throws(
+    () => catalog.createSpace({ id: "work", name: "Again", matchers: [
+      { kind: "tag", value: "again" },
+    ] }),
+    /space work already exists/,
+  );
+  assert.deepEqual(catalog.deleteSpace("home"), { id: "home" });
+  assert.equal(catalog.getSpace("home"), undefined);
+  assert.throws(() => catalog.deleteSpace("home"), /unknown space home/);
+  catalog.close();
+});
+
+test("rejects invalid Space matcher values atomically", async () => {
+  const { catalog } = await fixture();
+  const original = catalog.createSpace({
+    id: "work",
+    name: "Work",
+    matchers: [{ kind: "tag", value: "work" }],
+  });
+
+  for (const matcher of [
+    { kind: "repository-namespace", value: "github.com" },
+    { kind: "repository-namespace", value: "local:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" },
+    { kind: "repository", value: "not a repository?secret=yes" },
+    { kind: "tag", value: "unsafe tag" },
+    { kind: "unknown", value: "work" },
+  ]) {
+    assert.throws(
+      () => catalog.replaceSpaceMatchers("work", { matchers: [matcher] }),
+      /invalid|unknown|namespace|tag/,
+    );
+    assert.deepEqual(catalog.getSpace("work"), original);
+  }
+  catalog.close();
+});
+
+test("derives scoped documents, workspaces, and reviews from current facts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-space-scope-"));
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  const workspaceInputs = [
+    ["acme", "github.com/acme/app"],
+    ["acme-labs", "github.com/acme-labs/app"],
+    ["partner", "github.com/partner/tool"],
+  ] as const;
+  for (const [id, repository] of workspaceInputs) {
+    const workspaceRoot = join(root, id);
+    await mkdir(workspaceRoot);
+    await catalog.addWorkspace({
+      id,
+      name: id,
+      root: workspaceRoot,
+      artifactRoots: [workspaceRoot],
+      repository,
+    });
+    await writeFile(join(workspaceRoot, "plan.md"), `# ${id}\n`, "utf8");
+  }
+  const acme = await catalog.registerDocument({
+    workspaceId: "acme",
+    kind: "plan",
+    title: "Acme",
+    path: join(root, "acme", "plan.md"),
+    attention: "approval",
+    tags: ["client"],
+  });
+  await catalog.registerDocument({
+    workspaceId: "acme-labs",
+    kind: "plan",
+    title: "Acme Labs",
+    path: join(root, "acme-labs", "plan.md"),
+    attention: "none",
+  });
+  const partner = await catalog.registerDocument({
+    workspaceId: "partner",
+    kind: "plan",
+    title: "Partner",
+    path: join(root, "partner", "plan.md"),
+    attention: "none",
+    tags: ["client"],
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: acme.id,
+    kind: "plan-decision",
+    requestMessage: "Review Acme",
+  });
+
+  catalog.createSpace({
+    id: "acme-org",
+    name: "Acme org",
+    matchers: [{ kind: "repository-namespace", value: "github.com/acme" }],
+  });
+  catalog.createSpace({
+    id: "clients",
+    name: "Clients",
+    matchers: [{ kind: "tag", value: "client" }],
+  });
+  catalog.createSpace({
+    id: "partner",
+    name: "Partner",
+    matchers: [{ kind: "repository", value: "github.com/partner/tool" }],
+  });
+
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "acme-org" }).map(({ title }) => title),
+    ["Acme"],
+  );
+  assert.deepEqual(
+    catalog.listWorkspaces({ spaceId: "acme-org" }).map(({ id }) => id),
+    ["acme"],
+  );
+  assert.equal(catalog.getDocument(partner.id, { spaceId: "acme-org" }), undefined);
+  assert.deepEqual(
+    catalog.listReviewRequests({}, { spaceId: "acme-org" }).map(({ id }) => id),
+    [review.id],
+  );
+  assert.equal(
+    catalog.getReviewRequest(review.id, { spaceId: "partner" }),
+    undefined,
+  );
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "clients" }).map(({ title }) => title).sort(),
+    ["Acme", "Partner"],
+  );
+
+  await catalog.setDocumentTags(partner.id, []);
+  assert.deepEqual(
+    catalog.listDocuments({}, { spaceId: "clients" }).map(({ title }) => title),
+    ["Acme"],
+  );
+  const futurePath = join(root, "partner", "future.md");
+  await writeFile(futurePath, "# Future\n", "utf8");
+  const future = await catalog.registerDocument({
+    workspaceId: "partner",
+    kind: "brief",
+    title: "Future",
+    path: futurePath,
+    attention: "none",
+  });
+  assert.equal(catalog.getDocument(future.id, { spaceId: "partner" })?.title, "Future");
+
+  assert.throws(
+    () => catalog.listDocuments({}, { spaceId: "missing" }),
+    /unknown space missing/,
+  );
+  assert.throws(
+    () => catalog.listDocuments({}, { spaceId: "Invalid Space" }),
+    /invalid Space id/,
+  );
+  assert.equal(catalog.listDocuments().length, 4);
+  catalog.close();
+});
+
+test("keeps derived Space membership indexed and query-count constant at scale", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-scope-plan-"));
+  const statePath = join(root, "catalog.sqlite3");
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const documentIds: string[] = [];
+  const reviewIds: string[] = [];
+  for (let workspaceIndex = 0; workspaceIndex < 32; workspaceIndex += 1) {
+    const workspaceId = `workspace-${workspaceIndex}`;
+    const workspaceRoot = join(root, workspaceId);
+    await mkdir(workspaceRoot);
+    await catalog.addWorkspace({
+      id: workspaceId,
+      name: `Workspace ${workspaceIndex}`,
+      root: workspaceRoot,
+      artifactRoots: [workspaceRoot],
+      repository: `https://github.com/org-${workspaceIndex % 4}/repo-${workspaceIndex}.git`,
+      repositoryName: `Repo ${workspaceIndex}`,
+    });
+    for (let documentIndex = 0; documentIndex < 8; documentIndex += 1) {
+      const path = join(workspaceRoot, `document-${documentIndex}.md`);
+      await writeFile(path, `# ${workspaceId} document ${documentIndex}\n`, "utf8");
+      const document = await catalog.registerDocument({
+        workspaceId,
+        taskId: `TASK-${documentIndex}`,
+        kind: documentIndex === 0 ? "review" : "plan",
+        title: `${workspaceId} document ${documentIndex}`,
+        path,
+        attention: "review",
+        tags: [
+          `tag-${documentIndex % 4}`,
+          `team-${workspaceIndex % 4}`,
+          `row-${documentIndex}`,
+          "shared",
+        ],
+      });
+      documentIds.push(document.id);
+      if (documentIndex === 0) {
+        const review = await catalog.createReviewRequest({
+          documentId: document.id,
+          kind: "plan-decision",
+          requestMessage: "Review at scale",
+        });
+        reviewIds.push(review.id);
+      }
+    }
+  }
+  catalog.createSpace({
+    id: "scope-small",
+    name: "Small",
+    matchers: [
+      { kind: "repository", value: "github.com/org-0/repo-0" },
+      { kind: "repository", value: "github.com/org-1/repo-1" },
+      { kind: "repository-namespace", value: "github.com/unused-0" },
+      { kind: "repository-namespace", value: "github.com/unused-1" },
+      { kind: "tag", value: "unused-0" },
+      { kind: "tag", value: "unused-1" },
+      { kind: "tag", value: "unused-2" },
+      { kind: "tag", value: "unused-3" },
+    ],
+  });
+  catalog.createSpace({
+    id: "scope-full",
+    name: "Full",
+    matchers: [
+      { kind: "repository-namespace", value: "github.com/org-0" },
+      { kind: "repository-namespace", value: "github.com/org-1" },
+      { kind: "repository-namespace", value: "github.com/org-2" },
+      { kind: "repository-namespace", value: "github.com/org-3" },
+      { kind: "tag", value: "tag-0" },
+      { kind: "tag", value: "tag-1" },
+      { kind: "tag", value: "tag-2" },
+      { kind: "tag", value: "tag-3" },
+    ],
+  });
+  for (let index = 0; index < 10; index += 1) {
+    catalog.createSpace({
+      id: `scope-extra-${index}`,
+      name: `Extra ${index}`,
+      matchers: Array.from({ length: 8 }, (_, matcherIndex) => ({
+        kind: "tag" as const,
+        value: `extra-${index}-${matcherIndex}`,
+      })),
+    });
+  }
+  assert.equal(catalog.listDocuments().length, 256);
+  catalog.close();
+
+  const database = new Database(statePath);
+  const membership = `EXISTS (
+    SELECT 1 FROM space_matchers sm
+    WHERE sm.space_id = ? AND (
+      (sm.kind = 'repository' AND sm.value = wr.repository_key)
+      OR (sm.kind = 'repository-namespace'
+        AND substr(wr.repository_key, 1, length(sm.value) + 1) = sm.value || '/')
+      OR (sm.kind = 'tag' AND EXISTS (
+        SELECT 1 FROM document_tags scope_tags
+        WHERE scope_tags.document_id = d.id AND scope_tags.tag_name = sm.value
+      ))
+    )
+  )`;
+  const documentSelect = `SELECT d.id FROM documents d
+    JOIN document_projects dp ON dp.document_id = d.id
+    JOIN projects p ON p.id = dp.project_id
+    JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id`;
+  const queryShapes: Array<{ sql: string; parameters: string[] }> = [
+    { sql: `${documentSelect} WHERE d.archived_at IS NULL AND ${membership}`, parameters: ["scope-full"] },
+    { sql: `${documentSelect} WHERE d.id = ? AND ${membership}`, parameters: [documentIds[0]!, "scope-full"] },
+    { sql: `SELECT rr.id FROM review_requests rr JOIN documents d ON d.id = rr.document_id JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE ${membership}`, parameters: ["scope-full"] },
+    { sql: `SELECT rr.id FROM review_requests rr JOIN documents d ON d.id = rr.document_id JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE rr.id = ? AND ${membership}`, parameters: [reviewIds[0]!, "scope-full"] },
+    { sql: `SELECT w.id FROM workspaces w WHERE EXISTS (SELECT 1 FROM documents d JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id WHERE d.workspace_id = w.id AND d.archived_at IS NULL AND ${membership})`, parameters: ["scope-full"] },
+  ];
+  const planDetails = queryShapes.flatMap(({ sql, parameters }) =>
+    database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...parameters)
+      .map((row) => String((row as { detail: string }).detail)),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH sm(?: EXISTS)? USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH scope_tags USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  assert.ok(
+    planDetails.some((detail) => /SEARCH wr USING/.test(detail)),
+    planDetails.join("\n"),
+  );
+  for (const relation of ["sm", "scope_tags", "wr"]) {
+    assert.equal(
+      planDetails.some((detail) => new RegExp(`(?:^| )SCAN ${relation}(?: |$)`).test(detail)),
+      false,
+      planDetails.join("\n"),
+    );
+  }
+
+  const matcherIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect} WHERE d.archived_at IS NULL AND ${membership.replace(
+      "space_matchers sm",
+      "space_matchers sm NOT INDEXED",
+    )}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(matcherIndexDisabledPlan.some((detail) => /SCAN sm(?: |$)/.test(detail)));
+
+  const tagIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect} WHERE d.archived_at IS NULL AND ${membership.replace(
+      "document_tags scope_tags",
+      "document_tags scope_tags NOT INDEXED",
+    )}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(tagIndexDisabledPlan.some((detail) => /SCAN scope_tags(?: |$)/.test(detail)));
+
+  const repositoryIndexDisabledPlan = database
+    .prepare(`EXPLAIN QUERY PLAN ${documentSelect.replace(
+      "JOIN workspace_repositories wr ON",
+      "JOIN workspace_repositories wr NOT INDEXED ON",
+    )} WHERE d.archived_at IS NULL AND ${membership}`)
+    .all("scope-full")
+    .map((row) => String((row as { detail: string }).detail));
+  assert.ok(repositoryIndexDisabledPlan.some((detail) => /SCAN wr(?: |$)/.test(detail)));
+
+  database.close();
+
+  const observedQueries: string[] = [];
+  const measuredStorage = SqliteCatalogStorage.open(statePath, {
+    onQuery: (sql) => observedQueries.push(sql),
+  });
+  const refreshQueryCount = (spaceId: string): number => {
+    observedQueries.length = 0;
+    measuredStorage.listDocuments({}, { spaceId });
+    measuredStorage.listReviewRequests({}, { spaceId });
+    measuredStorage.listWorkspaces({ spaceId });
+    return observedQueries.filter((sql) => /^\s*SELECT\b/i.test(sql)).length;
+  };
+  const smallQueryCount = refreshQueryCount("scope-small");
+  const fullQueryCount = refreshQueryCount("scope-full");
+  assert.equal(
+    fullQueryCount,
+    smallQueryCount,
+    `small=${smallQueryCount}, full=${fullQueryCount}`,
+  );
+  assert.ok(fullQueryCount <= 8, `full=${fullQueryCount}`);
+  measuredStorage.close();
+});
+
+test("contains direct reads, mutations, reviews, and reference targets by Space", async () => {
+  const { catalog, workspace } = await fixture();
+  const inPath = join(workspace, "reports", "in-scope.md");
+  const outPath = join(workspace, "reports", "out-of-scope.md");
+  await writeFile(
+    inPath,
+    "# In scope\n\n[Registered target](./out-of-scope.md)\n",
+    "utf8",
+  );
+  await writeFile(outPath, "# Out of scope\n", "utf8");
+  const inScope = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "In scope",
+    path: inPath,
+    attention: "approval",
+    tags: ["client"],
+  });
+  const outOfScope = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Out of scope",
+    path: outPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: outOfScope.id,
+    kind: "plan-decision",
+    requestMessage: "Must stay outside",
+  });
+  catalog.createSpace({
+    id: "client",
+    name: "Client",
+    matchers: [{ kind: "tag", value: "client" }],
+  });
+  const scope = { spaceId: "client" };
+
+  await assert.rejects(catalog.readDocument(outOfScope.id, scope), /unknown document/);
+  await assert.rejects(catalog.markDocumentOpened(outOfScope.id, scope), /unknown document/);
+  await assert.rejects(
+    catalog.respondToReviewRequest(review.id, { outcome: "approved", message: "" }, scope),
+    /unknown review request/,
+  );
+  assert.deepEqual(catalog.resolveDocumentSourceTargets(inScope.id, scope), new Map());
+
+  const removed = await catalog.setDocumentTags(inScope.id, [], scope);
+  assert.deepEqual(removed.tags, []);
+  assert.equal(catalog.getDocument(inScope.id, scope), undefined);
+  await assert.rejects(catalog.readDocument(inScope.id, scope), /unknown document/);
+  catalog.close();
+});
+
+test("publishes metadata-free invalidation once for committed catalog changes", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "transactional-invalidation.md");
+  await writeFile(documentPath, "# Transactional invalidation\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Transactional invalidation",
+    path: documentPath,
+    attention: "approval",
+  });
+  const events: Array<Record<string, never>> = [];
+  catalog.subscribeInvalidation(() => {
+    throw new Error("observer failure");
+  });
+  const unsubscribe = catalog.subscribeInvalidation(() => events.push({}));
+
+  const space = catalog.createSpace({
+    id: "work",
+    name: "Work",
+    matchers: [{ kind: "tag", value: "work" }],
+  });
+  assert.deepEqual(events, [{}]);
+  catalog.renameSpace(space.id, "Work");
+  catalog.replaceSpaceMatchers(space.id, { matchers: space.matchers });
+  assert.equal(events.length, 1);
+  catalog.renameSpace(space.id, "Office");
+  assert.equal(events.length, 2);
+  assert.throws(
+    () => catalog.replaceSpaceMatchers(space.id, { matchers: [] }),
+    /at least one matcher/,
+  );
+  assert.equal(events.length, 2);
+  catalog.deleteSpace(space.id);
+  assert.equal(events.length, 3);
+
+  const archived = await catalog.archiveDocument(document.id);
+  assert.notEqual(archived.archivedAt, null);
+  assert.notEqual(catalog.getDocument(document.id)?.archivedAt, null);
+  assert.equal(events.length, 4);
+
+  unsubscribe();
+  catalog.close();
 });
 
 test("registers workspace-local source links and persists their safe mappings", async () => {
@@ -834,6 +1575,346 @@ test("rejects workspace updates that would orphan registered documents", async (
   );
 });
 
+test("rejects a second workspace for the same canonical root", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-root-"));
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const catalog = await Catalog.open(join(root, "catalog.sqlite3"), {
+    legacyStatePath: false,
+  });
+  await catalog.addWorkspace({
+    id: "stable-repository",
+    name: "Stable repository",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "task-derived-id",
+      name: "Task-derived identity",
+      root: join(workspace, "."),
+      artifactRoots: [workspace],
+    }),
+    /workspace root is already registered as stable-repository/,
+  );
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("reconciles duplicate-root workspaces without changing document or review ids", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-reconcile-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "plan.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Plan\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const document = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "plan",
+    title: "Plan",
+    path: documentPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "Review the plan.",
+  });
+
+  const dryRun = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: false,
+  });
+  assert.equal(dryRun.applied, false);
+  assert.deepEqual(dryRun.movedDocumentIds, [document.id]);
+  assert.deepEqual(dryRun.discardedDocumentIds, []);
+  assert.deepEqual(dryRun.blockingConflicts, []);
+  assert.equal(dryRun.reviewRequestCount, 1);
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "task-derived");
+
+  const applied = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: true,
+  });
+  assert.equal(applied.applied, true);
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "stable-repository");
+  assert.equal(catalog.getReviewRequest(review.id)?.documentId, document.id);
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("requires explicit disposal of archived path conflicts during reconciliation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-conflict-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "direction.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Direction\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const obsolete = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "decision",
+    title: "Obsolete direction",
+    path: documentPath,
+    attention: "none",
+  });
+  await catalog.archiveDocument(obsolete.id);
+  const active = await catalog.registerDocument({
+    workspaceId: "stable-repository",
+    kind: "decision",
+    title: "Active direction",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const blocked = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    apply: false,
+  });
+  assert.deepEqual(blocked.blockingConflicts, [{
+    sourceDocumentId: obsolete.id,
+    targetDocumentId: active.id,
+    reason: "path-conflict",
+  }]);
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      apply: true,
+    }),
+    /workspace reconciliation has blocking conflicts/,
+  );
+
+  const allowed = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    discardArchivedConflicts: true,
+    apply: true,
+  });
+  assert.equal(allowed.applied, true);
+  assert.deepEqual(allowed.discardedDocumentIds, [obsolete.id]);
+  assert.equal(catalog.getDocument(obsolete.id), undefined);
+  assert.equal(catalog.getDocument(active.id)?.archivedAt, null);
+  assert.deepEqual(
+    catalog.listWorkspaces().map(({ id }) => id),
+    ["stable-repository"],
+  );
+  catalog.close();
+});
+
+test("never discards archived conflict review history", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-review-conflict-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "reviewed.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Reviewed\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const storage = SqliteCatalogStorage.open(statePath);
+  for (const id of ["task-derived", "stable-repository"]) {
+    storage.saveWorkspace(
+      {
+        id,
+        name: id,
+        root: canonicalWorkspace,
+        artifactRoots: [canonicalWorkspace],
+      },
+      { key: "github.com/acme/repository", name: "Repository" },
+    );
+  }
+  storage.close();
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const obsolete = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "decision",
+    title: "Reviewed obsolete direction",
+    path: documentPath,
+    attention: "approval",
+  });
+  const review = await catalog.createReviewRequest({
+    documentId: obsolete.id,
+    kind: "plan-decision",
+    requestMessage: "Keep this history.",
+  });
+  await catalog.respondToReviewRequest(review.id, {
+    outcome: "approved",
+    message: "Keep the decision history.",
+  });
+  await catalog.archiveDocument(obsolete.id);
+  const active = await catalog.registerDocument({
+    workspaceId: "stable-repository",
+    kind: "decision",
+    title: "Active direction",
+    path: documentPath,
+    attention: "none",
+  });
+
+  const plan = catalog.reconcileWorkspace({
+    sourceWorkspaceId: "task-derived",
+    targetWorkspaceId: "stable-repository",
+    discardArchivedConflicts: true,
+    apply: false,
+  });
+  assert.deepEqual(plan.blockingConflicts, [{
+    sourceDocumentId: obsolete.id,
+    targetDocumentId: active.id,
+    reason: "review-history",
+  }]);
+  assert.equal(plan.reviewRequestCount, 1);
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      discardArchivedConflicts: true,
+      apply: true,
+    }),
+    /workspace reconciliation has blocking conflicts/,
+  );
+  assert.equal(catalog.getDocument(obsolete.id)?.workspaceId, "task-derived");
+  catalog.close();
+});
+
+test("refuses reconciliation that would escape target artifact roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-workspace-roots-"));
+  const workspace = join(root, "workspace");
+  const targetArtifacts = join(workspace, "published");
+  const statePath = join(root, "catalog.sqlite3");
+  const documentPath = join(workspace, "outside-target.md");
+  await mkdir(targetArtifacts, { recursive: true });
+  await writeFile(documentPath, "# Outside target artifacts\n", "utf8");
+  const canonicalWorkspace = await realpath(workspace);
+  const canonicalTargetArtifacts = await realpath(targetArtifacts);
+  const storage = SqliteCatalogStorage.open(statePath);
+  storage.saveWorkspace(
+    {
+      id: "task-derived",
+      name: "Task derived",
+      root: canonicalWorkspace,
+      artifactRoots: [canonicalWorkspace],
+    },
+    { key: "github.com/acme/repository", name: "Repository" },
+  );
+  storage.saveWorkspace(
+    {
+      id: "stable-repository",
+      name: "Stable repository",
+      root: canonicalWorkspace,
+      artifactRoots: [canonicalTargetArtifacts],
+    },
+    { key: "github.com/acme/repository", name: "Repository" },
+  );
+  storage.close();
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  const document = await catalog.registerDocument({
+    workspaceId: "task-derived",
+    kind: "handoff",
+    title: "Outside target artifacts",
+    path: documentPath,
+    attention: "none",
+  });
+
+  assert.throws(
+    () => catalog.reconcileWorkspace({
+      sourceWorkspaceId: "task-derived",
+      targetWorkspaceId: "stable-repository",
+      apply: false,
+    }),
+    new RegExp(`target workspace would exclude registered document ${document.id}`),
+  );
+  assert.equal(catalog.getDocument(document.id)?.workspaceId, "task-derived");
+  catalog.close();
+});
+
+test("freezes workspace repository identity after the first document", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "identity.md");
+  await writeFile(documentPath, "# Identity\n", "utf8");
+
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example before registration",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "github.com/acme/original",
+    repositoryName: "Original",
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Identity",
+    path: documentPath,
+    attention: "none",
+  });
+  const beforeWorkspace = catalog.listWorkspaces();
+  const beforeDocuments = catalog.listDocuments();
+
+  await assert.rejects(
+    catalog.addWorkspace({
+      id: "example",
+      name: "Must not persist",
+      root: workspace,
+      artifactRoots: [workspace],
+      repository: "github.com/acme/replacement",
+      repositoryName: "Replacement",
+    }),
+    /repository identity cannot change after documents exist/,
+  );
+  assert.deepEqual(catalog.listWorkspaces(), beforeWorkspace);
+  assert.deepEqual(catalog.listDocuments(), beforeDocuments);
+  assert.equal(catalog.getDocument(document.id)?.projectId, document.projectId);
+
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Allowed metadata rename",
+    root: workspace,
+    artifactRoots: [workspace],
+    repository: "git@github.com:acme/original.git",
+    repositoryName: "Original",
+  });
+  assert.equal(catalog.listWorkspaces()[0]?.name, "Allowed metadata rename");
+});
+
 test("tracks reading progress by content revision", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "status.md");
@@ -1000,7 +2081,7 @@ test("records one durable human response and requires reasons for changes", asyn
       outcome: "changes_requested",
       message: "   ",
     }),
-    /response message is required/,
+    /response message or anchored feedback is required/,
   );
   const responded = await catalog.respondToReviewRequest(request.id, {
     outcome: "changes_requested",
@@ -1031,7 +2112,46 @@ test("records one durable human response and requires reasons for changes", asyn
   catalog.close();
 });
 
-test("persists structured file, hunk, and todo feedback", async () => {
+test("supersedes an obsolete review without treating it as rejection", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "superseded.md");
+  await writeFile(documentPath, "# First proposal\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "First proposal",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review this proposal.",
+  });
+
+  const superseded = await catalog.respondToReviewRequest(request.id, {
+    outcome: "superseded",
+    message: "A newer review replaces this one.",
+  });
+
+  assert.equal(superseded.status, "superseded");
+  assert.equal(superseded.response?.outcome, "superseded");
+  assert.equal(catalog.listReviewRequests({ status: "pending" }).length, 0);
+  assert.deepEqual(
+    await catalog.respondToReviewRequest(request.id, {
+      outcome: "superseded",
+      message: "A newer review replaces this one.",
+    }),
+    superseded,
+  );
+
+  catalog.close();
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getReviewRequest(request.id), superseded);
+  restored.close();
+});
+
+test("persists structured file, hunk, line, and todo feedback", async () => {
   const { catalog, statePath, workspace } = await fixture();
   const documentPath = join(workspace, "reports", "change-feedback.md");
   await writeFile(documentPath, "# Change feedback\n", "utf8");
@@ -1053,7 +2173,16 @@ test("persists structured file, hunk, and todo feedback", async () => {
       kind: "feedback" as const,
       path: "src/auth.ts",
       hunkId: "hunk-11111111111111111111",
+      line: 14,
+      endLine: 17,
+      side: "new" as const,
       message: "Use constant-time comparison here.",
+    },
+    {
+      id: "feedback-33333333333333333333",
+      kind: "feedback" as const,
+      path: "src/auth.ts",
+      message: "Keep the public contract stable.",
     },
     {
       id: "feedback-22222222222222222222",
@@ -1065,12 +2194,13 @@ test("persists structured file, hunk, and todo feedback", async () => {
 
   await assert.rejects(
     catalog.respondToReviewRequest(request.id, {
-      outcome: "approved",
-      message: "Looks good.",
+      outcome: "rejected",
+      message: "Do not publish.",
       items,
     }),
-    /feedback items require a changes_requested outcome/,
+    /feedback items require an approved or changes_requested outcome/,
   );
+
   await assert.rejects(
     catalog.respondToReviewRequest(request.id, {
       outcome: "changes_requested",
@@ -1079,13 +2209,59 @@ test("persists structured file, hunk, and todo feedback", async () => {
     }),
     /invalid review feedback item/,
   );
+  await assert.rejects(
+    catalog.respondToReviewRequest(request.id, {
+      outcome: "changes_requested",
+      message: "Address the anchored feedback.",
+      items: [{ ...items[0]!, endLine: 13 }],
+    }),
+    /invalid review feedback item/,
+  );
 
-  const responded = await catalog.respondToReviewRequest(request.id, {
+  const anchoredOnly = await catalog.respondToReviewRequest(request.id, {
     outcome: "changes_requested",
-    message: "Address the anchored feedback.",
+    message: "",
     items,
   });
-  assert.deepEqual(responded.response?.items, items);
+  assert.deepEqual(anchoredOnly.response?.items, items);
+  assert.equal(anchoredOnly.response?.message, "");
+  catalog.close();
+
+  const restored = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.deepEqual(restored.getReviewRequest(request.id)?.response?.items, items);
+  restored.close();
+});
+
+test("persists anchored feedback as non-blocking approval comments", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "approved-feedback.md");
+  await writeFile(documentPath, "# Approved feedback\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "change-review",
+    title: "Approved feedback",
+    path: documentPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "change-decision",
+    requestMessage: "Review this exact implementation.",
+  });
+  const items = [{
+    id: "feedback-44444444444444444444",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    message: "Approved, but consider simplifying this later.",
+  }];
+
+  const approved = await catalog.respondToReviewRequest(request.id, {
+    outcome: "approved",
+    message: "Safe to publish.",
+    items,
+  });
+  assert.equal(approved.status, "approved");
+  assert.deepEqual(approved.response?.items, items);
   catalog.close();
 
   const restored = await Catalog.open(statePath, { legacyStatePath: false });
@@ -1403,6 +2579,15 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   const versionOne = new Database(databasePath);
   versionOne.exec("ALTER TABLE documents DROP COLUMN source_path");
   versionOne.exec("ALTER TABLE documents DROP COLUMN storage_kind");
+  versionOne.exec(
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     DROP TABLE review_requests;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
+  );
   versionOne.pragma("user_version = 1");
   versionOne.close();
   const migrated = await Catalog.open(databasePath, { legacyStatePath: false });
@@ -1410,6 +2595,15 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
 
   const versionTwo = new Database(databasePath);
   versionTwo.exec("DROP TABLE document_source_links");
+  versionTwo.exec(
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     DROP TABLE review_requests;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
+  );
   versionTwo.pragma("user_version = 2");
   versionTwo.close();
   const migratedAgain = await Catalog.open(databasePath, {
@@ -1419,7 +2613,12 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
 
   const versionThree = new Database(databasePath);
   versionThree.exec("DROP TABLE review_responses");
+  versionThree.exec("DROP TABLE feedback_comments");
+  versionThree.exec("DROP TABLE feedback_submissions");
   versionThree.exec("DROP TABLE review_requests");
+  versionThree.exec(
+    "DROP TABLE space_matchers; DROP TABLE spaces; DROP INDEX workspace_repositories_key_idx",
+  );
   versionThree.pragma("user_version = 3");
   versionThree.close();
   const migratedReviews = await Catalog.open(databasePath, {
@@ -1428,7 +2627,7 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
   migratedReviews.close();
 
   const database = new Database(databasePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 6);
+  assert.equal(database.pragma("user_version", { simple: true }), 10);
   assert.deepEqual(
     database
       .prepare<[], { name: string }>("PRAGMA table_info(documents)")
@@ -1445,17 +2644,50 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
       .all()
       .map(({ name }) => name),
     [
+      "document_projects",
       "document_source_links",
       "document_tags",
       "documents",
+      "feedback_comments",
+      "feedback_submissions",
+      "projects",
       "review_requests",
       "review_responses",
+      "space_matchers",
+      "spaces",
       "tags",
       "workspace_artifact_roots",
+      "workspace_repositories",
       "workspaces",
     ],
   );
   database.close();
+
+  const constraints = new Database(databasePath);
+  constraints
+    .prepare("INSERT INTO spaces (id, name) VALUES (?, ?)")
+    .run("work", "Work");
+  constraints
+    .prepare(
+      "INSERT INTO space_matchers (space_id, kind, value) VALUES (?, ?, ?)",
+    )
+    .run("work", "tag", "client-work");
+  assert.throws(
+    () => constraints
+      .prepare(
+        "INSERT INTO space_matchers (space_id, kind, value) VALUES (?, ?, ?)",
+      )
+      .run("work", "tag", "client-work"),
+    /UNIQUE constraint failed/,
+  );
+  constraints.prepare("DELETE FROM spaces WHERE id = ?").run("work");
+  assert.equal(
+    constraints
+      .prepare<[], { count: number }>("SELECT count(*) AS count FROM space_matchers")
+      .get()?.count,
+    0,
+  );
+  constraints.close();
 
   const futurePath = join(root, "future.sqlite3");
   const future = new Database(futurePath);
@@ -1465,6 +2697,45 @@ test("applies the SQLite schema migration and rejects a future schema", async ()
     Catalog.open(futurePath, { legacyStatePath: false }),
     /unsupported SQLite catalog schema 99/,
   );
+});
+
+test("rolls back a failed version nine migration", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "preserved.md");
+  await writeFile(documentPath, "# Preserved\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Preserved",
+    path: documentPath,
+    attention: "none",
+  });
+  catalog.close();
+
+  const broken = new Database(statePath);
+  broken.exec("DROP TABLE space_matchers; DROP TABLE spaces");
+  broken.exec("CREATE TABLE spaces (broken TEXT) STRICT");
+  broken.pragma("user_version = 8");
+  broken.close();
+
+  await assert.rejects(
+    Catalog.open(statePath, { legacyStatePath: false }),
+    /table spaces already exists/,
+  );
+
+  const inspected = new Database(statePath, { readonly: true });
+  assert.equal(inspected.pragma("user_version", { simple: true }), 8);
+  assert.equal(
+    inspected
+      .prepare<[string], { title: string }>("SELECT title FROM documents WHERE id = ?")
+      .get(document.id)?.title,
+    "Preserved",
+  );
+  assert.deepEqual(
+    inspected.prepare<[], { name: string }>("PRAGMA table_info(spaces)").all(),
+    [{ cid: 0, name: "broken", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 }],
+  );
+  inspected.close();
 });
 
 test("migrates version four review requests without losing decisions", async () => {
@@ -1490,6 +2761,40 @@ test("migrates version four review requests without losing decisions", async () 
   catalog.close();
 
   const versionFour = new Database(statePath);
+  const existingResponse = versionFour.prepare<[], {
+    outcome: string;
+    message: string;
+    created_at: string;
+  }>(
+    `SELECT rr.outcome, fs.general_message AS message, rr.created_at
+     FROM review_responses rr
+     JOIN feedback_submissions fs ON fs.id = rr.feedback_id`,
+  ).get();
+  assert.ok(existingResponse);
+  versionFour.exec(
+    `DROP TABLE review_responses;
+     DROP TABLE feedback_comments;
+     DROP TABLE feedback_submissions;
+     CREATE TABLE review_responses (
+       review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+       outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
+       message TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     ) STRICT;
+     DROP TABLE space_matchers;
+     DROP TABLE spaces;
+     DROP INDEX workspace_repositories_key_idx`,
+  );
+  versionFour.prepare(
+    `INSERT INTO review_responses (
+       review_request_id, outcome, message, created_at
+     ) VALUES (?, ?, ?, ?)`,
+  ).run(
+    request.id,
+    existingResponse.outcome,
+    existingResponse.message,
+    existingResponse.created_at,
+  );
   versionFour.pragma("user_version = 4");
   versionFour.close();
 
@@ -1502,7 +2807,7 @@ test("migrates version four review requests without losing decisions", async () 
   migrated.close();
 
   const database = new Database(statePath, { readonly: true });
-  assert.equal(database.pragma("user_version", { simple: true }), 6);
+  assert.equal(database.pragma("user_version", { simple: true }), 10);
   const schema = database
     .prepare<[], { sql: string }>(
       "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'review_requests'",
@@ -1641,6 +2946,147 @@ test("supports lifecycle updates and all persisted document filters", async () =
     /unknown document/,
   );
   catalog.close();
+});
+
+test("archives and restores document batches atomically", async () => {
+  const { catalog, workspace } = await fixture();
+  const firstPath = join(workspace, "reports", "bulk-first.md");
+  const secondPath = join(workspace, "reports", "bulk-second.md");
+  await writeFile(firstPath, "# First\n", "utf8");
+  await writeFile(secondPath, "# Second\n", "utf8");
+  const first = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "First",
+    path: firstPath,
+    attention: "none",
+  });
+  const second = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "review",
+    title: "Second",
+    path: secondPath,
+    attention: "approval",
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: second.id,
+    kind: "plan-decision",
+    requestMessage: "Review before archiving.",
+  });
+
+  await assert.rejects(
+    catalog.archiveDocuments([first.id, second.id]),
+    /document has a pending review request/,
+  );
+  assert.deepEqual(
+    catalog.listDocuments().map(({ id }) => id).sort(),
+    [first.id, second.id].sort(),
+  );
+
+  await catalog.respondToReviewRequest(request.id, {
+    outcome: "approved",
+    message: "Done.",
+  });
+  assert.equal((await catalog.archiveDocuments([first.id, second.id])).length, 2);
+  assert.equal(catalog.listDocuments().length, 0);
+  assert.equal(catalog.listDocuments({ archived: true }).length, 2);
+  assert.equal((await catalog.restoreDocuments([first.id, second.id])).length, 2);
+  assert.equal(catalog.listDocuments().length, 2);
+  catalog.close();
+});
+
+test("purges catalog history without deleting referenced Markdown", async () => {
+  const { catalog, workspace } = await fixture();
+  const documentPath = join(workspace, "reports", "purge-reference.md");
+  await writeFile(documentPath, "# Keep source\n", "utf8");
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "plan",
+    title: "Purge reference",
+    path: documentPath,
+    attention: "approval",
+    tags: ["purge-test"],
+  });
+  const request = await catalog.createReviewRequest({
+    documentId: document.id,
+    kind: "plan-decision",
+    requestMessage: "This history will be purged.",
+  });
+
+  assert.deepEqual(await catalog.purgeDocuments([document.id]), [document.id]);
+  assert.equal(catalog.getDocument(document.id), undefined);
+  assert.equal(catalog.getReviewRequest(request.id), undefined);
+  assert.equal(await readFile(documentPath, "utf8"), "# Keep source\n");
+  catalog.close();
+});
+
+test("purges every private managed copy while preserving its original source", async () => {
+  const { catalog, workspace } = await fixture();
+  const sourcePath = join(workspace, "..", "purge-managed.md");
+  await writeFile(sourcePath, "# Managed v1\n", "utf8");
+  const first = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed purge",
+    path: sourcePath,
+    attention: "none",
+  });
+  await writeFile(sourcePath, "# Managed v2\n", "utf8");
+  const second = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed purge",
+    path: sourcePath,
+    attention: "none",
+  });
+  assert.equal(second.id, first.id);
+  assert.notEqual(second.path, first.path);
+  const unrelatedPath = join(dirname(first.path), `${first.id}-notes.md`);
+  await writeFile(unrelatedPath, "# Not a managed revision\n", "utf8");
+
+  assert.deepEqual(await catalog.purgeDocuments([first.id]), [first.id]);
+  await assert.rejects(access(first.path));
+  await assert.rejects(access(second.path));
+  assert.equal(
+    await readFile(unrelatedPath, "utf8"),
+    "# Not a managed revision\n",
+  );
+  assert.equal(await readFile(sourcePath, "utf8"), "# Managed v2\n");
+  catalog.close();
+});
+
+test("restores every staged managed revision after an interrupted purge", async () => {
+  const { catalog, statePath, workspace } = await fixture();
+  const sourcePath = join(workspace, "..", "purge-recovery.md");
+  await writeFile(sourcePath, "# Managed v1\n", "utf8");
+  const first = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed recovery",
+    path: sourcePath,
+    attention: "none",
+  });
+  await writeFile(sourcePath, "# Managed v2\n", "utf8");
+  const second = await catalog.importDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Managed recovery",
+    path: sourcePath,
+    attention: "none",
+  });
+  catalog.close();
+
+  for (const path of [first.path, second.path]) {
+    await rename(
+      path,
+      join(dirname(path), `.${basename(path)}.deadbeef.purging`),
+    );
+  }
+  const recovered = await Catalog.open(statePath);
+  await access(first.path);
+  await access(second.path);
+  assert.equal(recovered.getDocument(first.id)?.path, second.path);
+  recovered.close();
 });
 
 test("validates structured catalog input at runtime", async () => {

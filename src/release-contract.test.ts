@@ -62,3 +62,23 @@ test("release CI verifies packages before trusted publication", async () => {
   assert.match(workflow, /npm publish --access public/);
   assert.match(workflow, /gh release create/);
 });
+
+test("release CI claims a current main commit before publishing", async () => {
+  const workflow = await readFile(
+    join(packageRoot, ".github", "workflows", "ci.yml"),
+    "utf8",
+  );
+
+  const publishJob = workflow.slice(workflow.indexOf("  publish:\n"));
+  const claimPosition = publishJob.indexOf("- name: Claim release commit");
+  const npmPublishPosition = publishJob.indexOf("- name: Publish to npm with trusted publishing");
+  const tagPosition = publishJob.indexOf("- name: Push release tag");
+
+  assert.match(publishJob, /fetch-depth: 0\n\s+ref: main/);
+  assert.match(publishJob, /npm version patch --no-git-tag-version/);
+  assert.ok(claimPosition > 0, "release commit must be claimed");
+  assert.ok(npmPublishPosition > claimPosition, "claim must precede npm publish");
+  assert.ok(tagPosition > npmPublishPosition, "tag must follow npm publish");
+  assert.match(publishJob, /bash scripts\/claim-release\.sh/);
+  assert.match(publishJob, /mode=skip/);
+});

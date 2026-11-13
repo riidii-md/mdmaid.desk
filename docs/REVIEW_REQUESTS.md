@@ -3,6 +3,9 @@
 Mdmaid.desk keeps document reading state and workflow decisions separate. A
 document is passive unless its producer explicitly creates a review request.
 Opening, registering, importing, or marking a document done never approves it.
+Likewise, [document feedback](DOCUMENT_FEEDBACK.md) is available independently
+and never changes review state. `pending` means only that a producer is waiting
+for one explicit human decision.
 
 ## State Model
 
@@ -10,6 +13,7 @@ Opening, registering, importing, or marking a document done never approves it.
 pending -> approved
         -> changes_requested
         -> rejected
+        -> superseded
         -> stale
 ```
 
@@ -22,10 +26,11 @@ durable.
 Request kinds are `plan-decision` for plans and `change-decision` for
 first-class `change-review` documents. A change decision is rejected when its
 document is not a change review, and a change review rejects any other decision
-kind. Human outcomes are `approved`,
-`changes_requested`, and `rejected`. Request and response messages are stored
-as plain text. Requested changes require a non-empty explanation; the other
-outcomes may also carry useful context.
+kind. Review outcomes are `approved`, `changes_requested`, `rejected`, and
+`superseded`. Superseded closes an old request without approving or rejecting
+it, so a waiting producer can ignore that version. Request and response
+messages are stored as plain text. Requested changes require a non-empty
+explanation; the other outcomes may also carry useful context.
 
 ## Producer CLI
 
@@ -70,6 +75,11 @@ mdmaid-desk review wait <review-id> --json
 mdmaid-desk review respond <review-id> \
   --outcome approved \
   --message "Proceed after the backup check."
+
+# Close an older request after publishing a replacement:
+mdmaid-desk review respond <old-review-id> \
+  --outcome superseded \
+  --message "Replaced by the newer change review."
 ```
 
 JSON output is versioned and contains the public document identity, complete
@@ -95,10 +105,18 @@ List filters:
 ```
 
 Creation accepts `documentId`, optional `documentRevision`, `kind`, and
-`requestMessage`. Response accepts `outcome`, `message`, and optional `items`.
-Items are available only for `changes_requested`: a `feedback` item identifies
-a safe relative `path` and stable `hunkId`, while a file-level `todo` identifies
-only its `path`. Both carry an ID and bounded plain-text message. Unknown
+`requestMessage`. Response accepts `outcome` (`approved`, `changes_requested`,
+`rejected`, or `superseded`), `message`, and either legacy `items` or a
+structured `feedback` submission. Structured feedback supports Markdown and
+diff anchors and is linked to the decision atomically.
+Items are available for `approved` and `changes_requested` outcomes. On an
+approval they are non-blocking comments; on requested changes they identify
+work that must be addressed. A `feedback` item identifies a safe relative
+`path`, optionally a stable `hunkId`, and optionally a paired `line` plus
+`side` (`old` or `new`). `endLine` extends a line anchor into an inclusive
+same-side range. A path-only feedback item is file-level; a line or range
+anchor must also identify its hunk. Legacy file-level `todo` items remain accepted.
+All items carry an ID and bounded plain-text message. Unknown
 fields, unknown enum values, unsafe paths or control data, malformed anchors,
 and oversized messages are rejected. The first valid response wins atomically.
 An identical retry returns the stored result, while a different retry receives
@@ -114,6 +132,9 @@ a conflict.
       "kind": "feedback",
       "path": "src/auth.ts",
       "hunkId": "hunk-44444444444444444444",
+      "line": 14,
+      "endLine": 17,
+      "side": "new",
       "message": "Use a constant-time comparison."
     },
     {
@@ -140,21 +161,41 @@ tag groups and then to one ordered list. Wide layouts show section headings;
 narrow layouts retain the same grouped navigation order without spending rows
 on headings.
 
-The browser always provides a response text area. In the TUI, use `r` for the
-Actions view, `y` to approve, `c` to request changes, or `x` to reject. The TUI
-composer uses `Enter` for a newline, `Ctrl-D` to submit, and `Esc` to cancel.
+The browser always provides a separate feedback surface on every document. In the TUI, use
+`r` for the Actions view, `y` to approve, `c` to request changes, `x` to reject,
+or `o` to supersede an obsolete request. The TUI composer uses `Enter` for a
+newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
 A Change Review containing fenced Git patches opens in a native read-only diff
-view. Use `[`/`]` or arrow keys for files, `p`/`n` for hunks, `m` for
+view. Use `p`/`n` for files (`[`/`]` remain aliases), `j`/`k`
+to move through lines across hunk boundaries, `m` for
 unified/side-by-side layout, and `d` for the complete Markdown explanation.
 Both native viewers color common keywords, strings, comments, numbers,
 properties, types, and function calls according to the changed file extension
 while preserving the red/green line backgrounds and intra-line emphasis.
-Use `f` for current-hunk feedback, `t` for a file todo, and `z` to undo the
-latest unsent note. Request Changes stores all notes as response `items`; open
-notes block Approve and Reject so they cannot be discarded accidentally. A
+The browser and TUI show the complete diff for the selected file in one
+continuous view; the file list controls which changed file is shown.
+Use `f` for feedback on the selected line, or press `v`, move with `j`/`k`, and
+press `f` for a same-side range. Use `t` for feedback on the current file and
+`z` to undo the latest unsent note. In the browser, click a visible `+` beside
+a line number, Shift-click a second same-side line for a range, or use
+**feedback on file**. Line and range comments render inline after their anchor
+and remain in the feedback summary for management.
+Feedback can be sent directly without a review. When a decision is pending,
+the same general and anchored draft can instead be linked atomically to that
+decision. Browser drafts survive reload for the exact document revision and
+expose Edit and Remove controls. A
 Change Review with no parsed files or any parser warning also blocks Approve,
 because the displayed native diff may not contain the exact requested scope.
+
+Every Mermaid fence is parsed during registration and import. Invalid diagrams
+reject ingress with a complete structured report containing the diagram count
+and every failing block's number, Markdown start line, and Mermaid parser
+diagnostic. The API returns it as `error.validation`; JSON CLI callers receive
+the same data, and `mdmaid-desk validate <file.md> --json` can run it before
+publication. Live reference changes are validated by the same gate. The browser
+still isolates runtime failures per diagram so an older document or client-only
+renderer problem cannot hide the rest of the review.
 
 ## Waiting and Recovery
 
@@ -165,10 +206,21 @@ the CLI resolves the current descriptor and reconnects. Without a daemon it
 polls SQLite without holding a transaction, so a later web or TUI service can
 respond through the same catalog.
 
+A live waiter also compares its loaded package version with the installed
+package. After an upgrade it stops the old subscription and delegates only the
+existing `review wait` operation to the updated CLI. The original process then
+finishes its normal output, including the combined document-and-review JSON
+from `register --wait` or `import --wait`; it does not repeat publication or
+create another review request.
+
 The command waits without using model turns. If the waiting process exits, the
 request and response remain recoverable with `review show` or another
 `review wait`. Mdmaid.desk does not execute callbacks or relaunch a dead agent
 session; that requires a separate supervisor.
+
+`superseded` is terminal just like the decision outcomes, so `review wait`
+returns immediately and the producer can ignore the obsolete review rather
+than treating it as approval, requested changes, or rejection.
 
 ## Security Boundaries
 

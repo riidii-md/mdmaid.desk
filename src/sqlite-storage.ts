@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -9,21 +10,34 @@ import {
   isReviewKind,
   isReviewOutcome,
   isReviewStatus,
+  isSpaceMatcherKind,
+  projectDisplayName,
   type Attention,
+  type ContentScope,
   type DocumentFilters,
   type DocumentKind,
   type DocumentSourceLink,
   type DocumentStorage,
+  type FeedbackAnchor,
+  type FeedbackComment,
+  type FeedbackStoragePage,
+  type FeedbackSubmissionFilters,
+  type Project,
+  type RepositoryIdentity,
+  type RepositoryInventoryItem,
   type ReviewRequestFilters,
   type ReviewFeedbackItem,
   type ReviewResponse,
   type StoredDocument,
+  type StoredFeedbackSubmission,
   type StoredReviewRequest,
+  type Space,
+  type SpaceMatcher,
   type Workspace,
 } from "./domain.js";
 import type { CatalogStorage } from "./storage.js";
 
-export const SQLITE_SCHEMA_VERSION = 6;
+export const SQLITE_SCHEMA_VERSION = 10;
 
 interface WorkspaceRow {
   id: string;
@@ -33,6 +47,43 @@ interface WorkspaceRow {
 
 interface ArtifactRootRow {
   path: string;
+}
+
+interface WorkspaceArtifactRootRow extends ArtifactRootRow {
+  workspace_id: string;
+}
+
+export interface SqliteCatalogStorageOptions {
+  onQuery?: (sql: string) => void;
+}
+
+interface WorkspaceRepositoryRow {
+  repository_key: string;
+  repository_name: string;
+}
+
+interface WorkspaceRepositoryInventoryRow extends WorkspaceRepositoryRow {
+  workspace_id: string;
+}
+
+interface SpaceRow {
+  id: string;
+  name: string;
+}
+
+interface SpaceMatcherRow {
+  kind: string;
+  value: string;
+}
+
+interface ProjectRow {
+  id: string;
+  repository_key: string;
+  repository_name: string;
+  task_key: string;
+  feature_name: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface DocumentRow {
@@ -54,16 +105,28 @@ interface DocumentRow {
   missing_at: string | null;
   created_at: string;
   updated_at: string;
+  project_id: string;
+  project_repository_name: string;
+  project_task_key: string;
+  project_feature_name: string | null;
 }
 
 interface TagRow {
   name: string;
 }
 
+interface DocumentTagRow extends TagRow {
+  document_id: string;
+}
+
 interface SourceLinkRow {
   id: string;
   href: string;
   workspace_path: string;
+}
+
+interface DocumentSourceLinkRow extends SourceLinkRow {
+  document_id: string;
 }
 
 interface DocumentIdRow {
@@ -84,9 +147,43 @@ interface ReviewRequestRow {
 
 interface ReviewResponseRow {
   outcome: string;
+  feedback_id: string | null;
+  created_at: string;
+}
+
+interface ReviewResponseWithIdRow extends ReviewResponseRow {
+  review_request_id: string;
+}
+
+interface LegacyReviewResponseRow {
+  review_request_id: string;
+  outcome: string;
   message: string;
   items_json: string | null;
   created_at: string;
+  document_id: string;
+  document_revision: number;
+  document_content_hash: string;
+}
+
+interface FeedbackSubmissionRow {
+  id: string;
+  document_id: string;
+  document_revision: number;
+  document_content_hash: string;
+  general_message: string | null;
+  review_request_id: string | null;
+  created_at: string;
+}
+
+interface FeedbackCommentRow {
+  submission_id: string;
+  id: string;
+  ordinal: number;
+  intent: string;
+  anchor_kind: string;
+  anchor_json: string;
+  message: string;
 }
 
 const INITIAL_SCHEMA = `
@@ -100,6 +197,23 @@ const INITIAL_SCHEMA = `
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     path TEXT NOT NULL,
     PRIMARY KEY (workspace_id, path)
+  ) STRICT;
+
+  CREATE TABLE workspace_repositories (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+    repository_key TEXT NOT NULL,
+    repository_name TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE projects (
+    id TEXT PRIMARY KEY,
+    repository_key TEXT NOT NULL,
+    repository_name TEXT NOT NULL,
+    task_key TEXT NOT NULL DEFAULT '',
+    feature_name TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (repository_key, task_key)
   ) STRICT;
 
   CREATE TABLE documents (
@@ -133,6 +247,11 @@ const INITIAL_SCHEMA = `
     UNIQUE (document_id, href)
   ) STRICT;
 
+  CREATE TABLE document_projects (
+    document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT
+  ) STRICT;
+
   CREATE TABLE review_requests (
     id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
@@ -140,16 +259,36 @@ const INITIAL_SCHEMA = `
     document_content_hash TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
     request_message TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'stale')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'superseded', 'stale')),
     stale_at TEXT,
     created_at TEXT NOT NULL
   ) STRICT;
 
+  CREATE TABLE feedback_submissions (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+    document_content_hash TEXT NOT NULL,
+    general_message TEXT,
+    created_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE feedback_comments (
+    submission_id TEXT NOT NULL REFERENCES feedback_submissions(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    intent TEXT NOT NULL CHECK (intent IN ('feedback', 'todo')),
+    anchor_kind TEXT NOT NULL CHECK (anchor_kind IN ('markdown-v1', 'diff-file-v1', 'diff-lines-v1')),
+    anchor_json TEXT NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (submission_id, id),
+    UNIQUE (submission_id, ordinal)
+  ) STRICT;
+
   CREATE TABLE review_responses (
     review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
-    outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected')),
-    message TEXT NOT NULL,
-    items_json TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
+    feedback_id TEXT UNIQUE REFERENCES feedback_submissions(id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -163,19 +302,66 @@ const INITIAL_SCHEMA = `
     PRIMARY KEY (document_id, tag_name)
   ) STRICT;
 
+  CREATE TABLE spaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE space_matchers (
+    space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('repository', 'repository-namespace', 'tag')),
+    value TEXT NOT NULL,
+    PRIMARY KEY (space_id, kind, value)
+  ) STRICT;
+
   CREATE INDEX documents_workspace_idx ON documents(workspace_id);
   CREATE INDEX documents_task_idx ON documents(task_id);
   CREATE INDEX documents_kind_idx ON documents(kind);
   CREATE INDEX documents_attention_idx ON documents(attention);
   CREATE INDEX documents_updated_idx ON documents(updated_at DESC);
   CREATE INDEX document_tags_tag_idx ON document_tags(tag_name);
+  CREATE INDEX workspace_repositories_key_idx
+    ON workspace_repositories(repository_key);
+  CREATE INDEX space_matchers_lookup_idx
+    ON space_matchers(space_id, kind, value);
   CREATE UNIQUE INDEX review_requests_pending_document_idx
     ON review_requests(document_id) WHERE status = 'pending';
   CREATE INDEX review_requests_document_idx
     ON review_requests(document_id, created_at DESC);
   CREATE INDEX review_requests_status_idx
     ON review_requests(status, created_at DESC);
+  CREATE INDEX feedback_submissions_document_idx
+    ON feedback_submissions(document_id, document_revision, created_at DESC, id DESC);
 `;
+
+const DOCUMENT_SELECT = `SELECT d.*,
+  dp.project_id,
+  p.repository_name AS project_repository_name,
+  p.task_key AS project_task_key,
+  p.feature_name AS project_feature_name
+  FROM documents d
+  JOIN document_projects dp ON dp.document_id = d.id
+  JOIN projects p ON p.id = dp.project_id
+  JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id`;
+
+const SPACE_MEMBERSHIP_PREDICATE = `EXISTS (
+  SELECT 1 FROM space_matchers sm
+  WHERE sm.space_id = ? AND (
+    (sm.kind = 'repository' AND sm.value = wr.repository_key)
+    OR (
+      sm.kind = 'repository-namespace'
+      AND substr(wr.repository_key, 1, length(sm.value) + 1) = sm.value || '/'
+    )
+    OR (
+      sm.kind = 'tag'
+      AND EXISTS (
+        SELECT 1 FROM document_tags scope_tags
+        WHERE scope_tags.document_id = d.id
+          AND scope_tags.tag_name = sm.value
+      )
+    )
+  )
+)`;
 
 export class SqliteCatalogStorage implements CatalogStorage {
   readonly #database: Database.Database;
@@ -184,7 +370,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
     this.#database = database;
   }
 
-  static open(databasePath: string): SqliteCatalogStorage {
+  static open(
+    databasePath: string,
+    options: SqliteCatalogStorageOptions = {},
+  ): SqliteCatalogStorage {
     const canonicalPath = resolve(databasePath);
     mkdirSync(dirname(canonicalPath), { recursive: true, mode: 0o700 });
     try {
@@ -198,7 +387,18 @@ export class SqliteCatalogStorage implements CatalogStorage {
       }
     }
 
-    const database = new Database(canonicalPath);
+    const database = new Database(
+      canonicalPath,
+      options.onQuery === undefined
+        ? undefined
+        : {
+            verbose: (message: unknown) => {
+              if (typeof message === "string") {
+                options.onQuery?.(message);
+              }
+            },
+          },
+    );
     try {
       chmodSync(canonicalPath, 0o600);
       database.pragma("foreign_keys = ON");
@@ -221,7 +421,9 @@ export class SqliteCatalogStorage implements CatalogStorage {
   isEmpty(): boolean {
     const row = this.#database
       .prepare<[], { count: number }>(
-        "SELECT (SELECT count(*) FROM workspaces) + (SELECT count(*) FROM documents) AS count",
+        `SELECT (SELECT count(*) FROM workspaces) +
+                (SELECT count(*) FROM documents) +
+                (SELECT count(*) FROM spaces) AS count`,
       )
       .get();
     return row?.count === 0;
@@ -231,20 +433,128 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return this.#database.transaction(operation)();
   }
 
-  listWorkspaces(): Workspace[] {
+  listSpaces(): Space[] {
     const rows = this.#database
-      .prepare<[], WorkspaceRow>("SELECT id, name, root FROM workspaces ORDER BY id")
+      .prepare<[], SpaceRow>("SELECT id, name FROM spaces")
       .all();
-    const roots = this.#database.prepare<
-      [string],
-      ArtifactRootRow
-    >(
-      "SELECT path FROM workspace_artifact_roots WHERE workspace_id = ? ORDER BY path",
+    const matchers = this.#database.prepare<[string], SpaceMatcherRow>(
+      `SELECT kind, value FROM space_matchers
+       WHERE space_id = ? ORDER BY kind, value`,
     );
+    return rows
+      .map((row) => validateSpaceRow(row, matchers.all(row.id)))
+      .sort(compareSpaces);
+  }
+
+  getSpace(id: string): Space | undefined {
+    const row = this.#database
+      .prepare<[string], SpaceRow>("SELECT id, name FROM spaces WHERE id = ?")
+      .get(id);
+    if (!row) {
+      return undefined;
+    }
+    const matchers = this.#database
+      .prepare<[string], SpaceMatcherRow>(
+        `SELECT kind, value FROM space_matchers
+         WHERE space_id = ? ORDER BY kind, value`,
+      )
+      .all(id);
+    return validateSpaceRow(row, matchers);
+  }
+
+  saveSpace(space: Space): void {
+    this.transaction(() => {
+      this.#database
+        .prepare(
+          `INSERT INTO spaces (id, name) VALUES (?, ?)
+           ON CONFLICT(id) DO UPDATE SET name = excluded.name`,
+        )
+        .run(space.id, space.name);
+      this.#database
+        .prepare("DELETE FROM space_matchers WHERE space_id = ?")
+        .run(space.id);
+      const insert = this.#database.prepare(
+        `INSERT INTO space_matchers (space_id, kind, value)
+         VALUES (?, ?, ?)`,
+      );
+      for (const matcher of space.matchers) {
+        insert.run(space.id, matcher.kind, matcher.value);
+      }
+    });
+  }
+
+  deleteSpace(id: string): boolean {
+    return this.#database.prepare("DELETE FROM spaces WHERE id = ?").run(id)
+      .changes === 1;
+  }
+
+  listRepositories(): RepositoryInventoryItem[] {
+    const rows = this.#database
+      .prepare<[], WorkspaceRepositoryInventoryRow>(
+        `SELECT workspace_id, repository_key, repository_name
+         FROM workspace_repositories
+         ORDER BY repository_key, repository_name, workspace_id`,
+      )
+      .all();
+    const grouped = new Map<
+      string,
+      { names: string[]; workspaceIds: string[] }
+    >();
+    for (const row of rows) {
+      const current = grouped.get(row.repository_key) ?? {
+        names: [],
+        workspaceIds: [],
+      };
+      if (!current.names.includes(row.repository_name)) {
+        current.names.push(row.repository_name);
+      }
+      current.workspaceIds.push(row.workspace_id);
+      grouped.set(row.repository_key, current);
+    }
+    return [...grouped.entries()].map(([key, value]) => ({
+      key,
+      name: value.names.sort(compareText)[0] ?? key,
+      workspaceIds: value.workspaceIds.sort(compareText),
+      kind: key.startsWith("local:") ? "local" : "remote",
+    }));
+  }
+
+  listWorkspaces(scope: ContentScope = {}): Workspace[] {
+    const scopedWhere = scope.spaceId === undefined
+      ? ""
+      : ` WHERE EXISTS (
+          SELECT 1 FROM documents d
+          JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+          WHERE d.workspace_id = workspaces.id
+            AND d.archived_at IS NULL
+            AND ${SPACE_MEMBERSHIP_PREDICATE}
+        )`;
+    const rows = this.#database
+      .prepare<string[], WorkspaceRow>(
+        `SELECT id, name, root FROM workspaces${scopedWhere} ORDER BY id`,
+      )
+      .all(...(scope.spaceId === undefined ? [] : [scope.spaceId]));
+    const rootsByWorkspace = new Map<string, string[]>();
+    if (rows.length > 0) {
+      const placeholders = rows.map(() => "?").join(", ");
+      const rootRows = this.#database
+        .prepare<string[], WorkspaceArtifactRootRow>(
+          `SELECT workspace_id, path
+           FROM workspace_artifact_roots
+           WHERE workspace_id IN (${placeholders})
+           ORDER BY workspace_id, path`,
+        )
+        .all(...rows.map(({ id }) => id));
+      for (const root of rootRows) {
+        const paths = rootsByWorkspace.get(root.workspace_id) ?? [];
+        paths.push(root.path);
+        rootsByWorkspace.set(root.workspace_id, paths);
+      }
+    }
     return rows.map((row) =>
       validateWorkspaceRow(
         row,
-        roots.all(row.id).map(({ path }) => path),
+        rootsByWorkspace.get(row.id) ?? [],
       ),
     );
   }
@@ -267,7 +577,30 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return validateWorkspaceRow(row, artifactRoots);
   }
 
-  saveWorkspace(workspace: Workspace): void {
+  getWorkspaceRepository(id: string): RepositoryIdentity | undefined {
+    const row = this.#database
+      .prepare<[string], WorkspaceRepositoryRow>(
+        `SELECT repository_key, repository_name
+         FROM workspace_repositories WHERE workspace_id = ?`,
+      )
+      .get(id);
+    return row
+      ? { key: row.repository_key, name: row.repository_name }
+      : undefined;
+  }
+
+  workspaceHasDocuments(id: string): boolean {
+    return this.#database
+      .prepare<[string], { present: number }>(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE workspace_id = ?) AS present",
+      )
+      .get(id)?.present === 1;
+  }
+
+  saveWorkspace(
+    workspace: Workspace,
+    repository: RepositoryIdentity,
+  ): void {
     this.transaction(() => {
       this.#database
         .prepare(
@@ -285,10 +618,94 @@ export class SqliteCatalogStorage implements CatalogStorage {
       for (const artifactRoot of workspace.artifactRoots) {
         insertRoot.run(workspace.id, artifactRoot);
       }
+      this.#database
+        .prepare(
+          `INSERT INTO workspace_repositories (
+             workspace_id, repository_key, repository_name
+           ) VALUES (?, ?, ?)
+           ON CONFLICT(workspace_id) DO UPDATE SET
+             repository_key = excluded.repository_key,
+             repository_name = excluded.repository_name`,
+        )
+        .run(workspace.id, repository.key, repository.name);
     });
   }
 
-  listDocuments(filters: DocumentFilters = {}): StoredDocument[] {
+  reconcileWorkspaces(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    movedDocumentIds: string[],
+    discardedDocumentIds: string[],
+  ): void {
+    this.transaction(() => {
+      const discardDocument = this.#database.prepare(
+        "DELETE FROM documents WHERE id = ? AND workspace_id = ?",
+      );
+      for (const documentId of discardedDocumentIds) {
+        if (discardDocument.run(documentId, sourceWorkspaceId).changes !== 1) {
+          throw new Error(`could not discard document ${documentId}`);
+        }
+      }
+      const moveDocument = this.#database.prepare(
+        `UPDATE documents SET workspace_id = ?
+         WHERE id = ? AND workspace_id = ?`,
+      );
+      for (const documentId of movedDocumentIds) {
+        if (
+          moveDocument.run(
+            targetWorkspaceId,
+            documentId,
+            sourceWorkspaceId,
+          ).changes !== 1
+        ) {
+          throw new Error(`could not move document ${documentId}`);
+        }
+      }
+      if (this.workspaceHasDocuments(sourceWorkspaceId)) {
+        throw new Error("workspace changed during reconciliation");
+      }
+      if (
+        this.#database
+          .prepare("DELETE FROM workspaces WHERE id = ?")
+          .run(sourceWorkspaceId).changes !== 1
+      ) {
+        throw new Error(`unknown workspace ${sourceWorkspaceId}`);
+      }
+    });
+  }
+
+  saveProject(project: Project): Project {
+    this.#database
+      .prepare(
+        `INSERT INTO projects (
+           id, repository_key, repository_name, task_key, feature_name,
+           created_at, updated_at
+         ) VALUES (
+           @id, @repositoryKey, @repositoryName, @taskKey, @featureName,
+           @createdAt, @updatedAt
+         )
+         ON CONFLICT(repository_key, task_key) DO UPDATE SET
+           feature_name = COALESCE(projects.feature_name, excluded.feature_name),
+           updated_at = CASE
+             WHEN projects.feature_name IS NULL AND excluded.feature_name IS NOT NULL
+             THEN excluded.updated_at ELSE projects.updated_at END`,
+      )
+      .run({ ...project, featureName: project.featureName ?? null });
+    const row = this.#database
+      .prepare<[string, string], ProjectRow>(
+        "SELECT * FROM projects WHERE repository_key = ? AND task_key = ?",
+      )
+      .get(project.repositoryKey, project.taskKey);
+    if (!row) {
+      throw new Error("could not persist project");
+    }
+    return mapProject(row);
+  }
+
+  listDocuments(
+    filters: DocumentFilters = {},
+    scope: ContentScope = {},
+  ): StoredDocument[] {
     const clauses: string[] = [];
     const parameters: Array<string | number> = [];
 
@@ -330,34 +747,53 @@ export class SqliteCatalogStorage implements CatalogStorage {
     if (filters.missing !== undefined) {
       clauses.push(filters.missing ? "d.missing_at IS NOT NULL" : "d.missing_at IS NULL");
     }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
 
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.#database
       .prepare<Array<string | number>, DocumentRow>(
-        `SELECT d.* FROM documents d${where} ORDER BY d.updated_at DESC, d.id`,
+        `${DOCUMENT_SELECT}${where} ORDER BY d.updated_at DESC, d.id`,
       )
       .all(...parameters);
-    return rows.map((row) => this.#mapDocument(row));
+    return this.#mapDocuments(rows);
   }
 
-  getDocument(id: string): StoredDocument | undefined {
+  getDocument(id: string, scope: ContentScope = {}): StoredDocument | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
     const row = this.#database
-      .prepare<[string], DocumentRow>("SELECT * FROM documents WHERE id = ?")
-      .get(id);
+      .prepare<string[], DocumentRow>(
+        `${DOCUMENT_SELECT} WHERE d.id = ?${scoped}`,
+      )
+      .get(...parameters);
     return row ? this.#mapDocument(row) : undefined;
   }
 
   getReferenceDocumentIdByPath(
     workspaceId: string,
     path: string,
+    scope: ContentScope = {},
   ): string | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined
+      ? [workspaceId, path]
+      : [workspaceId, path, scope.spaceId];
     return this.#database
-      .prepare<[string, string], DocumentIdRow>(
-        `SELECT id
-         FROM documents
-         WHERE workspace_id = ? AND path = ? AND storage_kind = 'reference'`,
+      .prepare<string[], DocumentIdRow>(
+        `SELECT d.id
+         FROM documents d
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         WHERE d.workspace_id = ? AND d.path = ?
+           AND d.storage_kind = 'reference'${scoped}`,
       )
-      .get(workspaceId, path)?.id;
+      .get(...parameters)?.id;
   }
 
   saveDocument(document: StoredDocument): void {
@@ -443,6 +879,13 @@ export class SqliteCatalogStorage implements CatalogStorage {
           sourceLink.workspacePath,
         );
       }
+      this.#database
+        .prepare(
+          `INSERT INTO document_projects (document_id, project_id)
+           VALUES (?, ?)
+           ON CONFLICT(document_id) DO UPDATE SET project_id = excluded.project_id`,
+        )
+        .run(document.id, document.projectId);
       this.#database.exec(
         "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM document_tags WHERE document_tags.tag_name = tags.name)",
       );
@@ -468,34 +911,188 @@ export class SqliteCatalogStorage implements CatalogStorage {
     });
   }
 
+  deleteDocuments(ids: readonly string[]): number {
+    return this.transaction(() => {
+      const deleteReviews = this.#database.prepare(
+        "DELETE FROM review_requests WHERE document_id = ?",
+      );
+      const deleteDocument = this.#database.prepare(
+        "DELETE FROM documents WHERE id = ?",
+      );
+      let deleted = 0;
+      for (const id of ids) {
+        deleteReviews.run(id);
+        deleted += deleteDocument.run(id).changes;
+      }
+      this.#database.prepare(
+        `DELETE FROM tags
+         WHERE NOT EXISTS (
+           SELECT 1 FROM document_tags dt WHERE dt.tag_name = tags.name
+         )`,
+      ).run();
+      return deleted;
+    });
+  }
+
+  listFeedbackSubmissions(
+    filters: FeedbackSubmissionFilters,
+    page: FeedbackStoragePage,
+    scope: ContentScope = {},
+  ): StoredFeedbackSubmission[] {
+    if (
+      !/^doc-[a-f0-9]{20}$/.test(filters.documentId) ||
+      (filters.documentRevision !== undefined &&
+        !isPositiveInteger(filters.documentRevision)) ||
+      !Number.isSafeInteger(page.limit) ||
+      page.limit < 1 ||
+      page.limit > 101 ||
+      (page.before !== undefined &&
+        (!isDate(page.before.createdAt) ||
+          !/^feedback-[a-f0-9]{20}$/.test(page.before.id)))
+    ) {
+      throw new Error("invalid feedback page query");
+    }
+    const clauses = ["fs.document_id = ?"];
+    const parameters: Array<string | number> = [filters.documentId];
+    if (filters.documentRevision !== undefined) {
+      clauses.push("fs.document_revision = ?");
+      parameters.push(filters.documentRevision);
+    }
+    if (page.before !== undefined) {
+      clauses.push("(fs.created_at < ? OR (fs.created_at = ? AND fs.id < ?))");
+      parameters.push(
+        page.before.createdAt,
+        page.before.createdAt,
+        page.before.id,
+      );
+    }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
+    parameters.push(page.limit);
+    const rows = this.#database
+      .prepare<Array<string | number>, FeedbackSubmissionRow>(
+        `SELECT fs.*, rr.review_request_id
+         FROM feedback_submissions fs
+         JOIN documents d ON d.id = fs.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY fs.created_at DESC, fs.id DESC
+         LIMIT ?`,
+      )
+      .all(...parameters);
+    return this.#mapFeedbackSubmissions(rows);
+  }
+
+  getFeedbackSubmission(
+    id: string,
+    scope: ContentScope = {},
+  ): StoredFeedbackSubmission | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
+    const row = this.#database
+      .prepare<string[], FeedbackSubmissionRow>(
+        `SELECT fs.*, rr.review_request_id
+         FROM feedback_submissions fs
+         JOIN documents d ON d.id = fs.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+         WHERE fs.id = ?${scoped}`,
+      )
+      .get(...parameters);
+    return row ? this.#mapFeedbackSubmission(row) : undefined;
+  }
+
+  saveFeedbackSubmission(submission: StoredFeedbackSubmission): boolean {
+    validateFeedbackSubmission(submission);
+    return this.transaction(() => {
+      const result = this.#database
+        .prepare(
+          `INSERT INTO feedback_submissions (
+             id, document_id, document_revision, document_content_hash,
+             general_message, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO NOTHING`,
+        )
+        .run(
+          submission.id,
+          submission.documentId,
+          submission.documentRevision,
+          submission.documentContentHash,
+          submission.generalMessage ?? null,
+          submission.createdAt,
+        );
+      if (result.changes === 0) return false;
+      const saveComment = this.#database.prepare(
+        `INSERT INTO feedback_comments (
+           submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const [ordinal, comment] of submission.comments.entries()) {
+        saveComment.run(
+          submission.id,
+          comment.id,
+          ordinal,
+          comment.intent,
+          comment.anchor.kind,
+          JSON.stringify(comment.anchor),
+          comment.message,
+        );
+      }
+      return true;
+    });
+  }
+
   listReviewRequests(
     filters: ReviewRequestFilters = {},
+    scope: ContentScope = {},
   ): StoredReviewRequest[] {
     const clauses: string[] = [];
     const parameters: string[] = [];
     if (filters.documentId !== undefined) {
-      clauses.push("document_id = ?");
+      clauses.push("rr.document_id = ?");
       parameters.push(filters.documentId);
     }
     if (filters.status !== undefined) {
-      clauses.push("status = ?");
+      clauses.push("rr.status = ?");
       parameters.push(filters.status);
     }
+    if (scope.spaceId !== undefined) {
+      clauses.push(SPACE_MEMBERSHIP_PREDICATE);
+      parameters.push(scope.spaceId);
+    }
     const where = clauses.length === 0 ? "" : ` WHERE ${clauses.join(" AND ")}`;
-    return this.#database
+    const rows = this.#database
       .prepare<string[], ReviewRequestRow>(
-        `SELECT * FROM review_requests${where} ORDER BY created_at DESC, id`,
+        `SELECT rr.* FROM review_requests rr
+         JOIN documents d ON d.id = rr.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         ${where} ORDER BY rr.created_at DESC, rr.id`,
       )
-      .all(...parameters)
-      .map((row) => this.#mapReviewRequest(row));
+      .all(...parameters);
+    return this.#mapReviewRequests(rows);
   }
 
-  getReviewRequest(id: string): StoredReviewRequest | undefined {
+  getReviewRequest(
+    id: string,
+    scope: ContentScope = {},
+  ): StoredReviewRequest | undefined {
+    const scoped = scope.spaceId === undefined
+      ? ""
+      : ` AND ${SPACE_MEMBERSHIP_PREDICATE}`;
+    const parameters = scope.spaceId === undefined ? [id] : [id, scope.spaceId];
     const row = this.#database
-      .prepare<[string], ReviewRequestRow>(
-        "SELECT * FROM review_requests WHERE id = ?",
+      .prepare<string[], ReviewRequestRow>(
+        `SELECT rr.* FROM review_requests rr
+         JOIN documents d ON d.id = rr.document_id
+         JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+         WHERE rr.id = ?${scoped}`,
       )
-      .get(id);
+      .get(...parameters);
     return row ? this.#mapReviewRequest(row) : undefined;
   }
 
@@ -520,7 +1117,10 @@ export class SqliteCatalogStorage implements CatalogStorage {
       .run(request);
   }
 
-  completeReviewRequest(request: StoredReviewRequest): boolean {
+  completeReviewRequest(
+    request: StoredReviewRequest,
+    feedback?: StoredFeedbackSubmission,
+  ): boolean {
     if (request.response === null) {
       throw new Error("completed review request requires a response");
     }
@@ -539,17 +1139,26 @@ export class SqliteCatalogStorage implements CatalogStorage {
       if (result.changes !== 1) {
         return false;
       }
+      const linkedFeedback = feedback ?? feedbackFromReviewResponse(request, response);
+      if (linkedFeedback !== undefined) {
+        const created = this.saveFeedbackSubmission(linkedFeedback);
+        if (!created) {
+          const existing = this.getFeedbackSubmission(linkedFeedback.id);
+          if (!existing || !sameStoredFeedback(existing, linkedFeedback)) {
+            throw new Error("review feedback id conflicts with stored feedback");
+          }
+        }
+      }
       this.#database
         .prepare(
           `INSERT INTO review_responses (
-             review_request_id, outcome, message, items_json, created_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+             review_request_id, outcome, feedback_id, created_at
+           ) VALUES (?, ?, ?, ?)`,
         )
         .run(
           request.id,
           response.outcome,
-          response.message,
-          response.items === undefined ? null : JSON.stringify(response.items),
+          linkedFeedback?.id ?? null,
           response.createdAt,
         );
       return true;
@@ -567,8 +1176,111 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return result.changes === 1;
   }
 
-  #mapDocument(row: DocumentRow): StoredDocument {
-    const tags = this.#database
+  #mapDocuments(rows: DocumentRow[]): StoredDocument[] {
+    if (rows.length === 0) {
+      return [];
+    }
+    const documentIds = JSON.stringify(rows.map(({ id }) => id));
+    const tagsByDocument = new Map<string, string[]>();
+    const sourceLinksByDocument = new Map<string, DocumentSourceLink[]>();
+    const tagRows = this.#database
+      .prepare<[string], DocumentTagRow>(
+        `SELECT dt.document_id, t.name
+         FROM tags t
+         JOIN document_tags dt ON dt.tag_name = t.name
+         WHERE dt.document_id IN (SELECT value FROM json_each(?))
+         ORDER BY dt.document_id, t.name`,
+      )
+      .all(documentIds);
+    for (const { document_id: documentId, name } of tagRows) {
+      const tags = tagsByDocument.get(documentId) ?? [];
+      tags.push(name);
+      tagsByDocument.set(documentId, tags);
+    }
+    const sourceLinkRows = this.#database
+      .prepare<[string], DocumentSourceLinkRow>(
+        `SELECT document_id, id, href, workspace_path
+         FROM document_source_links
+         WHERE document_id IN (SELECT value FROM json_each(?))
+         ORDER BY document_id, href`,
+      )
+      .all(documentIds);
+    for (const {
+      document_id: documentId,
+      id,
+      href,
+      workspace_path: workspacePath,
+    } of sourceLinkRows) {
+      const links = sourceLinksByDocument.get(documentId) ?? [];
+      links.push({ id, href, workspacePath });
+      sourceLinksByDocument.set(documentId, links);
+    }
+    return rows.map((row) => this.#mapDocument(
+      row,
+      tagsByDocument.get(row.id) ?? [],
+      sourceLinksByDocument.get(row.id) ?? [],
+    ));
+  }
+
+  #mapFeedbackSubmissions(
+    rows: FeedbackSubmissionRow[],
+  ): StoredFeedbackSubmission[] {
+    if (rows.length === 0) return [];
+    const commentRows = this.#database
+      .prepare<[string], FeedbackCommentRow>(
+        `SELECT submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         FROM feedback_comments
+         WHERE submission_id IN (SELECT value FROM json_each(?))
+         ORDER BY submission_id, ordinal`,
+      )
+      .all(JSON.stringify(rows.map(({ id }) => id)));
+    const comments = new Map<string, FeedbackCommentRow[]>();
+    for (const row of commentRows) {
+      const submissionComments = comments.get(row.submission_id) ?? [];
+      submissionComments.push(row);
+      comments.set(row.submission_id, submissionComments);
+    }
+    return rows.map((row) =>
+      this.#mapFeedbackSubmission(row, comments.get(row.id) ?? [])
+    );
+  }
+
+  #mapFeedbackSubmission(
+    row: FeedbackSubmissionRow,
+    providedComments?: FeedbackCommentRow[],
+  ): StoredFeedbackSubmission {
+    const commentRows = providedComments ?? this.#database
+      .prepare<[string], FeedbackCommentRow>(
+        `SELECT submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         FROM feedback_comments
+         WHERE submission_id = ? ORDER BY ordinal`,
+      )
+      .all(row.id);
+    const comments = commentRows.map(mapFeedbackCommentRow);
+    const submission: StoredFeedbackSubmission = {
+      id: row.id,
+      documentId: row.document_id,
+      documentRevision: row.document_revision,
+      documentContentHash: row.document_content_hash,
+      ...(row.general_message === null
+        ? {}
+        : { generalMessage: row.general_message }),
+      comments,
+      ...(row.review_request_id === null
+        ? {}
+        : { reviewRequestId: row.review_request_id }),
+      createdAt: row.created_at,
+    };
+    validateFeedbackSubmission(submission);
+    return submission;
+  }
+
+  #mapDocument(
+    row: DocumentRow,
+    providedTags?: string[],
+    providedSourceLinks?: DocumentSourceLink[],
+  ): StoredDocument {
+    const tags = providedTags ?? this.#database
       .prepare<[string], TagRow>(
         `SELECT t.name
          FROM tags t
@@ -578,7 +1290,7 @@ export class SqliteCatalogStorage implements CatalogStorage {
       )
       .all(row.id)
       .map(({ name }) => name);
-    const sourceLinks = this.#database
+    const sourceLinks = providedSourceLinks ?? this.#database
       .prepare<[string], SourceLinkRow>(
         `SELECT id, href, workspace_path
          FROM document_source_links
@@ -595,6 +1307,14 @@ export class SqliteCatalogStorage implements CatalogStorage {
     return {
       id: row.id,
       workspaceId: row.workspace_id,
+      projectId: row.project_id,
+      projectName: projectDisplayName({
+        repositoryName: row.project_repository_name,
+        taskKey: row.project_task_key,
+        ...(row.project_feature_name === null
+          ? {}
+          : { featureName: row.project_feature_name }),
+      }),
       ...(row.task_id === null ? {} : { taskId: row.task_id }),
       ...(row.producer === null ? {} : { producer: row.producer }),
       kind: row.kind as DocumentKind,
@@ -616,18 +1336,58 @@ export class SqliteCatalogStorage implements CatalogStorage {
     };
   }
 
-  #mapReviewRequest(row: ReviewRequestRow): StoredReviewRequest {
-    const responseRow = this.#database
-      .prepare<[string], ReviewResponseRow>(
-        `SELECT outcome, message, items_json, created_at
-         FROM review_responses WHERE review_request_id = ?`,
+  #mapReviewRequests(rows: ReviewRequestRow[]): StoredReviewRequest[] {
+    if (rows.length === 0) {
+      return [];
+    }
+    const responseRows = this.#database
+      .prepare<[string], ReviewResponseWithIdRow>(
+        `SELECT review_request_id, outcome, feedback_id, created_at
+         FROM review_responses
+         WHERE review_request_id IN (SELECT value FROM json_each(?))`,
       )
-      .get(row.id);
+      .all(JSON.stringify(rows.map(({ id }) => id)));
+    const responses = new Map(
+      responseRows.map((response) => [response.review_request_id, response]),
+    );
+    return rows.map((row) =>
+      this.#mapReviewRequest(row, responses.get(row.id) ?? null),
+    );
+  }
+
+  #mapReviewRequest(
+    row: ReviewRequestRow,
+    providedResponseRow?: ReviewResponseRow | null,
+  ): StoredReviewRequest {
+    const responseRow = providedResponseRow === undefined
+      ? this.#database
+          .prepare<[string], ReviewResponseRow>(
+            `SELECT outcome, feedback_id, created_at
+             FROM review_responses WHERE review_request_id = ?`,
+          )
+          .get(row.id)
+      : providedResponseRow;
+    const linkedFeedback = responseRow?.feedback_id === null || !responseRow
+      ? undefined
+      : this.#database
+          .prepare<[string], FeedbackSubmissionRow>(
+            `SELECT fs.*, rr.review_request_id
+             FROM feedback_submissions fs
+             LEFT JOIN review_responses rr ON rr.feedback_id = fs.id
+             WHERE fs.id = ?`,
+          )
+          .get(responseRow.feedback_id);
+    const storedFeedback = linkedFeedback
+      ? this.#mapFeedbackSubmission(linkedFeedback)
+      : undefined;
     const response: ReviewResponse | null = responseRow
       ? {
           outcome: responseRow.outcome as ReviewResponse["outcome"],
-          message: responseRow.message,
-          ...parseReviewFeedbackItems(responseRow.items_json),
+          message: storedFeedback?.generalMessage ?? "",
+          ...projectReviewFeedbackItems(storedFeedback?.comments ?? []),
+          ...(storedFeedback === undefined
+            ? {}
+            : { feedbackId: storedFeedback.id }),
           createdAt: responseRow.created_at,
         }
       : null;
@@ -761,6 +1521,383 @@ function migrate(database: Database.Database): void {
       database.pragma("user_version = 6");
     })();
   }
+  if (rawVersion < 7) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE IF NOT EXISTS workspace_repositories (
+           workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+           repository_key TEXT NOT NULL,
+           repository_name TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS projects (
+           id TEXT PRIMARY KEY,
+           repository_key TEXT NOT NULL,
+           repository_name TEXT NOT NULL,
+           task_key TEXT NOT NULL DEFAULT '',
+           feature_name TEXT,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           UNIQUE (repository_key, task_key)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS document_projects (
+           document_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+           project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT
+         ) STRICT;`,
+      );
+      const workspaces = database
+        .prepare<[], { id: string; name: string; root: string }>(
+          "SELECT id, name, root FROM workspaces ORDER BY id",
+        )
+        .all();
+      const saveRepository = database.prepare(
+        `INSERT INTO workspace_repositories (
+           workspace_id, repository_key, repository_name
+         ) VALUES (?, ?, ?)
+         ON CONFLICT(workspace_id) DO NOTHING`,
+      );
+      for (const workspace of workspaces) {
+        saveRepository.run(
+          workspace.id,
+          localRepositoryKey(workspace.root),
+          workspace.name,
+        );
+      }
+      const documents = database
+        .prepare<[], {
+          id: string;
+          task_id: string | null;
+          created_at: string;
+          updated_at: string;
+          repository_key: string;
+          repository_name: string;
+        }>(
+          `SELECT d.id, d.task_id, d.created_at, d.updated_at,
+                  wr.repository_key, wr.repository_name
+           FROM documents d
+           JOIN workspace_repositories wr ON wr.workspace_id = d.workspace_id
+           ORDER BY d.id`,
+        )
+        .all();
+      const saveProject = database.prepare(
+        `INSERT OR IGNORE INTO projects (
+           id, repository_key, repository_name, task_key, feature_name,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+      );
+      const mapDocument = database.prepare(
+        `INSERT INTO document_projects (document_id, project_id) VALUES (?, ?)
+         ON CONFLICT(document_id) DO NOTHING`,
+      );
+      for (const document of documents) {
+        const taskKey = document.task_id?.trim().toUpperCase() ?? "";
+        const id = projectId(document.repository_key, taskKey);
+        saveProject.run(
+          id,
+          document.repository_key,
+          document.repository_name,
+          taskKey,
+          document.created_at,
+          document.updated_at,
+        );
+        mapDocument.run(document.id, id);
+      }
+      database.pragma("user_version = 7");
+    })();
+  }
+  if (rawVersion < 8) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE review_requests_v8 (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE RESTRICT,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK (kind IN ('plan-decision', 'change-decision')),
+           request_message TEXT NOT NULL,
+           status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'changes_requested', 'rejected', 'superseded', 'stale')),
+           stale_at TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE review_responses_v8 (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests_v8(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
+           message TEXT NOT NULL,
+           items_json TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         INSERT INTO review_requests_v8 SELECT * FROM review_requests;
+         INSERT INTO review_responses_v8 (
+           review_request_id, outcome, message, items_json, created_at
+         ) SELECT review_request_id, outcome, message, items_json, created_at
+           FROM review_responses;
+         DROP TABLE review_responses;
+         DROP TABLE review_requests;
+         ALTER TABLE review_requests_v8 RENAME TO review_requests;
+         ALTER TABLE review_responses_v8 RENAME TO review_responses;
+         CREATE UNIQUE INDEX review_requests_pending_document_idx
+           ON review_requests(document_id) WHERE status = 'pending';
+         CREATE INDEX review_requests_document_idx
+           ON review_requests(document_id, created_at DESC);
+         CREATE INDEX review_requests_status_idx
+           ON review_requests(status, created_at DESC);`,
+      );
+      database.pragma("user_version = 8");
+    })();
+  }
+  if (rawVersion < 9) {
+    database.transaction(() => {
+      database.exec(
+        `CREATE TABLE spaces (
+           id TEXT PRIMARY KEY,
+           name TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE space_matchers (
+           space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+           kind TEXT NOT NULL CHECK (kind IN ('repository', 'repository-namespace', 'tag')),
+           value TEXT NOT NULL,
+           PRIMARY KEY (space_id, kind, value)
+         ) STRICT;
+         CREATE INDEX workspace_repositories_key_idx
+           ON workspace_repositories(repository_key);
+         CREATE INDEX space_matchers_lookup_idx
+           ON space_matchers(space_id, kind, value);`,
+      );
+      database.pragma("user_version = 9");
+    })();
+  }
+  if (rawVersion < 10) {
+    database.transaction(() => {
+      const legacyResponses = database
+        .prepare<[], LegacyReviewResponseRow>(
+          `SELECT rr.review_request_id, rr.outcome, rr.message, rr.items_json,
+                  rr.created_at, rq.document_id, rq.document_revision,
+                  rq.document_content_hash
+           FROM review_responses rr
+           JOIN review_requests rq ON rq.id = rr.review_request_id
+           ORDER BY rr.review_request_id`,
+        )
+        .all();
+      const normalized = legacyResponses.map((row) => {
+        if (
+          !isReviewOutcome(row.outcome) ||
+          !isValidReviewMessage(row.message) ||
+          !isDate(row.created_at) ||
+          !/^review-[a-f0-9]{20}$/.test(row.review_request_id) ||
+          !/^doc-[a-f0-9]{20}$/.test(row.document_id) ||
+          !isPositiveInteger(row.document_revision) ||
+          !/^[a-f0-9]{64}$/.test(row.document_content_hash)
+        ) {
+          throw new Error(`invalid legacy review response ${row.review_request_id}`);
+        }
+        const { items } = parseReviewFeedbackItems(row.items_json);
+        return { row, items: items ?? [] };
+      });
+
+      database.exec(
+        `CREATE TABLE feedback_submissions (
+           id TEXT PRIMARY KEY,
+           document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+           document_revision INTEGER NOT NULL CHECK (document_revision > 0),
+           document_content_hash TEXT NOT NULL,
+           general_message TEXT,
+           created_at TEXT NOT NULL
+         ) STRICT;
+         CREATE TABLE feedback_comments (
+           submission_id TEXT NOT NULL REFERENCES feedback_submissions(id) ON DELETE CASCADE,
+           id TEXT NOT NULL,
+           ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+           intent TEXT NOT NULL CHECK (intent IN ('feedback', 'todo')),
+           anchor_kind TEXT NOT NULL CHECK (anchor_kind IN ('markdown-v1', 'diff-file-v1', 'diff-lines-v1')),
+           anchor_json TEXT NOT NULL,
+           message TEXT NOT NULL,
+           PRIMARY KEY (submission_id, id),
+           UNIQUE (submission_id, ordinal)
+         ) STRICT;
+         CREATE TABLE review_responses_v10 (
+           review_request_id TEXT PRIMARY KEY REFERENCES review_requests(id) ON DELETE CASCADE,
+           outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'changes_requested', 'rejected', 'superseded')),
+           feedback_id TEXT UNIQUE REFERENCES feedback_submissions(id) ON DELETE RESTRICT,
+           created_at TEXT NOT NULL
+         ) STRICT;`,
+      );
+
+      const saveSubmission = database.prepare(
+        `INSERT INTO feedback_submissions (
+           id, document_id, document_revision, document_content_hash,
+           general_message, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      const saveComment = database.prepare(
+        `INSERT INTO feedback_comments (
+           submission_id, id, ordinal, intent, anchor_kind, anchor_json, message
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const saveResponse = database.prepare(
+        `INSERT INTO review_responses_v10 (
+           review_request_id, outcome, feedback_id, created_at
+         ) VALUES (?, ?, ?, ?)`,
+      );
+
+      for (const { row, items } of normalized) {
+        const hasMessage = row.message.trim() !== "";
+        const feedbackId = hasMessage || items.length > 0
+          ? legacyFeedbackId(row.review_request_id)
+          : null;
+        if (feedbackId !== null) {
+          saveSubmission.run(
+            feedbackId,
+            row.document_id,
+            row.document_revision,
+            row.document_content_hash,
+            hasMessage ? row.message : null,
+            row.created_at,
+          );
+          for (const [ordinal, item] of items.entries()) {
+            const anchor: FeedbackAnchor = item.line === undefined
+              ? { kind: "diff-file-v1", path: item.path }
+              : {
+                  kind: "diff-lines-v1",
+                  path: item.path,
+                  hunkId: item.hunkId!,
+                  side: item.side!,
+                  line: item.line,
+                  ...(item.endLine === undefined
+                    ? {}
+                    : { endLine: item.endLine }),
+                };
+            saveComment.run(
+              feedbackId,
+              item.id,
+              ordinal,
+              item.kind,
+              anchor.kind,
+              JSON.stringify(anchor),
+              item.message,
+            );
+          }
+        }
+        saveResponse.run(
+          row.review_request_id,
+          row.outcome,
+          feedbackId,
+          row.created_at,
+        );
+      }
+
+      database.exec(
+        `DROP TABLE review_responses;
+         ALTER TABLE review_responses_v10 RENAME TO review_responses;
+         CREATE INDEX feedback_submissions_document_idx
+           ON feedback_submissions(document_id, document_revision, created_at DESC, id DESC);`,
+      );
+      database.pragma("user_version = 10");
+    })();
+  }
+}
+
+function feedbackFromReviewResponse(
+  request: StoredReviewRequest,
+  response: ReviewResponse,
+): StoredFeedbackSubmission | undefined {
+  const items = response.items ?? [];
+  const hasMessage = response.message.trim() !== "";
+  if (!hasMessage && items.length === 0) return undefined;
+  return {
+    id: response.feedbackId ?? legacyFeedbackId(request.id),
+    documentId: request.documentId,
+    documentRevision: request.documentRevision,
+    documentContentHash: request.documentContentHash,
+    ...(hasMessage ? { generalMessage: response.message } : {}),
+    comments: items.map((item): FeedbackComment => ({
+      id: item.id,
+      intent: item.kind,
+      anchor: item.line === undefined
+        ? { kind: "diff-file-v1", path: item.path }
+        : {
+            kind: "diff-lines-v1",
+            path: item.path,
+            hunkId: item.hunkId!,
+            side: item.side!,
+            line: item.line,
+            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          },
+      message: item.message,
+    })),
+    createdAt: response.createdAt,
+  };
+}
+
+function projectReviewFeedbackItems(
+  comments: readonly FeedbackComment[],
+): { items?: ReviewFeedbackItem[] } {
+  const items = comments.flatMap((comment): ReviewFeedbackItem[] => {
+    if (comment.anchor.kind === "markdown-v1") return [];
+    if (comment.anchor.kind === "diff-file-v1") {
+      return [{
+        id: comment.id.replace(/^comment-/, "feedback-"),
+        kind: comment.intent,
+        path: comment.anchor.path,
+        message: comment.message,
+      }];
+    }
+    if (comment.intent === "todo") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: comment.anchor.path,
+      hunkId: comment.anchor.hunkId,
+      side: comment.anchor.side,
+      line: comment.anchor.line,
+      ...(comment.anchor.endLine === undefined
+        ? {}
+        : { endLine: comment.anchor.endLine }),
+      message: comment.message,
+    }];
+  });
+  return items.length === 0 ? {} : { items };
+}
+
+function sameStoredFeedback(
+  left: StoredFeedbackSubmission,
+  right: StoredFeedbackSubmission,
+): boolean {
+  const { reviewRequestId: _leftReview, ...leftComparable } = left;
+  const { reviewRequestId: _rightReview, ...rightComparable } = right;
+  return JSON.stringify(leftComparable) === JSON.stringify(rightComparable);
+}
+
+function validateSpaceRow(
+  row: SpaceRow,
+  matcherRows: SpaceMatcherRow[],
+): Space {
+  if (
+    !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.id) ||
+    row.name.trim() === "" ||
+    row.name !== row.name.trim() ||
+    /[\u0000-\u001f\u007f]/.test(row.name) ||
+    matcherRows.length === 0 ||
+    matcherRows.some(
+      ({ kind, value }) =>
+        !isSpaceMatcherKind(kind) || value.trim() === "" || value !== value.trim(),
+    )
+  ) {
+    throw new Error(`invalid space row ${row.id}`);
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    matchers: matcherRows.map(({ kind, value }) => ({ kind, value }) as SpaceMatcher),
+  };
+}
+
+function compareSpaces(left: Space, right: Space): number {
+  const leftName = left.name.toLowerCase();
+  const rightName = right.name.toLowerCase();
+  return compareText(leftName, rightName) || compareText(left.id, right.id);
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function validateWorkspaceRow(
@@ -782,6 +1919,51 @@ function validateWorkspaceRow(
   return { ...row, artifactRoots };
 }
 
+function mapProject(row: ProjectRow): Project {
+  if (
+    !/^project-[a-f0-9]{20}$/.test(row.id) ||
+    row.repository_key.trim() === "" ||
+    row.repository_name.trim() === "" ||
+    row.task_key.trim() !== row.task_key ||
+    (row.feature_name !== null && row.feature_name.trim() === "") ||
+    !isDate(row.created_at) ||
+    !isDate(row.updated_at)
+  ) {
+    throw new Error(`invalid project row ${row.id}`);
+  }
+  return {
+    id: row.id,
+    repositoryKey: row.repository_key,
+    repositoryName: row.repository_name,
+    taskKey: row.task_key,
+    ...(row.feature_name === null ? {} : { featureName: row.feature_name }),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function localRepositoryKey(root: string): string {
+  return `local:${createHash("sha256").update(root).digest("hex")}`;
+}
+
+function projectId(repositoryKey: string, taskKey: string): string {
+  const hash = createHash("sha256")
+    .update(repositoryKey)
+    .update("\0")
+    .update(taskKey)
+    .digest("hex")
+    .slice(0, 20);
+  return `project-${hash}`;
+}
+
+function legacyFeedbackId(reviewRequestId: string): string {
+  return `feedback-${createHash("sha256")
+    .update("review-feedback\0")
+    .update(reviewRequestId)
+    .digest("hex")
+    .slice(0, 20)}`;
+}
+
 function validateDocumentRow(
   row: DocumentRow,
   tags: string[],
@@ -790,6 +1972,11 @@ function validateDocumentRow(
   if (
     !/^doc-[a-f0-9]{20}$/.test(row.id) ||
     !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.workspace_id) ||
+    !/^project-[a-f0-9]{20}$/.test(row.project_id) ||
+    row.project_repository_name.trim() === "" ||
+    row.project_task_key.trim() !== row.project_task_key ||
+    (row.project_feature_name !== null &&
+      row.project_feature_name.trim() === "") ||
     (row.task_id !== null && row.task_id.trim() === "") ||
     (row.producer !== null && row.producer.trim() === "") ||
     !isDocumentKind(row.kind) ||
@@ -824,6 +2011,160 @@ function validateDocumentRow(
   }
 }
 
+function mapFeedbackCommentRow(row: FeedbackCommentRow): FeedbackComment {
+  let anchor: unknown;
+  try {
+    anchor = JSON.parse(row.anchor_json);
+  } catch {
+    throw new Error(`invalid stored feedback comment ${row.id}`);
+  }
+  const comment = {
+    id: row.id,
+    intent: row.intent,
+    anchor,
+    message: row.message,
+  };
+  if (
+    !Number.isSafeInteger(row.ordinal) ||
+    row.ordinal < 0 ||
+    !isValidFeedbackComment(comment) ||
+    comment.anchor.kind !== row.anchor_kind
+  ) {
+    throw new Error(`invalid stored feedback comment ${row.id}`);
+  }
+  return structuredClone(comment) as FeedbackComment;
+}
+
+function validateFeedbackSubmission(submission: StoredFeedbackSubmission): void {
+  if (
+    !/^feedback-[a-f0-9]{20}$/.test(submission.id) ||
+    !/^doc-[a-f0-9]{20}$/.test(submission.documentId) ||
+    !isPositiveInteger(submission.documentRevision) ||
+    !/^[a-f0-9]{64}$/.test(submission.documentContentHash) ||
+    (submission.generalMessage !== undefined &&
+      (!isValidFeedbackMessage(submission.generalMessage, 16 * 1024) ||
+        submission.generalMessage.trim() === "")) ||
+    !Array.isArray(submission.comments) ||
+    submission.comments.length > 32 ||
+    (submission.generalMessage === undefined && submission.comments.length === 0) ||
+    !submission.comments.every(isValidFeedbackComment) ||
+    new Set(submission.comments.map(({ id }) => id)).size !==
+      submission.comments.length ||
+    (submission.reviewRequestId !== undefined &&
+      !/^review-[a-f0-9]{20}$/.test(submission.reviewRequestId)) ||
+    !isDate(submission.createdAt)
+  ) {
+    throw new Error(`invalid feedback submission ${submission.id}`);
+  }
+}
+
+function isValidFeedbackComment(value: unknown): value is FeedbackComment {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const comment = value as Record<string, unknown>;
+  return Object.keys(comment).every((key) =>
+    ["id", "intent", "anchor", "message"].includes(key)
+  ) &&
+    typeof comment.id === "string" &&
+    /^(?:comment|feedback)-[a-f0-9]{20}$/.test(comment.id) &&
+    (comment.intent === "feedback" || comment.intent === "todo") &&
+    isValidFeedbackAnchor(comment.anchor) &&
+    typeof comment.message === "string" &&
+    comment.message.trim() !== "" &&
+    isValidFeedbackMessage(comment.message, 512);
+}
+
+function isValidFeedbackAnchor(value: unknown): value is FeedbackAnchor {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const anchor = value as Record<string, unknown>;
+  if (anchor.kind === "markdown-v1") {
+    return hasOnlyRecordKeys(anchor, [
+      "kind",
+      "start",
+      "end",
+      "exact",
+      "prefix",
+      "suffix",
+    ]) &&
+      isValidMarkdownSourcePoint(anchor.start) &&
+      isValidMarkdownSourcePoint(anchor.end) &&
+      anchor.end.offset > anchor.start.offset &&
+      typeof anchor.exact === "string" &&
+      anchor.exact.length > 0 &&
+      anchor.exact.length <= 4_096 &&
+      typeof anchor.prefix === "string" &&
+      anchor.prefix.length <= 128 &&
+      typeof anchor.suffix === "string" &&
+      anchor.suffix.length <= 128 &&
+      isValidFeedbackMessage(anchor.exact, 4_096) &&
+      isValidFeedbackMessage(anchor.prefix, 128) &&
+      isValidFeedbackMessage(anchor.suffix, 128);
+  }
+  if (anchor.kind === "diff-file-v1") {
+    return hasOnlyRecordKeys(anchor, ["kind", "path"]) &&
+      typeof anchor.path === "string" &&
+      anchor.path.length <= 1_024 &&
+      isSafeFeedbackPath(anchor.path);
+  }
+  if (anchor.kind === "diff-lines-v1") {
+    return hasOnlyRecordKeys(anchor, [
+      "kind",
+      "path",
+      "hunkId",
+      "side",
+      "line",
+      "endLine",
+    ]) &&
+      typeof anchor.path === "string" &&
+      anchor.path.length <= 1_024 &&
+      isSafeFeedbackPath(anchor.path) &&
+      typeof anchor.hunkId === "string" &&
+      /^hunk-[a-f0-9]{16,64}$/.test(anchor.hunkId) &&
+      (anchor.side === "old" || anchor.side === "new") &&
+      typeof anchor.line === "number" &&
+      isPositiveInteger(anchor.line) &&
+      (anchor.endLine === undefined ||
+        (typeof anchor.endLine === "number" &&
+          isPositiveInteger(anchor.endLine) &&
+          anchor.endLine >= anchor.line));
+  }
+  return false;
+}
+
+function isValidMarkdownSourcePoint(value: unknown): value is {
+  offset: number;
+  line: number;
+  column: number;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const point = value as Record<string, unknown>;
+  return hasOnlyRecordKeys(point, ["offset", "line", "column"]) &&
+    typeof point.offset === "number" &&
+    Number.isSafeInteger(point.offset) &&
+    point.offset >= 0 &&
+    typeof point.line === "number" &&
+    isPositiveInteger(point.line) &&
+    typeof point.column === "number" &&
+    isPositiveInteger(point.column);
+}
+
+function hasOnlyRecordKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function isValidFeedbackMessage(value: string, maximum: number): boolean {
+  return value.length <= maximum &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+
 function validateReviewRequestRow(
   row: ReviewRequestRow,
   response: ReviewResponse | null,
@@ -845,8 +2186,7 @@ function validateReviewRequestRow(
       (!isReviewOutcome(response.outcome) ||
         !isValidReviewMessage(response.message) ||
         (response.items !== undefined &&
-          (response.outcome !== "changes_requested" ||
-            !response.items.every(isValidReviewFeedbackItem))) ||
+          !response.items.every(isValidReviewFeedbackItem)) ||
         !isDate(response.createdAt) ||
         response.outcome !== row.status))
   ) {
@@ -882,7 +2222,16 @@ function isValidReviewFeedbackItem(value: unknown): value is ReviewFeedbackItem 
     return false;
   }
   const item = value as Record<string, unknown>;
-  const allowed = new Set(["id", "kind", "path", "hunkId", "message"]);
+  const allowed = new Set([
+    "id",
+    "kind",
+    "path",
+    "hunkId",
+    "line",
+    "endLine",
+    "side",
+    "message",
+  ]);
   return Object.keys(item).every((key) => allowed.has(key)) &&
     typeof item.id === "string" &&
     /^feedback-[a-f0-9]{20}$/.test(item.id) &&
@@ -894,9 +2243,26 @@ function isValidReviewFeedbackItem(value: unknown): value is ReviewFeedbackItem 
     item.message.trim() !== "" &&
     item.message.length <= 512 &&
     !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(item.message) &&
-    (item.kind === "feedback"
-      ? typeof item.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(item.hunkId)
-      : item.hunkId === undefined);
+    (item.hunkId === undefined ||
+      (typeof item.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(item.hunkId))) &&
+    (item.line === undefined ||
+      (typeof item.line === "number" &&
+        Number.isSafeInteger(item.line) &&
+        item.line > 0)) &&
+    (item.endLine === undefined ||
+      (typeof item.endLine === "number" &&
+        Number.isSafeInteger(item.endLine) &&
+        item.endLine > 0)) &&
+    (item.side === undefined || item.side === "old" || item.side === "new") &&
+    ((item.line === undefined) === (item.side === undefined)) &&
+    (item.endLine === undefined ||
+      (typeof item.line === "number" && item.endLine > item.line)) &&
+    (item.line === undefined || item.hunkId !== undefined) &&
+    (item.kind !== "todo" ||
+      (item.hunkId === undefined &&
+        item.line === undefined &&
+        item.endLine === undefined &&
+        item.side === undefined));
 }
 
 function isSafeFeedbackPath(value: string): boolean {

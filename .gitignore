@@ -1,9 +1,9 @@
 dist/
 node_modules/
 coverage/
+playwright-report/
+test-results/
 .DS_Store
 *.log
 .env
-test-results/
-playwright-report/
 .playwright-mcp/

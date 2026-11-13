@@ -20,6 +20,7 @@ test("names HTML exports after the title with portable, bounded filenames", () =
 test("embeds only image data or the current document's opaque media routes", () => {
   const id = "doc-11111111111111111111";
   assert.equal(isExportImageSource(`/d/${id}/media/source-11111111111111111111`, id), true);
+  assert.equal(isExportImageSource(`/d/${id}/media/source-11111111111111111111?space=work&view=docs&actions=1`, id), true);
   for (const type of ["png", "jpeg", "gif", "webp", "svg+xml"]) {
     assert.equal(isExportImageSource(`data:image/${type};base64,AAAA`, id), true);
   }
@@ -28,6 +29,8 @@ test("embeds only image data or the current document's opaque media routes", () 
     "/api/v1/documents", "data:text/html;base64,AAAA", "data:image/svg+xml,<svg/>",
     "/d/doc-22222222222222222222/media/source-11111111111111111111",
     `/d/${id}/media/source-11111111111111111111?token=secret`,
+    `/d/${id}/media/source-11111111111111111111?space=work&space=other`,
+    `/d/${id}/media/source-11111111111111111111?view=invalid`,
   ]) assert.equal(isExportImageSource(src, id), false, src);
 });
 

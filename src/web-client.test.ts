@@ -1,26 +1,62 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createMarkdownSourceMap, resolveMarkdownSelection } from "mdmaid";
 
 import {
+  actionsQueueTransition,
+  activateReviewDraft,
+  bulkDocumentIds,
   changeReviewApprovalError,
+  cleanupReviewDrafts,
+  documentFeedbackDraftStorageKey,
+  documentHistoryState,
   documentFragmentId,
   documentOutline,
+  feedbackAnchorContainsLine,
+  feedbackAnchorLabel,
+  feedbackEndingAtLine,
   filterQueue,
+  filterProjectChoices,
   groupQueue,
   highlightDiffLine,
   isSourceMissing,
   nearestHeadingPosition,
   parseLiveSourceCatalogEvent,
+  pendingDecisionCount,
   pendingReviewForDocument,
+  projectQueueRoute,
+  projectQueueSelection,
+  projectQueueSelectionForRoute,
+  projectQueueSelectionForReaderHistory,
+  queueHistoryState,
   queueGroupingPreference,
   queueCounts,
   requestDocumentPrint,
+  loadReviewDraft,
+  loadDocumentFeedbackDraft,
+  markdownSelectionWitness,
+  markdownFeedbackWitness,
+  persistDocumentFeedbackDraft,
+  persistReviewDraft,
+  removeReviewDraftFeedback,
+  reviewFeedbackItemsForOutcome,
   reviewResponseError,
+  renderMermaidNodes,
+  mermaidErrorMessage,
+  withVisibleMermaidLayout,
   shouldRefreshWebReader,
   sourceModeLabel,
+  WEB_LINE_FEEDBACK_HINT,
+  webDiffLineControlModel,
   webDiffRows,
   webLoadFailure,
+  webMutationConfirmation,
   visibleWorkspaces,
+  workspaceQueryState,
+  workspaceRouteWithState,
+  upsertReviewDraftFeedback,
+  type ReviewDraftStorage,
+  type WebDocumentFeedbackDraft,
   type WebDocument,
   type WebFilters,
 } from "./web-client.js";
@@ -134,6 +170,477 @@ test("filters the browser queue by workspace, status, and search", () => {
   ]);
 });
 
+test("matches project choices by case-insensitive text anywhere in the name", () => {
+  const projects: PublicWorkspace[] = [
+    {
+      id: "project-a",
+      name: "EyWizards SA-2203 Safe Edit Confirmation",
+      documentCount: 1,
+      route: "/p/project-a",
+    },
+    {
+      id: "project-b",
+      name: "Audits / SA-3365 (AI service identity)",
+      documentCount: 2,
+      route: "/p/project-b",
+    },
+  ];
+
+  assert.deepEqual(filterProjectChoices(projects, "2203 safe"), [projects[0]]);
+  assert.deepEqual(filterProjectChoices(projects, "SERVICE IDENTITY"), [projects[1]]);
+  assert.deepEqual(filterProjectChoices(projects, "  sa-33  "), [projects[1]]);
+  assert.deepEqual(filterProjectChoices(projects, ""), projects);
+  assert.deepEqual(filterProjectChoices(projects, "missing"), []);
+});
+
+test("keeps content mode independent from the Actions intersection", () => {
+  const changeReviewRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    kind: "change-decision",
+  };
+  assert.deepEqual(
+    filterQueue(documents, {
+      contentMode: "docs",
+      actionsOnly: true,
+    }, [pendingReview, changeReviewRequest]).map(({ id }) => id),
+    [documents[0]!.id],
+  );
+  assert.deepEqual(
+    filterQueue(documents, {
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    }, [pendingReview, changeReviewRequest]).map(({ id }) => id),
+    [documents[3]!.id],
+  );
+});
+
+test("separates archived documents and selects the current project in bulk", () => {
+  const archived = {
+    ...documents[2]!,
+    archivedAt: "2026-09-27T10:00:00.000Z",
+  };
+  const mixed = [documents[0]!, documents[1]!, archived];
+
+  assert.deepEqual(
+    filterQueue(mixed, { contentMode: "archive" }).map(({ id }) => id),
+    [archived.id],
+  );
+  assert.deepEqual(
+    filterQueue(mixed, { contentMode: "docs" }).map(({ id }) => id),
+    [documents[0]!.id, documents[1]!.id],
+  );
+  assert.deepEqual(
+    bulkDocumentIds(mixed, {
+      contentMode: "docs",
+      workspaceId: "alpha",
+    }),
+    [documents[0]!.id],
+  );
+});
+
+test("describes reversible archive and irreversible purge confirmations", () => {
+  assert.deepEqual(webMutationConfirmation("archive", 2), {
+    confirmLabel: "archive 2 documents",
+    message: "Archive 2 documents? You can restore them later from Archive.",
+    title: "Archive documents?",
+  });
+  assert.deepEqual(webMutationConfirmation("purge", 1), {
+    confirmLabel: "purge document forever",
+    message:
+      "Purge this document forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.",
+    title: "Purge forever?",
+  });
+});
+
+test("counts every pending decision across document content types", () => {
+  const changeReviewRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    kind: "change-decision",
+  };
+  const completedRequest: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-33333333333333333333",
+    status: "approved",
+    response: {
+      outcome: "approved",
+      message: "Approved.",
+      createdAt: "2026-08-19T11:00:00.000Z",
+    },
+  };
+
+  assert.equal(
+    pendingDecisionCount([pendingReview, changeReviewRequest, completedRequest]),
+    2,
+  );
+  assert.equal(pendingDecisionCount([completedRequest]), 0);
+});
+
+test("preserves Space, content mode, Actions, and fragments in workspace URLs", () => {
+  assert.equal(
+    workspaceRouteWithState("/d/doc-11111111111111111111#details", {
+      selectedSpace: "work",
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    }),
+    "/d/doc-11111111111111111111?space=work&view=change-reviews&actions=1#details",
+  );
+});
+
+test("restores orthogonal workspace query state", () => {
+  assert.deepEqual(
+    workspaceQueryState("?space=work&view=change-reviews&actions=1"),
+    {
+      selectedSpace: "work",
+      contentMode: "change-reviews",
+      actionsOnly: true,
+    },
+  );
+  assert.deepEqual(workspaceQueryState("?view=docs"), {
+    contentMode: "docs",
+    actionsOnly: false,
+  });
+  assert.deepEqual(workspaceQueryState("?view=archive"), {
+    contentMode: "archive",
+    actionsOnly: false,
+  });
+});
+
+test("filters the queue by logical project across workspaces", () => {
+  const sharedProject = "project-11111111111111111111";
+  const otherProject = "project-22222222222222222222";
+  const projectDocuments = [
+    { ...documents[0]!, projectId: sharedProject },
+    { ...documents[1]!, projectId: sharedProject },
+    { ...documents[2]!, projectId: otherProject },
+  ];
+  assert.deepEqual(
+    filterQueue(projectDocuments, {
+      workspaceId: sharedProject,
+      status: "all",
+    }).map(({ id }) => id),
+    [documents[0]!.id, documents[1]!.id],
+  );
+});
+
+test("selects a project queue and leaves document-only spaces", () => {
+  const current: WebFilters = {
+    workspaceId: "beta",
+    status: "reading",
+    search: "migration",
+    actionsOnly: true,
+    changeReviewsOnly: true,
+  };
+
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  assert.deepEqual(projectQueueSelection(current, project), {
+    filters: {
+      workspaceId: project.id,
+      status: "reading",
+      search: "migration",
+      actionsOnly: true,
+      changeReviewsOnly: true,
+    },
+    route: project.route,
+  });
+  assert.deepEqual(current, {
+    workspaceId: "beta",
+    status: "reading",
+    search: "migration",
+    actionsOnly: true,
+    changeReviewsOnly: true,
+  });
+});
+
+test("selects the unfiltered queue for all projects", () => {
+  assert.deepEqual(projectQueueSelection({ status: "all" }, undefined), {
+    filters: {
+      status: "all",
+      workspaceId: undefined,
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: "/",
+  });
+});
+
+test("uses canonical workspace routes and restores queue filters on history navigation", () => {
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = { workspaceId: workspace.id, status: "done" };
+
+  assert.equal(projectQueueSelection(filters, workspace).route, "/w/alpha");
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, project.route, [workspace, project]),
+    {
+      filters: {
+        workspaceId: project.id,
+        status: "done",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: project.route,
+    },
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/", [workspace, project]),
+    projectQueueSelection(filters, undefined),
+  );
+  assert.equal(
+    projectQueueSelectionForRoute(filters, "/d/doc-11111111111111111111", [workspace, project]),
+    undefined,
+  );
+});
+
+test("restores a stable workspace route alongside logical project routes", () => {
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha workspace",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = { workspaceId: project.id, status: "all" };
+
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, workspace.route, [project, workspace]),
+    {
+      filters: {
+        workspaceId: workspace.id,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: workspace.route,
+    },
+  );
+  assert.equal(projectQueueRoute(workspace.id, [project, workspace]), workspace.route);
+});
+
+test("restores special queues from browser history state", () => {
+  const filters: WebFilters = { workspaceId: "alpha", status: "all" };
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/", [], { space: "change-reviews" }),
+    {
+      filters: {
+        workspaceId: undefined,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: true,
+      },
+      route: "/",
+    },
+  );
+  assert.equal(
+    projectQueueSelectionForRoute(filters, "/", [], { space: "unknown" })?.filters.changeReviewsOnly,
+    false,
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(filters, "/w/alpha", [
+      { id: "alpha", name: "Alpha", documentCount: 1, route: "/w/alpha" },
+    ], { space: "actions" }),
+    {
+      filters: {
+        workspaceId: "alpha",
+        status: "all",
+        actionsOnly: true,
+        changeReviewsOnly: false,
+      },
+      route: "/w/alpha",
+    },
+  );
+});
+
+test("opens the Actions queue when toggled from a reader", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  const filters: WebFilters = {
+    workspaceId: project.id,
+    status: "all",
+    changeReviewsOnly: true,
+  };
+
+  assert.deepEqual(actionsQueueTransition(filters, true, [project]), {
+    filters: {
+      workspaceId: project.id,
+      status: "all",
+      actionsOnly: true,
+      changeReviewsOnly: false,
+    },
+    route: project.route,
+    historyState: { space: "actions" },
+    pushHistory: true,
+  });
+  assert.deepEqual(
+    actionsQueueTransition({ ...filters, actionsOnly: true }, false, [project]),
+    {
+      filters: {
+        workspaceId: project.id,
+        status: "all",
+        actionsOnly: false,
+        changeReviewsOnly: false,
+      },
+      route: project.route,
+      historyState: {},
+      pushHistory: false,
+    },
+  );
+});
+
+test("restores a document's originating project and space from history", () => {
+  const projectA: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Project A",
+    documentCount: 1,
+    route: "/p/project-11111111111111111111",
+  };
+  const projectB: PublicWorkspace = {
+    id: "project-22222222222222222222",
+    name: "Project B",
+    documentCount: 1,
+    route: "/p/project-22222222222222222222",
+  };
+  const historyState = documentHistoryState(
+    documents[0]!.id,
+    { workspaceId: projectA.id, status: "all", actionsOnly: true },
+    [projectA, projectB],
+  );
+  assert.deepEqual(historyState, {
+    documentId: documents[0]!.id,
+    queueRoute: projectA.route,
+    space: "actions",
+  });
+  assert.deepEqual(
+    projectQueueSelectionForReaderHistory(
+      { workspaceId: projectB.id, status: "all" },
+      historyState,
+      [projectA, projectB],
+    ),
+    {
+      filters: {
+        workspaceId: projectA.id,
+        status: "all",
+        actionsOnly: true,
+        changeReviewsOnly: false,
+      },
+      route: projectA.route,
+    },
+  );
+  assert.equal(
+    projectQueueSelectionForReaderHistory(
+      { workspaceId: projectB.id, status: "all" },
+      { queueRoute: "/d/doc-11111111111111111111" },
+      [projectA, projectB],
+    ),
+    undefined,
+  );
+  const workspace: PublicWorkspace = {
+    id: "alpha",
+    name: "Alpha",
+    documentCount: 1,
+    route: "/w/alpha",
+  };
+  assert.equal(
+    documentHistoryState(documents[0]!.id, { workspaceId: "alpha", status: "all" }, [workspace]).queueRoute,
+    "/w/alpha",
+  );
+  assert.deepEqual(
+    documentHistoryState(documents[0]!.id, { status: "all", changeReviewsOnly: true }, []),
+    {
+      documentId: documents[0]!.id,
+      queueRoute: "/",
+      space: "change-reviews",
+    },
+  );
+});
+
+test("preserves Actions state when a vanished project route becomes all projects", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Project A",
+    documentCount: 1,
+    route: "/p/project-11111111111111111111",
+  };
+  const current: WebFilters = { workspaceId: project.id, status: "all" };
+  const selection = projectQueueSelectionForRoute(
+    current,
+    project.route,
+    [],
+    { space: "actions" },
+  );
+  assert.equal(selection?.route, "/");
+  assert.equal(selection?.filters.actionsOnly, true);
+  const normalizedHistoryState = queueHistoryState(selection!.filters);
+  assert.deepEqual(normalizedHistoryState, { space: "actions" });
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/", [], normalizedHistoryState),
+    selection,
+  );
+});
+
+test("returns from a reader to its selected project's canonical route", () => {
+  const project: PublicWorkspace = {
+    id: "project-11111111111111111111",
+    name: "Shared project",
+    documentCount: 2,
+    route: "/p/project-11111111111111111111",
+  };
+  assert.equal(projectQueueRoute(project.id, [project]), project.route);
+  assert.equal(projectQueueRoute(undefined, [project]), "/");
+  assert.equal(projectQueueRoute("archived-project", [project]), "/");
+});
+
+test("falls back to all projects for a vanished project history route", () => {
+  const current: WebFilters = { workspaceId: "beta", status: "reading" };
+  const visible: PublicWorkspace[] = [
+    { id: "beta", name: "Beta", documentCount: 1, route: "/w/beta" },
+  ];
+  const all = {
+    filters: {
+      workspaceId: undefined,
+      status: "reading",
+      actionsOnly: false,
+      changeReviewsOnly: false,
+    },
+    route: "/",
+  };
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/w/alpha", visible),
+    all,
+  );
+  assert.deepEqual(
+    projectQueueSelectionForRoute(current, "/p/project-11111111111111111111", visible),
+    all,
+  );
+});
+
 test("provides a dedicated browser Change Reviews space", () => {
   assert.deepEqual(
     filterQueue(documents, { status: "all", changeReviewsOnly: true }).map(
@@ -161,6 +668,45 @@ test("builds native unified and side-by-side rows with intra-line changes", () =
   assert.equal(rows[0]?.old?.changed, "");
   assert.equal(rows[0]?.new?.changed, "=");
   assert.equal(rows[0]?.old?.suffix, " expected;");
+});
+
+test("labels feedback ranges and locates their inline endpoint", () => {
+  const range = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-11111111111111111111",
+    line: 14,
+    endLine: 17,
+    side: "new" as const,
+    message: "Extract this validation block.",
+  };
+
+  assert.equal(feedbackAnchorLabel(range), "src/auth.ts:14-17 (new)");
+  assert.equal(feedbackAnchorContainsLine(range, {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "new",
+  }), true);
+  assert.equal(feedbackAnchorContainsLine(range, {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "old",
+  }), false);
+  assert.deepEqual(feedbackEndingAtLine([range], {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 17,
+    side: "new",
+  }), [range]);
+  assert.deepEqual(feedbackEndingAtLine([range], {
+    path: range.path,
+    hunkId: range.hunkId,
+    line: 16,
+    side: "new",
+  }), []);
 });
 
 test("syntax-highlights code diff lines without changing their text", () => {
@@ -253,6 +799,37 @@ test("groups the queue by project without changing document order", () => {
   ]);
 });
 
+test("groups different workspaces by their shared logical project", () => {
+  const shared = [
+    {
+      ...documents[0]!,
+      projectId: "project-11111111111111111111",
+      projectName: "EyWizards / SA-2913 (COA Worker Continuity)",
+    },
+    {
+      ...documents[1]!,
+      projectId: "project-11111111111111111111",
+      projectName: "EyWizards / SA-2913 (COA Worker Continuity)",
+    },
+  ];
+
+  assert.deepEqual(groupQueue(shared, "project", []), [
+    {
+      key: "project:project-11111111111111111111",
+      label: "EyWizards / SA-2913 (COA Worker Continuity)",
+      documents: shared,
+    },
+  ]);
+  assert.deepEqual(visibleWorkspaces(shared, []), [
+    {
+      id: "project-11111111111111111111",
+      name: "EyWizards / SA-2913 (COA Worker Continuity)",
+      documentCount: 2,
+      route: "/p/project-11111111111111111111",
+    },
+  ]);
+});
+
 test("groups multi-tag documents under every tag and puts untagged last", () => {
   const untagged = {
     ...documents[1]!,
@@ -329,11 +906,350 @@ test("requires explanatory text only when changes are requested", () => {
     "Explain what needs to change.",
   );
   assert.equal(
-    reviewResponseError("changes_requested", "Add rollback proof."),
+    reviewResponseError("changes_requested", "Add rollback proof.", []),
+    undefined,
+  );
+  assert.equal(
+    reviewResponseError("changes_requested", "", [{
+      id: "feedback-11111111111111111111",
+      kind: "feedback",
+      path: "src/auth.ts",
+      line: 14,
+      side: "new",
+      message: "Handle the expired token here.",
+    }]),
     undefined,
   );
   assert.equal(reviewResponseError("approved", ""), undefined);
   assert.equal(reviewResponseError("rejected", ""), undefined);
+  assert.equal(reviewResponseError("superseded", ""), undefined);
+});
+
+test("round-trips revision-bound review drafts and removes empty drafts", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const item = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-22222222222222222222",
+    line: 14,
+    endLine: 17,
+    side: "new" as const,
+    message: "Keep this comment after reload.",
+  };
+
+  persistReviewDraft(storage, request, {
+    message: "Approval context",
+    items: [item],
+  });
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [item],
+  });
+
+  const revised = { ...request, documentRevision: request.documentRevision + 1 };
+  assert.deepEqual(loadReviewDraft(storage, revised), { message: "", items: [] });
+
+  persistReviewDraft(storage, request, { message: "", items: [] });
+  assert.deepEqual(loadReviewDraft(storage, request), { message: "", items: [] });
+  assert.equal(values.size, 0);
+});
+
+test("restores, edits, removes, and approves persisted review feedback", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const original = {
+    id: "feedback-11111111111111111111",
+    kind: "feedback" as const,
+    path: "src/auth.ts",
+    hunkId: "hunk-22222222222222222222",
+    line: 14,
+    side: "new" as const,
+    message: "Keep this comment after reload.",
+  };
+  persistReviewDraft(storage, request, {
+    message: "Approval context",
+    items: [original],
+  });
+
+  const restored = loadReviewDraft(storage, request);
+  const edited = upsertReviewDraftFeedback(restored, {
+    ...original,
+    message: "Use the constant-time helper here.",
+  });
+  persistReviewDraft(storage, request, edited);
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [{
+      ...original,
+      message: "Use the constant-time helper here.",
+    }],
+  });
+  assert.deepEqual(
+    reviewFeedbackItemsForOutcome("approved", edited.items),
+    edited.items,
+  );
+
+  const removed = removeReviewDraftFeedback(edited, original.id);
+  persistReviewDraft(storage, request, removed);
+  assert.deepEqual(loadReviewDraft(storage, request), {
+    message: "Approval context",
+    items: [],
+  });
+});
+
+test("activates a replacement review with a composer reset", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+  const replacement: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  persistReviewDraft(storage, replacement, {
+    message: "Replacement context",
+    items: [],
+  });
+
+  assert.deepEqual(
+    activateReviewDraft(
+      storage,
+      replacement,
+      "review-11111111111111111111",
+    ),
+    {
+      requestId: replacement.id,
+      resetComposer: true,
+      draft: { message: "Replacement context", items: [] },
+    },
+  );
+  assert.equal(
+    activateReviewDraft(storage, replacement, replacement.id),
+    undefined,
+  );
+});
+
+test("sweeps drafts for review requests observed in a terminal state", () => {
+  const values = new Map<string, string>([
+    ["mdmaid-desk-review-draft:review-11111111111111111111", "pending"],
+    ["mdmaid-desk-review-draft:review-22222222222222222222", "terminal"],
+    ["mdmaid-desk-review-draft:review-33333333333333333333", "unknown"],
+    ["unrelated", "keep"],
+  ]);
+  const storage: ReviewDraftStorage = {
+    get length() {
+      return values.size;
+    },
+    key: (index) => [...values.keys()][index] ?? null,
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  };
+
+  cleanupReviewDrafts(storage, new Set([
+    "review-22222222222222222222",
+  ]));
+
+  assert.deepEqual([...values.keys()], [
+    "mdmaid-desk-review-draft:review-11111111111111111111",
+    "mdmaid-desk-review-draft:review-33333333333333333333",
+    "unrelated",
+  ]);
+});
+
+test("ignores malformed persisted review feedback", () => {
+  const request: PublicReviewRequest = {
+    ...pendingReview,
+    id: "review-22222222222222222222",
+    documentId: documents[3]!.id,
+    documentRevision: documents[3]!.revision,
+    kind: "change-decision",
+  };
+  const storage: ReviewDraftStorage = {
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "Approval context",
+      items: [{
+        id: "feedback-11111111111111111111",
+        kind: "feedback",
+        path: "../../outside.txt",
+        message: "Unsafe",
+      }],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  };
+
+  assert.deepEqual(loadReviewDraft(storage, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "Approval\u0000context",
+      items: [],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => JSON.stringify({
+      version: 1,
+      documentId: request.documentId,
+      documentRevision: request.documentRevision,
+      message: "",
+      items: [{
+        id: "feedback-11111111111111111111",
+        kind: "feedback",
+        path: "src/auth.ts",
+        message: "Unsafe\u0000feedback",
+      }],
+    }),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
+
+  assert.deepEqual(loadReviewDraft({
+    getItem: () => {
+      throw new Error("browser storage unavailable");
+    },
+    setItem: () => undefined,
+    removeItem: () => undefined,
+  }, request), { message: "", items: [] });
+});
+
+test("makes pending line feedback an explicit visible action", () => {
+  assert.deepEqual(webDiffLineControlModel(14, "new", true), {
+    lineText: "14",
+    feedbackMarker: "+",
+    feedbackLabel: "Add feedback on new line 14",
+  });
+  assert.deepEqual(webDiffLineControlModel(14, "old", false), {
+    lineText: "14",
+  });
+  assert.deepEqual(webDiffLineControlModel(null, "new", true), {
+    lineText: "",
+  });
+  assert.equal(
+    WEB_LINE_FEEDBACK_HINT,
+    "Line feedback: click + beside a line; Shift-click another same-side line for a range.",
+  );
+});
+
+test("isolates Mermaid failures so one diagram cannot hide the document", async () => {
+  const first = {} as Element;
+  const second = {} as Element;
+  const rendered: Element[] = [];
+  const failed: Array<{ node: Element; error: unknown }> = [];
+
+  await renderMermaidNodes(
+    {
+      async run({ nodes }) {
+        const node = nodes[0]!;
+        rendered.push(node);
+        if (node === first) {
+          throw new Error("invalid state diagram");
+        }
+      },
+    },
+    [first, second],
+    (node, error) => failed.push({ node, error }),
+  );
+
+  assert.deepEqual(rendered, [first, second]);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]?.node, first);
+  assert.match(String(failed[0]?.error), /invalid state diagram/);
+});
+
+test("waits for browser fonts before laying out Mermaid diagrams", async () => {
+  const node = {} as Element;
+  const rendered: Element[] = [];
+  let releaseFonts!: () => void;
+  const fontsReady = new Promise<void>((resolve) => {
+    releaseFonts = resolve;
+  });
+
+  const rendering = renderMermaidNodes(
+    {
+      async run({ nodes }) {
+        rendered.push(nodes[0]!);
+      },
+    },
+    [node],
+    () => undefined,
+    fontsReady,
+  );
+  await Promise.resolve();
+  assert.deepEqual(rendered, []);
+  releaseFonts();
+  await rendering;
+  assert.deepEqual(rendered, [node]);
+});
+
+test("extracts Mermaid diagnostics thrown as parser objects", () => {
+  assert.equal(
+    mermaidErrorMessage({
+      str: "Could not find a suitable point for the given distance",
+      hash: "Error",
+    }),
+    "Could not find a suitable point for the given distance",
+  );
+  assert.equal(mermaidErrorMessage(new Error("parse failed")), "parse failed");
+});
+
+test("temporarily reveals hidden Mermaid layout without flashing content", async () => {
+  const attributes = new Set(["hidden"]);
+  const style = { visibility: "collapse" };
+  const container = {
+    hasAttribute: (name: string) => attributes.has(name),
+    removeAttribute: (name: string) => attributes.delete(name),
+    setAttribute: (name: string) => attributes.add(name),
+    style,
+  } as unknown as HTMLElement;
+  let visibleDuringLayout = false;
+
+  await withVisibleMermaidLayout(container, async () => {
+    visibleDuringLayout = !attributes.has("hidden") &&
+      style.visibility === "hidden";
+  });
+
+  assert.equal(visibleDuringLayout, true);
+  assert.equal(attributes.has("hidden"), true);
+  assert.equal(style.visibility, "collapse");
 });
 
 test("hides projects without visible documents from browser navigation", () => {
@@ -466,6 +1382,118 @@ test("requests the browser print dialog for PDF export", () => {
     },
   });
   assert.equal(calls, 1);
+});
+
+test("builds Markdown selection witnesses only within one mapped block", () => {
+  const sourceMap = {
+    version: 1 as const,
+    coordinateSystem: "utf16-code-units" as const,
+    sourceLength: 12,
+    segments: [
+      {
+        ref: "m1-s1",
+        blockRef: "m1-b1",
+        text: "hello ",
+        sourceStart: { offset: 0, line: 1, column: 1 },
+        sourceEnd: { offset: 6, line: 1, column: 7 },
+        mapping: "identity" as const,
+      },
+      {
+        ref: "m1-s2",
+        blockRef: "m1-b1",
+        text: "world",
+        sourceStart: { offset: 6, line: 1, column: 7 },
+        sourceEnd: { offset: 11, line: 1, column: 12 },
+        mapping: "identity" as const,
+      },
+      {
+        ref: "m1-s3",
+        blockRef: "m1-b2",
+        text: "next",
+        sourceStart: { offset: 12, line: 2, column: 1 },
+        sourceEnd: { offset: 16, line: 2, column: 5 },
+        mapping: "identity" as const,
+      },
+    ],
+    logicalLines: [],
+    exclusions: [],
+  };
+  assert.deepEqual(
+    markdownSelectionWitness(sourceMap, "m1-s1", 2, "m1-s2", 3),
+    {
+      kind: "markdown-selection-v1",
+      start: { ref: "m1-s1", offset: 2 },
+      end: { ref: "m1-s2", offset: 3 },
+    },
+  );
+  assert.equal(
+    markdownSelectionWitness(sourceMap, "m1-s1", 2, "m1-s3", 3),
+    undefined,
+  );
+  assert.equal(
+    markdownSelectionWitness(sourceMap, "m1-s1", 7, "m1-s2", 3),
+    undefined,
+  );
+});
+
+test("restores exact Markdown feedback selections across formatting and escaped text", async () => {
+  const source = "Repeated **phrase** &amp; again.\n\nRepeated **phrase** &amp; again.";
+  const map = await createMarkdownSourceMap(source);
+  for (const segment of map.segments) {
+    const witness = {
+      kind: "markdown-selection-v1" as const,
+      start: { ref: segment.ref, offset: 0 },
+      end: { ref: segment.ref, offset: segment.text.length },
+    };
+    const anchor = resolveMarkdownSelection(source, map, witness);
+    assert.deepEqual(markdownFeedbackWitness(map, anchor), witness);
+  }
+  const anchor = resolveMarkdownSelection(source, map, {
+    start: { ref: map.segments[0]!.ref, offset: 2 },
+    end: { ref: map.segments[1]!.ref, offset: 3 },
+  });
+  assert.deepEqual(markdownFeedbackWitness(map, anchor), {
+    kind: "markdown-selection-v1",
+    start: { ref: map.segments[0]!.ref, offset: 2 },
+    end: { ref: map.segments[1]!.ref, offset: 3 },
+  });
+  assert.equal(markdownFeedbackWitness(map, {
+    ...anchor, end: { ...anchor.end, offset: source.length + 1 },
+  }), undefined);
+});
+
+test("persists document feedback drafts by document revision", () => {
+  const values = new Map<string, string>();
+  const storage: ReviewDraftStorage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => void values.delete(key),
+  };
+  const draft: WebDocumentFeedbackDraft = {
+    generalMessage: "Overall note",
+    comments: [{
+      id: "comment-11111111111111111111",
+      intent: "feedback",
+      anchor: {
+        kind: "markdown-selection-v1",
+        start: { ref: "m1-s1", offset: 0 },
+        end: { ref: "m1-s1", offset: 5 },
+      },
+      label: "hello",
+      message: "Clarify this.",
+    }],
+  };
+  persistDocumentFeedbackDraft(storage, documents[0]!, draft);
+  assert.deepEqual(loadDocumentFeedbackDraft(storage, documents[0]!), draft);
+  assert.equal(
+    documentFeedbackDraftStorageKey(documents[0]!),
+    `mdmaid-desk-feedback-draft:${documents[0]!.id}:1`,
+  );
+  persistDocumentFeedbackDraft(storage, documents[0]!, {
+    generalMessage: "",
+    comments: [],
+  });
+  assert.equal(values.size, 0);
 });
 
 test("explains how to recover when the browser session expires", () => {

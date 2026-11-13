@@ -9,11 +9,17 @@ import {
 } from "./document-export.js";
 
 import type {
+  BulkDocumentResult,
   ChangeReviewDiff,
+  FeedbackSubmissionRegistration,
   PublicDocument,
+  PublicFeedbackPage,
+  PublicFeedbackSubmission,
   PublicReviewRequest,
+  PublicSpace,
   PublicWorkspace,
   ReadingStatus,
+  ReviewFeedbackItem,
   ReviewOutcome,
 } from "./api-types.js";
 import type {
@@ -21,12 +27,16 @@ import type {
   ChangeReviewHunk,
   ChangeReviewLine,
 } from "./change-review.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
+import type { MarkdownFeedbackAnchor } from "./domain.js";
 
 export type WebReadingStatus = ReadingStatus;
 export type WebDocument = PublicDocument;
 export type WebWorkspace = PublicWorkspace;
 export type WebReviewRequest = PublicReviewRequest;
 export type WebQueueGrouping = "project" | "tag" | "all";
+export type WebContentMode = "docs" | "change-reviews" | "archive";
+export type WebMutationAction = "archive" | "restore" | "purge";
 
 export interface WebFilters {
   workspaceId?: string | undefined;
@@ -34,6 +44,12 @@ export interface WebFilters {
   search?: string | undefined;
   actionsOnly?: boolean | undefined;
   changeReviewsOnly?: boolean | undefined;
+  contentMode?: WebContentMode | undefined;
+}
+
+export interface WebProjectQueueSelection {
+  filters: WebFilters;
+  route: string;
 }
 
 export interface WebDiffCell {
@@ -47,6 +63,33 @@ export interface WebDiffCell {
 export interface WebDiffRow {
   old?: WebDiffCell;
   new?: WebDiffCell;
+}
+
+export interface WebDiffLineControlModel {
+  lineText: string;
+  feedbackMarker?: string;
+  feedbackLabel?: string;
+}
+
+export const WEB_LINE_FEEDBACK_HINT =
+  "Line feedback: click + beside a line; Shift-click another same-side line for a range.";
+
+export function webDiffLineControlModel(
+  line: number | null,
+  side: "old" | "new",
+  feedbackEnabled: boolean,
+): WebDiffLineControlModel {
+  if (line === null) {
+    return { lineText: "" };
+  }
+  const lineText = String(line);
+  return feedbackEnabled
+    ? {
+        lineText,
+        feedbackMarker: "+",
+        feedbackLabel: `Add feedback on ${side} line ${line}`,
+      }
+    : { lineText };
 }
 
 export type WebSyntaxKind =
@@ -64,6 +107,10 @@ export type WebSyntaxKind =
 export interface WebSyntaxToken {
   kind: WebSyntaxKind;
   text: string;
+}
+
+export interface WebMermaidRenderer {
+  run(options: { nodes: Element[] }): Promise<void>;
 }
 
 export interface DocumentOutlineItem {
@@ -93,6 +140,41 @@ export interface WebLoadFailure {
   guidance: string;
   liveStatus: string;
   title: string;
+}
+
+export interface ReviewDraftStorage {
+  readonly length?: number;
+  key?(index: number): string | null;
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+export interface WebReviewDraft {
+  message: string;
+  items: ReviewFeedbackItem[];
+}
+
+export interface WebReviewDraftActivation {
+  requestId: string;
+  resetComposer: true;
+  draft: WebReviewDraft;
+}
+
+export type WebFeedbackAnchorInput =
+  FeedbackSubmissionRegistration["comments"][number]["anchor"];
+
+export interface WebFeedbackCommentDraft {
+  id: string;
+  intent: "feedback" | "todo";
+  anchor: WebFeedbackAnchorInput;
+  label: string;
+  message: string;
+}
+
+export interface WebDocumentFeedbackDraft {
+  generalMessage: string;
+  comments: WebFeedbackCommentDraft[];
 }
 
 interface DocumentHeading {
@@ -326,6 +408,8 @@ interface RenderedDocument {
   document: WebDocument;
   target: "web";
   content: string;
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 
@@ -334,8 +418,108 @@ interface WebState {
   filters: WebFilters;
   grouping: WebQueueGrouping;
   reviewRequests: WebReviewRequest[];
+  selectedDocumentIds: Set<string>;
   selectedId: string | undefined;
+  selectedSpace: string | undefined;
+  spaces: PublicSpace[];
   workspaces: WebWorkspace[];
+}
+
+export interface WebFeedbackAnchor {
+  path: string;
+  hunkId?: string;
+  line?: number;
+  endLine?: number;
+  side?: "old" | "new";
+}
+
+type WebFeedbackDraftAnchor = WebFeedbackAnchor |
+  Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>;
+
+function isMarkdownFeedbackAnchor(
+  anchor: WebFeedbackDraftAnchor,
+): anchor is Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> {
+  return "kind" in anchor && anchor.kind === "markdown-selection-v1";
+}
+
+function diffFeedbackAnchorInput(anchor: WebFeedbackAnchor): WebFeedbackAnchorInput {
+  return anchor.line === undefined
+    ? { kind: "diff-file-v1", path: anchor.path }
+    : {
+        kind: "diff-lines-v1",
+        path: anchor.path,
+        hunkId: anchor.hunkId!,
+        side: anchor.side!,
+        line: anchor.line,
+        ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+      };
+}
+
+function draftDiffItems(
+  comments: readonly WebFeedbackCommentDraft[],
+): ReviewFeedbackItem[] {
+  return comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-selection-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  });
+}
+
+function storedDiffItems(
+  submissions: readonly PublicFeedbackSubmission[],
+): ReviewFeedbackItem[] {
+  return submissions.flatMap((submission) => submission.comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  }));
+}
+
+function storedFeedbackAnchorLabel(
+  comment: PublicFeedbackSubmission["comments"][number],
+): string {
+  const anchor = comment.anchor;
+  if (anchor.kind === "markdown-v1") {
+    const lines = anchor.start.line === anchor.end.line
+      ? `line ${anchor.start.line}`
+      : `lines ${anchor.start.line}-${anchor.end.line}`;
+    return `${lines} · “${anchor.exact.slice(0, 160)}”`;
+  }
+  return feedbackAnchorLabel(anchor.kind === "diff-file-v1"
+    ? { path: anchor.path }
+    : {
+        path: anchor.path,
+        hunkId: anchor.hunkId,
+        side: anchor.side,
+        line: anchor.line,
+        ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+      });
 }
 
 class WebApiError extends Error {
@@ -365,13 +549,31 @@ export function filterQueue(
     .split(/\s+/)
     .filter(Boolean);
   return documents.filter((document) => {
+    const contentMode = filters.contentMode ??
+      (filters.changeReviewsOnly === true ? "change-reviews" : "docs");
     if (
+      (contentMode === "archive" && document.archivedAt === null) ||
+      (contentMode !== "archive" && document.archivedAt !== null)
+    ) {
+      return false;
+    }
+    if (
+      filters.contentMode !== undefined &&
+      contentMode !== "archive" &&
+      ((contentMode === "docs" && document.kind === "change-review") ||
+        (contentMode === "change-reviews" && document.kind !== "change-review"))
+    ) {
+      return false;
+    }
+    if (
+      filters.contentMode === undefined &&
       filters.changeReviewsOnly === true &&
       document.kind !== "change-review"
     ) {
       return false;
     }
     if (
+      filters.contentMode === undefined &&
       filters.changeReviewsOnly !== true &&
       filters.actionsOnly !== true &&
       document.kind === "change-review"
@@ -386,6 +588,7 @@ export function filterQueue(
     }
     if (
       filters.workspaceId !== undefined &&
+      (document.projectId ?? document.workspaceId) !== filters.workspaceId &&
       document.workspaceId !== filters.workspaceId
     ) {
       return false;
@@ -402,6 +605,7 @@ export function filterQueue(
     }
     const haystack = [
       document.title,
+      document.projectName ?? "",
       document.workspaceId,
       document.taskId ?? "",
       document.producer ?? "",
@@ -414,6 +618,192 @@ export function filterQueue(
       .toLowerCase();
     return terms.every((term) => haystack.includes(term));
   });
+}
+
+export function bulkDocumentIds(
+  documents: WebDocument[],
+  filters: WebFilters,
+  reviewRequests: WebReviewRequest[] = [],
+): string[] {
+  return filterQueue(documents, filters, reviewRequests).map(({ id }) => id);
+}
+
+export function webMutationConfirmation(
+  action: "archive" | "purge",
+  count: number,
+): { confirmLabel: string; message: string; title: string } {
+  const multiple = count !== 1;
+  if (action === "archive") {
+    return {
+      confirmLabel: multiple ? `archive ${count} documents` : "archive document",
+      message: multiple
+        ? `Archive ${count} documents? You can restore them later from Archive.`
+        : "Archive this document? You can restore it later from Archive.",
+      title: multiple ? "Archive documents?" : "Archive document?",
+    };
+  }
+  return {
+    confirmLabel: multiple ? `purge ${count} documents forever` : "purge document forever",
+    message: multiple
+      ? `Purge ${count} documents forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.`
+      : "Purge this document forever? This cannot be undone. Catalog history and managed snapshots will be deleted. Referenced source files will not be deleted.",
+    title: "Purge forever?",
+  };
+}
+
+export function projectQueueSelection(
+  filters: WebFilters,
+  workspace: Pick<WebWorkspace, "id" | "route"> | undefined,
+): WebProjectQueueSelection {
+  return {
+    filters: {
+      ...filters,
+      workspaceId: workspace?.id,
+      actionsOnly: filters.actionsOnly === true,
+      changeReviewsOnly: filters.changeReviewsOnly === true,
+    },
+    route: workspace?.route ?? "/",
+  };
+}
+
+export function workspaceRouteWithState(
+  route: string,
+  state: {
+    selectedSpace?: string | undefined;
+    contentMode: WebContentMode;
+    actionsOnly: boolean;
+  },
+): string {
+  const url = new URL(route, "http://mdmaid.desk.localhost");
+  url.searchParams.delete("space");
+  url.searchParams.delete("view");
+  url.searchParams.delete("actions");
+  if (state.selectedSpace !== undefined) {
+    url.searchParams.set("space", state.selectedSpace);
+  }
+  url.searchParams.set("view", state.contentMode);
+  if (state.actionsOnly) {
+    url.searchParams.set("actions", "1");
+  }
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+export function workspaceQueryState(search: string): {
+  selectedSpace?: string;
+  contentMode: WebContentMode;
+  actionsOnly: boolean;
+} {
+  const query = new URLSearchParams(search);
+  const selectedSpace = query.get("space") ?? undefined;
+  return {
+    ...(selectedSpace === undefined ? {} : { selectedSpace }),
+    contentMode: query.get("view") === "change-reviews"
+      ? "change-reviews"
+      : query.get("view") === "archive"
+        ? "archive"
+        : "docs",
+    actionsOnly: query.get("actions") === "1",
+  };
+}
+
+export function projectQueueRoute(
+  workspaceId: string | undefined,
+  workspaces: readonly WebWorkspace[],
+): string {
+  return workspaces.find(({ id }) => id === workspaceId)?.route ?? "/";
+}
+
+export function queueHistoryState(
+  filters: WebFilters,
+): { space?: "actions" | "change-reviews" } {
+  if (filters.changeReviewsOnly === true) {
+    return { space: "change-reviews" };
+  }
+  return filters.actionsOnly === true ? { space: "actions" } : {};
+}
+
+export function documentHistoryState(
+  documentId: string,
+  filters: WebFilters,
+  workspaces: readonly WebWorkspace[],
+): { documentId: string; queueRoute: string; space?: "actions" | "change-reviews" } {
+  return {
+    documentId,
+    queueRoute: projectQueueRoute(filters.workspaceId, workspaces),
+    ...queueHistoryState(filters),
+  };
+}
+
+export function projectQueueSelectionForReaderHistory(
+  filters: WebFilters,
+  historyState: unknown,
+  workspaces: readonly WebWorkspace[],
+): WebProjectQueueSelection | undefined {
+  if (!isRecord(historyState) || typeof historyState.queueRoute !== "string") {
+    return undefined;
+  }
+  return projectQueueSelectionForRoute(
+    filters,
+    historyState.queueRoute,
+    workspaces,
+    historyState,
+  );
+}
+
+export function actionsQueueTransition(
+  filters: WebFilters,
+  readerOpen: boolean,
+  workspaces: readonly WebWorkspace[],
+): WebProjectQueueSelection & {
+  historyState: { space?: "actions" | "change-reviews" };
+  pushHistory: boolean;
+} {
+  const actionsOnly = filters.actionsOnly !== true;
+  const nextFilters = { ...filters, actionsOnly, changeReviewsOnly: false };
+  return {
+    filters: nextFilters,
+    route: projectQueueRoute(filters.workspaceId, workspaces),
+    historyState: queueHistoryState(nextFilters),
+    pushHistory: readerOpen,
+  };
+}
+
+export function projectQueueSelectionForRoute(
+  filters: WebFilters,
+  route: string,
+  workspaces: readonly WebWorkspace[],
+  historyState?: unknown,
+): WebProjectQueueSelection | undefined {
+  let selection: WebProjectQueueSelection | undefined;
+  if (route === "/") {
+    selection = projectQueueSelection(filters, undefined);
+  } else {
+    const workspace = workspaces.find((candidate) => candidate.route === route);
+    if (workspace) {
+      selection = projectQueueSelection(filters, workspace);
+    } else if (
+      /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(route) ||
+      /^\/p\/project-[a-f0-9]{20}$/.test(route)
+    ) {
+      selection = projectQueueSelection(filters, undefined);
+    }
+  }
+  if (!selection || !isRecord(historyState)) {
+    return selection;
+  }
+  if (route === "/" && historyState.space === "change-reviews") {
+    return {
+      ...selection,
+      filters: { ...selection.filters, changeReviewsOnly: true },
+    };
+  }
+  if (historyState.space === "actions") {
+    return {
+      ...selection,
+      filters: { ...selection.filters, actionsOnly: true },
+    };
+  }
+  return selection;
 }
 
 export function webDiffRows(hunk: ChangeReviewHunk): WebDiffRow[] {
@@ -518,13 +908,488 @@ export function pendingReviewForDocument(
   );
 }
 
+export function pendingDecisionCount(
+  reviewRequests: WebReviewRequest[],
+): number {
+  return reviewRequests.filter(({ status }) => status === "pending").length;
+}
+
+export function feedbackAnchorLabel(anchor: WebFeedbackAnchor): string {
+  if (anchor.line !== undefined && anchor.side !== undefined) {
+    const lines = anchor.endLine === undefined
+      ? String(anchor.line)
+      : `${anchor.line}-${anchor.endLine}`;
+    return `${anchor.path}:${lines} (${anchor.side})`;
+  }
+  return anchor.hunkId ? `${anchor.path}#${anchor.hunkId}` : anchor.path;
+}
+
+export function feedbackAnchorContainsLine(
+  feedback: WebFeedbackAnchor,
+  anchor: Required<Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">>,
+): boolean {
+  return feedback.path === anchor.path &&
+    feedback.hunkId === anchor.hunkId &&
+    feedback.side === anchor.side &&
+    feedback.line !== undefined &&
+    feedback.line <= anchor.line &&
+    (feedback.endLine ?? feedback.line) >= anchor.line;
+}
+
+export function feedbackEndingAtLine<T extends ReviewFeedbackItem>(
+  items: readonly T[],
+  anchor: Required<Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">>,
+): T[] {
+  return items.filter((item) =>
+    item.path === anchor.path &&
+    item.hunkId === anchor.hunkId &&
+    item.side === anchor.side &&
+    (item.endLine ?? item.line) === anchor.line
+  );
+}
+
 export function reviewResponseError(
   outcome: ReviewOutcome,
   message: string,
+  items: readonly ReviewFeedbackItem[] = [],
 ): string | undefined {
-  return outcome === "changes_requested" && message.trim() === ""
+  return outcome === "changes_requested" &&
+      message.trim() === "" &&
+      items.length === 0
     ? "Explain what needs to change."
     : undefined;
+}
+
+export function upsertReviewDraftFeedback(
+  draft: WebReviewDraft,
+  item: ReviewFeedbackItem,
+): WebReviewDraft {
+  const index = draft.items.findIndex(({ id }) => id === item.id);
+  return {
+    message: draft.message,
+    items: index < 0
+      ? [...draft.items, item]
+      : draft.items.map((candidate, candidateIndex) =>
+        candidateIndex === index ? item : candidate
+      ),
+  };
+}
+
+export function removeReviewDraftFeedback(
+  draft: WebReviewDraft,
+  itemId: string,
+): WebReviewDraft {
+  return {
+    message: draft.message,
+    items: draft.items.filter(({ id }) => id !== itemId),
+  };
+}
+
+export function reviewFeedbackItemsForOutcome(
+  outcome: ReviewOutcome,
+  items: readonly ReviewFeedbackItem[],
+): ReviewFeedbackItem[] | undefined {
+  return (outcome === "changes_requested" || outcome === "approved") &&
+      items.length > 0
+    ? [...items]
+    : undefined;
+}
+
+export function loadReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+): WebReviewDraft {
+  const empty = { message: "", items: [] };
+  if (request.status !== "pending") {
+    return empty;
+  }
+  try {
+    const raw = storage.getItem(reviewDraftStorageKey(request.id));
+    if (raw === null) {
+      return empty;
+    }
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !hasOnlyKeys(value, [
+        "version",
+        "documentId",
+        "documentRevision",
+        "message",
+        "items",
+      ]) ||
+      value.version !== 1 ||
+      value.documentId !== request.documentId ||
+      value.documentRevision !== request.documentRevision ||
+      typeof value.message !== "string" ||
+      value.message.length > 16 * 1024 ||
+      !isSafeReviewMessage(value.message) ||
+      !Array.isArray(value.items) ||
+      value.items.length > 32 ||
+      !value.items.every(isStoredReviewFeedbackItem)
+    ) {
+      return empty;
+    }
+    return {
+      message: value.message,
+      items: value.items.map((item) => ({ ...item })),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function activateReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+  activeRequestId: string | undefined,
+): WebReviewDraftActivation | undefined {
+  if (request.status !== "pending" || activeRequestId === request.id) {
+    return undefined;
+  }
+  return {
+    requestId: request.id,
+    resetComposer: true,
+    draft: loadReviewDraft(storage, request),
+  };
+}
+
+export function persistReviewDraft(
+  storage: ReviewDraftStorage,
+  request: WebReviewRequest,
+  draft: WebReviewDraft,
+): void {
+  const key = reviewDraftStorageKey(request.id);
+  if (draft.message === "" && draft.items.length === 0) {
+    storage.removeItem(key);
+    return;
+  }
+  storage.setItem(key, JSON.stringify({
+    version: 1,
+    documentId: request.documentId,
+    documentRevision: request.documentRevision,
+    message: draft.message,
+    items: draft.items,
+  }));
+}
+
+export function cleanupReviewDrafts(
+  storage: ReviewDraftStorage,
+  terminalRequestIds: ReadonlySet<string>,
+): void {
+  if (storage.length === undefined || storage.key === undefined) {
+    return;
+  }
+  const keys = Array.from(
+    { length: storage.length },
+    (_, index) => storage.key?.(index) ?? null,
+  );
+  for (const key of keys) {
+    if (
+      key?.startsWith(REVIEW_DRAFT_STORAGE_PREFIX) &&
+      terminalRequestIds.has(key.slice(REVIEW_DRAFT_STORAGE_PREFIX.length))
+    ) {
+      storage.removeItem(key);
+    }
+  }
+}
+
+function reviewDraftStorageKey(requestId: string): string {
+  return `${REVIEW_DRAFT_STORAGE_PREFIX}${requestId}`;
+}
+
+const REVIEW_DRAFT_STORAGE_PREFIX = "mdmaid-desk-review-draft:";
+
+const DOCUMENT_FEEDBACK_DRAFT_STORAGE_PREFIX =
+  "mdmaid-desk-feedback-draft:";
+
+export function documentFeedbackDraftStorageKey(
+  document: Pick<WebDocument, "id" | "revision">,
+): string {
+  return `${DOCUMENT_FEEDBACK_DRAFT_STORAGE_PREFIX}${document.id}:${document.revision}`;
+}
+
+export function markdownSelectionWitness(
+  sourceMap: MarkdownSourceMapV1,
+  startRef: string,
+  startOffset: number,
+  endRef: string,
+  endOffset: number,
+): Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> | undefined {
+  const startIndex = sourceMap.segments.findIndex(({ ref }) => ref === startRef);
+  const endIndex = sourceMap.segments.findIndex(({ ref }) => ref === endRef);
+  const start = sourceMap.segments[startIndex];
+  const end = sourceMap.segments[endIndex];
+  if (
+    !start ||
+    !end ||
+    start.blockRef !== end.blockRef ||
+    !Number.isSafeInteger(startOffset) ||
+    !Number.isSafeInteger(endOffset) ||
+    startOffset < 0 ||
+    startOffset > start.text.length ||
+    endOffset < 0 ||
+    endOffset > end.text.length ||
+    (startIndex > endIndex || (startIndex === endIndex && startOffset >= endOffset))
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "markdown-selection-v1",
+    start: { ref: startRef, offset: startOffset },
+    end: { ref: endRef, offset: endOffset },
+  };
+}
+
+export function markdownFeedbackWitness(
+  sourceMap: MarkdownSourceMapV1,
+  anchor: MarkdownFeedbackAnchor,
+): Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }> | undefined {
+  const boundary = (offset: number, end: boolean) => {
+    const segment = sourceMap.segments.find((segment) => end
+      ? segment.sourceStart.offset < offset && offset <= segment.sourceEnd.offset
+      : segment.sourceStart.offset <= offset && offset < segment.sourceEnd.offset);
+    if (!segment) return undefined;
+    if (segment.mapping === "atomic" &&
+        offset !== segment.sourceStart.offset && offset !== segment.sourceEnd.offset) {
+      return undefined;
+    }
+    return {
+      ref: segment.ref,
+      offset: segment.mapping === "identity"
+        ? offset - segment.sourceStart.offset
+        : offset === segment.sourceStart.offset ? 0 : segment.text.length,
+    };
+  };
+  const start = boundary(anchor.start.offset, false);
+  const end = boundary(anchor.end.offset, true);
+  return start && end
+    ? markdownSelectionWitness(sourceMap, start.ref, start.offset, end.ref, end.offset)
+    : undefined;
+}
+
+export function loadDocumentFeedbackDraft(
+  storage: ReviewDraftStorage,
+  document: Pick<WebDocument, "id" | "revision">,
+): WebDocumentFeedbackDraft {
+  const empty = { generalMessage: "", comments: [] };
+  try {
+    const raw = storage.getItem(documentFeedbackDraftStorageKey(document));
+    if (raw === null) return empty;
+    const value: unknown = JSON.parse(raw);
+    if (
+      !isRecord(value) ||
+      !hasOnlyKeys(value, ["version", "documentId", "documentRevision", "generalMessage", "comments"]) ||
+      value.version !== 1 ||
+      value.documentId !== document.id ||
+      value.documentRevision !== document.revision ||
+      typeof value.generalMessage !== "string" ||
+      value.generalMessage.length > 16 * 1024 ||
+      !isSafeReviewMessage(value.generalMessage) ||
+      !Array.isArray(value.comments) ||
+      value.comments.length > 32 ||
+      !value.comments.every(isStoredDocumentFeedbackComment)
+    ) return empty;
+    return {
+      generalMessage: value.generalMessage,
+      comments: value.comments.map((comment) => ({ ...comment })),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function persistDocumentFeedbackDraft(
+  storage: ReviewDraftStorage,
+  document: Pick<WebDocument, "id" | "revision">,
+  draft: WebDocumentFeedbackDraft,
+): void {
+  const key = documentFeedbackDraftStorageKey(document);
+  if (draft.generalMessage === "" && draft.comments.length === 0) {
+    storage.removeItem(key);
+    return;
+  }
+  storage.setItem(key, JSON.stringify({
+    version: 1,
+    documentId: document.id,
+    documentRevision: document.revision,
+    generalMessage: draft.generalMessage,
+    comments: draft.comments,
+  }));
+}
+
+function isStoredDocumentFeedbackComment(
+  value: unknown,
+): value is WebFeedbackCommentDraft {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["id", "intent", "anchor", "label", "message"]) ||
+    typeof value.id !== "string" ||
+    !/^comment-[a-f0-9]{20}$/.test(value.id) ||
+    (value.intent !== "feedback" && value.intent !== "todo") ||
+    typeof value.label !== "string" ||
+    value.label.length > 512 ||
+    typeof value.message !== "string" ||
+    value.message.trim() === "" ||
+    value.message.length > 512 ||
+    !isSafeReviewMessage(value.message) ||
+    !isRecord(value.anchor)
+  ) return false;
+  const anchor = value.anchor;
+  if (anchor.kind === "markdown-selection-v1") {
+    return isStoredSelectionBoundary(anchor.start) &&
+      isStoredSelectionBoundary(anchor.end) &&
+      hasOnlyKeys(anchor, ["kind", "start", "end"]);
+  }
+  if (anchor.kind === "diff-file-v1") {
+    return hasOnlyKeys(anchor, ["kind", "path"]) &&
+      typeof anchor.path === "string" && isSafeReviewPath(anchor.path);
+  }
+  return anchor.kind === "diff-lines-v1" &&
+    hasOnlyKeys(anchor, ["kind", "path", "hunkId", "side", "line", "endLine"]) &&
+    typeof anchor.path === "string" && isSafeReviewPath(anchor.path) &&
+    typeof anchor.hunkId === "string" && /^hunk-[a-f0-9]{20}$/.test(anchor.hunkId) &&
+    (anchor.side === "old" || anchor.side === "new") &&
+    typeof anchor.line === "number" && Number.isSafeInteger(anchor.line) && anchor.line > 0 &&
+    (anchor.endLine === undefined ||
+      (typeof anchor.endLine === "number" && Number.isSafeInteger(anchor.endLine) && anchor.endLine > anchor.line));
+}
+
+function isStoredSelectionBoundary(value: unknown): boolean {
+  return isRecord(value) && hasOnlyKeys(value, ["ref", "offset"]) &&
+    typeof value.ref === "string" && /^m1-s[1-9][0-9]*$/.test(value.ref) &&
+    typeof value.offset === "number" && Number.isSafeInteger(value.offset) && value.offset >= 0;
+}
+
+function isStoredReviewFeedbackItem(
+  value: unknown,
+): value is ReviewFeedbackItem {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "id",
+      "kind",
+      "path",
+      "hunkId",
+      "line",
+      "endLine",
+      "side",
+      "message",
+    ]) ||
+    typeof value.id !== "string" ||
+    !/^feedback-[a-f0-9]{20}$/.test(value.id) ||
+    (value.kind !== "feedback" && value.kind !== "todo") ||
+    typeof value.path !== "string" ||
+    !isSafeReviewPath(value.path) ||
+    typeof value.message !== "string" ||
+    value.message.trim() === "" ||
+    value.message.length > 512 ||
+    !isSafeReviewMessage(value.message) ||
+    (value.hunkId !== undefined &&
+      (typeof value.hunkId !== "string" ||
+        !/^hunk-[a-f0-9]{20}$/.test(value.hunkId))) ||
+    (value.line !== undefined &&
+      (typeof value.line !== "number" ||
+        !Number.isSafeInteger(value.line) ||
+        value.line <= 0)) ||
+    (value.endLine !== undefined &&
+      (typeof value.endLine !== "number" ||
+        !Number.isSafeInteger(value.endLine) ||
+        value.endLine <= 0)) ||
+    (value.side !== undefined && value.side !== "old" && value.side !== "new") ||
+    ((value.line === undefined) !== (value.side === undefined)) ||
+    (value.endLine !== undefined &&
+      (value.line === undefined || value.endLine <= value.line)) ||
+    (value.line !== undefined && value.hunkId === undefined) ||
+    (value.kind === "todo" &&
+      (value.hunkId !== undefined ||
+        value.line !== undefined ||
+        value.endLine !== undefined ||
+        value.side !== undefined))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isSafeReviewMessage(value: string): boolean {
+  return !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+
+function isSafeReviewPath(value: string): boolean {
+  if (
+    value === "" ||
+    value.length > 1_024 ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return false;
+  }
+  return value
+    .replaceAll("\\", "/")
+    .split("/")
+    .every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
+
+export async function renderMermaidNodes(
+  renderer: WebMermaidRenderer,
+  nodes: Element[],
+  onError: (node: Element, error: unknown) => void,
+  fontsReady: PromiseLike<unknown> = Promise.resolve(),
+): Promise<void> {
+  await fontsReady;
+  for (const node of nodes) {
+    try {
+      await renderer.run({ nodes: [node] });
+    } catch (error) {
+      onError(node, error);
+    }
+  }
+}
+
+export function mermaidErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "object" && error !== null) {
+    if (
+      "message" in error &&
+      typeof error.message === "string" &&
+      error.message.trim() !== ""
+    ) {
+      return error.message;
+    }
+    if (
+      "str" in error &&
+      typeof error.str === "string" &&
+      error.str.trim() !== ""
+    ) {
+      return error.str;
+    }
+  }
+  return String(error);
+}
+
+export async function withVisibleMermaidLayout(
+  container: HTMLElement,
+  operation: () => Promise<void>,
+): Promise<void> {
+  const wasHidden = container.hasAttribute("hidden");
+  if (!wasHidden) {
+    await operation();
+    return;
+  }
+  const previousVisibility = container.style.visibility;
+  container.style.visibility = "hidden";
+  container.removeAttribute("hidden");
+  try {
+    await operation();
+  } finally {
+    container.setAttribute("hidden", "");
+    container.style.visibility = previousVisibility;
+  }
 }
 
 export function queueCounts(
@@ -561,14 +1426,17 @@ export function groupQueue(
     const names = new Map(workspaces.map(({ id, name }) => [id, name]));
     const groups = new Map<string, WebDocumentGroup>();
     for (const document of documents) {
-      let group = groups.get(document.workspaceId);
+      const projectId = document.projectId ?? document.workspaceId;
+      let group = groups.get(projectId);
       if (!group) {
         group = {
-          key: `project:${document.workspaceId}`,
-          label: names.get(document.workspaceId) ?? document.workspaceId,
+          key: `project:${projectId}`,
+          label: document.projectName ??
+            names.get(document.workspaceId) ??
+            document.workspaceId,
           documents: [],
         };
-        groups.set(document.workspaceId, group);
+        groups.set(projectId, group);
       }
       group.documents.push(document);
     }
@@ -608,20 +1476,56 @@ export function groupQueue(
 export function visibleWorkspaces(
   documents: WebDocument[],
   workspaces: WebWorkspace[],
+  includeArchived = false,
 ): WebWorkspace[] {
   const counts = new Map<string, number>();
+  const labels = new Map<string, string>();
+  const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
   for (const document of documents) {
-    if (document.archivedAt === null) {
+    if (includeArchived || document.archivedAt === null) {
+      const projectId = document.projectId ?? document.workspaceId;
       counts.set(
-        document.workspaceId,
-        (counts.get(document.workspaceId) ?? 0) + 1,
+        projectId,
+        (counts.get(projectId) ?? 0) + 1,
+      );
+      labels.set(
+        projectId,
+        document.projectName ??
+          workspaceNames.get(document.workspaceId) ??
+          document.workspaceId,
       );
     }
   }
-  return workspaces.flatMap((workspace) => {
-    const documentCount = counts.get(workspace.id) ?? 0;
-    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
-  });
+  return [...counts].map(([id, documentCount]) => ({
+    id,
+    name: labels.get(id) ?? id,
+    documentCount,
+    route: documents.some(({ projectId }) => projectId === id)
+      ? `/p/${id}`
+      : `/w/${id}`,
+  }));
+}
+
+function normalizedProjectSearch(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+export function filterProjectChoices(
+  projects: WebWorkspace[],
+  query: string,
+): WebWorkspace[] {
+  const needle = normalizedProjectSearch(query);
+  if (needle === "") {
+    return projects;
+  }
+  return projects.filter(({ name }) =>
+    normalizedProjectSearch(name).includes(needle)
+  );
 }
 
 export function isSourceMissing(document: WebDocument): boolean {
@@ -742,17 +1646,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  const allowed = new Set(keys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
 async function boot(): Promise<void> {
+  const initialQuery = workspaceQueryState(location.search);
   const state: WebState = {
     documents: [],
     reviewRequests: [],
+    selectedDocumentIds: new Set(),
     filters: {
       status: "all",
       workspaceId:
-        document.body.dataset.workspaceId === ""
-          ? undefined
-          : document.body.dataset.workspaceId,
+        document.body.dataset.projectId !== ""
+          ? document.body.dataset.projectId
+          : document.body.dataset.workspaceId === ""
+            ? undefined
+            : document.body.dataset.workspaceId,
       search: "",
+      contentMode: initialQuery.contentMode,
+      actionsOnly: initialQuery.actionsOnly,
     },
     grouping: queueGroupingPreference(
       localStorage.getItem("mdmaid-desk-queue-grouping"),
@@ -761,14 +1679,24 @@ async function boot(): Promise<void> {
       document.body.dataset.documentId === ""
         ? undefined
         : document.body.dataset.documentId,
+    selectedSpace: initialQuery.selectedSpace,
+    spaces: [],
     workspaces: [],
   };
 
-  const projectNav = element("project-nav");
+  const projectSelect = element("project-select") as HTMLInputElement;
+  const projectOptions = element("project-options");
+  const docsFilter = element("docs-filter") as HTMLButtonElement;
   const changeReviewsFilter = element("change-reviews-filter") as HTMLButtonElement;
+  const archiveFilter = element("archive-filter") as HTMLButtonElement;
   const changeReviewsCount = element("change-reviews-count");
   const actionsFilter = element("actions-filter") as HTMLButtonElement;
   const actionsCount = element("actions-count");
+  const pendingDecisions = element("pending-decisions");
+  const pendingDecisionsCount = element("pending-decisions-count");
+  const spaceSelect = element("space-select") as HTMLSelectElement;
+  const workspace = element("workspace");
+  const sidebar = element("sidebar");
   const queue = element("document-queue");
   const queueEyebrow = element("queue-eyebrow");
   const queueTitle = element("queue-title");
@@ -782,31 +1710,75 @@ async function boot(): Promise<void> {
   const changePosition = element("change-position");
   const changeFilePrevious = element("change-file-previous") as HTMLButtonElement;
   const changeFileNext = element("change-file-next") as HTMLButtonElement;
-  const changeHunkPrevious = element("change-hunk-previous") as HTMLButtonElement;
-  const changeHunkNext = element("change-hunk-next") as HTMLButtonElement;
   const changeLayout = element("change-layout") as HTMLButtonElement;
   const changeViewDiff = element("change-view-diff") as HTMLButtonElement;
   const changeViewDocument = element("change-view-document") as HTMLButtonElement;
   const readerToc = element("reader-toc");
   const readerTocList = element("reader-toc-list");
+  const contentsToggle = element("contents-toggle") as HTMLButtonElement;
+  const compactViewport = window.matchMedia("(max-width: 1024px)");
+  let contentsPreference: boolean | undefined;
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
+  const feedbackPanel = element("feedback-panel");
+  const feedbackGeneralMessage = element("feedback-general-message") as HTMLTextAreaElement;
+  const feedbackError = element("feedback-error");
+  const feedbackSend = element("feedback-send") as HTMLButtonElement;
+  const feedbackHistoryElement = element("feedback-history");
+  const feedbackAddSelection = element("document-feedback-add-selection") as HTMLButtonElement;
   const reviewPanel = element("review-panel");
   const reviewRequestMessage = element("review-request-message");
   const reviewStatus = element("review-status");
   const reviewResponse = element("review-response") as HTMLTextAreaElement;
+  const reviewFeedbackSection = element("review-feedback-section");
+  const reviewFeedbackList = element("review-feedback-list");
+  const reviewFeedbackComposer = element("review-feedback-composer");
+  const reviewFeedbackAnchor = element("review-feedback-anchor");
+  const reviewFeedbackMessage = element("review-feedback-message") as HTMLTextAreaElement;
+  const reviewFeedbackSave = element("review-feedback-save") as HTMLButtonElement;
+  const reviewFeedbackCancel = element("review-feedback-cancel") as HTMLButtonElement;
+  const reviewFeedbackError = element("review-feedback-error");
+  const markdownFeedbackPopup = document.createElement("div");
+  markdownFeedbackPopup.id = "document-feedback-popup";
+  markdownFeedbackPopup.className = "document-feedback-popup";
+  markdownFeedbackPopup.setAttribute("role", "dialog");
+  markdownFeedbackPopup.setAttribute("aria-label", "Comments on selected text");
+  markdownFeedbackPopup.hidden = true;
+  document.body.append(markdownFeedbackPopup);
   const reviewError = element("review-error");
   const reviewActions = element("review-actions");
   const reviewApprove = element("review-approve") as HTMLButtonElement;
   const reviewChanges = element("review-changes") as HTMLButtonElement;
   const reviewReject = element("review-reject") as HTMLButtonElement;
+  const reviewSupersede = element("review-supersede") as HTMLButtonElement;
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
+  const copyLink = element("copy-link") as HTMLButtonElement;
   const print = element("print") as HTMLButtonElement;
   const exportPdf = element("export-pdf") as HTMLButtonElement;
   const exportHtml = element("export-html") as HTMLButtonElement;
   const exportStatus = element("export-status");
   const empty = element("queue-empty");
+  const bulkActions = element("bulk-actions");
+  const selectVisible = element("select-visible") as HTMLButtonElement;
+  const selectionCount = element("selection-count");
+  const bulkArchive = element("bulk-archive") as HTMLButtonElement;
+  const bulkRestore = element("bulk-restore") as HTMLButtonElement;
+  const bulkPurge = element("bulk-purge") as HTMLButtonElement;
+  const queueError = element("queue-error");
+  const queueErrorTitle = element("queue-error-title");
+  const queueErrorGuidance = element("queue-error-guidance");
+  const archiveButton = element("archive") as HTMLButtonElement;
+  const restoreButton = element("restore") as HTMLButtonElement;
+  const purgeButton = element("purge") as HTMLButtonElement;
+  const actionDialog = element("document-action-dialog") as HTMLDialogElement;
+  const actionDialogTitle = element("document-action-title");
+  const actionDialogMessage = element("document-action-message");
+  const actionCancel = element("document-action-cancel") as HTMLButtonElement;
+  const actionConfirm = element("document-action-confirm") as HTMLButtonElement;
+  const archiveUndo = element("archive-undo");
+  const archiveUndoMessage = element("archive-undo-message");
+  const archiveUndoButton = element("archive-undo-button") as HTMLButtonElement;
   const search = element("search") as HTMLInputElement;
   const live = element("live-status");
   const statusButtons = Array.from(
@@ -816,12 +1788,29 @@ async function boot(): Promise<void> {
     document.querySelectorAll<HTMLButtonElement>("[data-grouping]"),
   );
   let renderedRevision: number | undefined;
+  let renderedSourceWitness: string | undefined;
+  let feedbackDraftRevision: number | undefined;
   let renderedChangeReview: ChangeReviewDiff | undefined;
+  let renderedSourceMap: MarkdownSourceMapV1 | undefined;
   let changeFileIndex = 0;
-  let changeHunkIndex = 0;
   let changeReviewLayout: "unified" | "side-by-side" = "side-by-side";
   let changeReviewView: "diff" | "document" = "diff";
+  let feedbackComments: WebFeedbackCommentDraft[] = [];
+  let feedbackHistory: PublicFeedbackSubmission[] = [];
+  let feedbackDraft: WebFeedbackDraftAnchor | undefined;
+  let feedbackRangeStart: WebFeedbackAnchor | undefined;
+  let feedbackEditingId: string | undefined;
+  let selectedMarkdownWitness:
+    | Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>
+    | undefined;
+  let selectedMarkdownLabel = "";
+  let markdownPopupMarker: HTMLButtonElement | undefined;
+  let markdownPopupFocused = false;
+  let markdownPopupTimer: ReturnType<typeof setTimeout> | undefined;
+  let markdownFeedbackSignature = "";
+  let activeReviewDraftId: string | undefined;
   let renderSequence = 0;
+  let loadSequence = 0;
   let catalogRefresh = Promise.resolve();
   let readerReady = false;
   let exportBusy = false;
@@ -870,9 +1859,55 @@ async function boot(): Promise<void> {
       updateExportAvailability();
     }
   }
+  let projectPickerOpen = false;
+  let highlightedProjectIndex = -1;
+  let displayedProjectChoices: Array<WebWorkspace | undefined> = [];
+  let pendingMutation: { action: "archive" | "purge"; ids: string[] } | undefined;
+  let lastArchivedIds: string[] = [];
 
-  async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetch(path, {
+  function scopedPath(path: string): string {
+    const url = new URL(path, location.origin);
+    if (state.selectedSpace !== undefined) {
+      url.searchParams.set("space", state.selectedSpace);
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  }
+
+  function currentRoute(route = location.pathname): string {
+    return workspaceRouteWithState(route, {
+      selectedSpace: state.selectedSpace,
+      contentMode: state.filters.contentMode ?? "docs",
+      actionsOnly: state.filters.actionsOnly === true,
+    });
+  }
+
+  function currentProjectRoute(): string {
+    return projectQueueRoute(
+      state.filters.workspaceId,
+      [
+        ...currentVisibleWorkspaces(),
+        ...state.workspaces,
+      ],
+    );
+  }
+
+  function currentVisibleWorkspaces(
+    documents: WebDocument[] = state.documents,
+    workspaces: WebWorkspace[] = state.workspaces,
+  ): WebWorkspace[] {
+    return visibleWorkspaces(
+      documents,
+      workspaces,
+      state.filters.contentMode === "archive",
+    );
+  }
+
+  async function api<T>(
+    path: string,
+    init: RequestInit = {},
+    scoped = true,
+  ): Promise<T> {
+    const response = await fetch(scoped ? scopedPath(path) : path, {
       ...init,
       headers: {
         ...(init.body === undefined ? {} : { "content-type": "application/json" }),
@@ -891,90 +1926,199 @@ async function boot(): Promise<void> {
     return body.data;
   }
 
-  function renderProjects(): void {
-    projectNav.replaceChildren();
-    const ordinaryDocuments = state.documents.filter(
-      ({ kind }) => kind !== "change-review",
-    );
-    const workspaces = visibleWorkspaces(ordinaryDocuments, state.workspaces);
-    if (
-      state.filters.workspaceId !== undefined &&
-      !workspaces.some(({ id }) => id === state.filters.workspaceId)
-    ) {
-      state.filters.workspaceId = undefined;
+  function projectInventory(): WebWorkspace[] {
+    const selected = state.filters.workspaceId ?? "";
+    const projects = currentVisibleWorkspaces();
+    if (selected !== "" && !projects.some(({ id }) => id === selected)) {
+      const selectedProject = state.workspaces.find(({ id }) => id === selected);
+      projects.push({
+        id: selected,
+        name: selectedProject?.name ?? selected,
+        documentCount: 0,
+        route: selectedProject?.route ?? `/p/${selected}`,
+      });
     }
-    const all = projectButton("all projects", ordinaryDocuments.length, undefined);
-    projectNav.append(all);
-    for (const workspace of workspaces) {
-      projectNav.append(
-        projectButton(
-          workspace.name,
-          workspace.documentCount,
-          workspace.id,
-        ),
+    return projects;
+  }
+
+  function projectChoiceLabel(project?: WebWorkspace): string {
+    return project === undefined
+      ? `All projects (${state.documents.length})`
+      : `${project.name} (${project.documentCount})`;
+  }
+
+  function syncProjectSelectionLabel(projects = projectInventory()): void {
+    const selected = state.filters.workspaceId;
+    const project = selected === undefined
+      ? undefined
+      : projects.find(({ id }) => id === selected);
+    projectSelect.value = projectChoiceLabel(project);
+    projectSelect.dataset.projectId = selected ?? "";
+  }
+
+  function highlightProjectChoice(index: number): void {
+    if (displayedProjectChoices.length === 0) {
+      highlightedProjectIndex = -1;
+      projectSelect.removeAttribute("aria-activedescendant");
+      return;
+    }
+    highlightedProjectIndex =
+      (index + displayedProjectChoices.length) % displayedProjectChoices.length;
+    const options = Array.from(
+      projectOptions.querySelectorAll<HTMLElement>("[role=option]"),
+    );
+    for (const [optionIndex, option] of options.entries()) {
+      option.classList.toggle(
+        "highlighted",
+        optionIndex === highlightedProjectIndex,
       );
     }
-    const pendingCount = state.reviewRequests.filter(
-      ({ status }) => status === "pending",
-    ).length;
-    actionsCount.textContent = String(pendingCount);
-    actionsFilter.classList.toggle("active", state.filters.actionsOnly === true);
-    const reviewCount = state.documents.filter(
-      ({ archivedAt, kind }) => archivedAt === null && kind === "change-review",
+    const highlighted = options[highlightedProjectIndex];
+    if (highlighted) {
+      projectSelect.setAttribute("aria-activedescendant", highlighted.id);
+      highlighted.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function renderProjectOptions(query: string): void {
+    const projects = projectInventory();
+    const normalizedQuery = normalizedProjectSearch(query);
+    const includeAll = normalizedQuery === "" ||
+      normalizedProjectSearch("All projects").includes(normalizedQuery);
+    displayedProjectChoices = [
+      ...(includeAll ? [undefined] : []),
+      ...filterProjectChoices(projects, query),
+    ];
+    projectOptions.replaceChildren();
+    for (const [index, project] of displayedProjectChoices.entries()) {
+      const option = document.createElement("span");
+      option.id = `project-option-${index}`;
+      option.className = "project-option";
+      option.setAttribute("role", "option");
+      option.setAttribute(
+        "aria-selected",
+        String((project?.id ?? "") === (state.filters.workspaceId ?? "")),
+      );
+      option.dataset.projectId = project?.id ?? "";
+      option.textContent = projectChoiceLabel(project);
+      option.addEventListener("pointerdown", (event) => event.preventDefault());
+      option.addEventListener("click", () => selectProjectChoice(project));
+      projectOptions.append(option);
+    }
+    if (displayedProjectChoices.length === 0) {
+      const message = document.createElement("span");
+      message.className = "project-options-empty";
+      message.textContent = "No matching projects";
+      projectOptions.append(message);
+    }
+    highlightProjectChoice(displayedProjectChoices.length === 0 ? -1 : 0);
+  }
+
+  function openProjectPicker(): void {
+    projectPickerOpen = true;
+    projectSelect.value = "";
+    projectSelect.setAttribute("aria-expanded", "true");
+    projectOptions.removeAttribute("hidden");
+    renderProjectOptions("");
+  }
+
+  function closeProjectPicker(): void {
+    projectPickerOpen = false;
+    displayedProjectChoices = [];
+    highlightedProjectIndex = -1;
+    projectSelect.setAttribute("aria-expanded", "false");
+    projectSelect.removeAttribute("aria-activedescendant");
+    projectOptions.setAttribute("hidden", "");
+    syncProjectSelectionLabel();
+  }
+
+  function selectProjectChoice(selected?: WebWorkspace): void {
+    const selection = projectQueueSelection(state.filters, selected);
+    state.filters = selection.filters;
+    state.selectedDocumentIds.clear();
+    closeProjectPicker();
+    closeReader(false);
+    history.pushState({}, "", currentRoute(selection.route));
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  function renderProjects(): void {
+    if (projectPickerOpen) {
+      renderProjectOptions(projectSelect.value);
+    } else {
+      syncProjectSelectionLabel();
+    }
+    const reviewCount = filterQueue(
+      state.documents,
+      {
+        contentMode: "change-reviews",
+        workspaceId: state.filters.workspaceId,
+        status: "all",
+      },
+      state.reviewRequests,
     ).length;
     changeReviewsCount.textContent = String(reviewCount);
     changeReviewsFilter.classList.toggle(
       "active",
-      state.filters.changeReviewsOnly === true,
+      state.filters.contentMode === "change-reviews",
     );
-  }
-
-  function projectButton(
-    name: string,
-    count: number,
-    workspaceId: string | undefined,
-  ): HTMLButtonElement {
-    const button = document.createElement("button");
-    button.className = "project-button";
-    if (
-      state.filters.workspaceId === workspaceId &&
-      state.filters.changeReviewsOnly !== true &&
-      state.filters.actionsOnly !== true
-    ) {
-      button.classList.add("active");
-    }
-    button.type = "button";
-    const label = document.createElement("span");
-    label.textContent = name;
-    const badge = document.createElement("span");
-    badge.className = "count";
-    badge.textContent = String(count);
-    button.append(label, badge);
-    button.addEventListener("click", () => {
-      state.filters.workspaceId = workspaceId;
-      state.filters.actionsOnly = false;
-      state.filters.changeReviewsOnly = false;
-      render();
-    });
-    return button;
+    docsFilter.classList.toggle("active", state.filters.contentMode === "docs");
+    archiveFilter.classList.toggle(
+      "active",
+      state.filters.contentMode === "archive",
+    );
+    changeReviewsFilter.setAttribute(
+      "aria-pressed",
+      String(state.filters.contentMode === "change-reviews"),
+    );
+    docsFilter.setAttribute(
+      "aria-pressed",
+      String(state.filters.contentMode === "docs"),
+    );
+    archiveFilter.setAttribute(
+      "aria-pressed",
+      String(state.filters.contentMode === "archive"),
+    );
   }
 
   function renderStatusCounts(): void {
     const source = filterQueue(state.documents, {
       workspaceId: state.filters.workspaceId,
       status: "all",
-      actionsOnly: state.filters.actionsOnly,
+      actionsOnly: false,
       changeReviewsOnly: state.filters.changeReviewsOnly,
+      contentMode: state.filters.contentMode,
     }, state.reviewRequests);
     const counts = queueCounts(source);
+    const pendingCount = filterQueue(state.documents, {
+      workspaceId: state.filters.workspaceId,
+      status: "all",
+      actionsOnly: true,
+      contentMode: state.filters.contentMode,
+    }, state.reviewRequests).length;
+    actionsCount.textContent = String(pendingCount);
+    actionsFilter.classList.toggle("active", state.filters.actionsOnly === true);
+    actionsFilter.setAttribute(
+      "aria-pressed",
+      String(state.filters.actionsOnly === true),
+    );
     for (const button of statusButtons) {
       const status = button.dataset.statusFilter as keyof typeof counts;
-      button.classList.toggle("active", state.filters.status === status);
+      const active = state.filters.actionsOnly !== true && state.filters.status === status;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
       const count = button.querySelector(".count");
       if (count) {
         count.textContent = String(counts[status]);
       }
     }
+  }
+
+  function renderPendingDecisions(): void {
+    const count = pendingDecisionCount(state.reviewRequests);
+    pendingDecisionsCount.textContent = String(count);
+    pendingDecisions.toggleAttribute("hidden", count === 0);
   }
 
   function renderQueue(): void {
@@ -984,11 +2128,25 @@ async function boot(): Promise<void> {
       state.filters,
       state.reviewRequests,
     );
-    const changes = state.filters.changeReviewsOnly === true;
-    queueEyebrow.textContent = changes
-      ? "implementation review workspace"
-      : "persistent reading queue";
-    queueTitle.textContent = changes ? "Change Reviews" : "What needs your eyes?";
+    const changes = state.filters.contentMode === "change-reviews";
+    const archived = state.filters.contentMode === "archive";
+    queueEyebrow.textContent = archived
+      ? "reversible document storage"
+      : changes
+        ? "implementation review workspace"
+        : "persistent reading queue";
+    queueTitle.textContent = archived
+      ? "Archive"
+      : changes
+        ? "Change Reviews"
+        : "What needs your eyes?";
+    const visibleIds = new Set(documents.map(({ id }) => id));
+    for (const id of state.selectedDocumentIds) {
+      if (!visibleIds.has(id)) {
+        state.selectedDocumentIds.delete(id);
+      }
+    }
+    renderBulkActions(documents);
     empty.toggleAttribute("hidden", documents.length !== 0);
     for (const group of groupQueue(documents, state.grouping, state.workspaces)) {
       const grid = document.createElement("div");
@@ -1014,7 +2172,48 @@ async function boot(): Promise<void> {
     }
   }
 
-  function documentCard(item: WebDocument): HTMLButtonElement {
+  function renderBulkActions(documents: WebDocument[]): void {
+    bulkActions.toggleAttribute("hidden", documents.length === 0);
+    const selectedCount = state.selectedDocumentIds.size;
+    const allSelected = documents.length > 0 &&
+      documents.every(({ id }) => state.selectedDocumentIds.has(id));
+    selectVisible.textContent = allSelected
+      ? "clear selection"
+      : state.filters.workspaceId === undefined
+        ? "select all visible"
+        : "select all in project";
+    selectionCount.textContent = `${selectedCount} selected`;
+    bulkArchive.disabled = selectedCount === 0;
+    bulkRestore.disabled = selectedCount === 0;
+    bulkPurge.disabled = selectedCount === 0;
+    bulkArchive.toggleAttribute("hidden", state.filters.contentMode === "archive");
+    bulkRestore.toggleAttribute("hidden", state.filters.contentMode !== "archive");
+  }
+
+  function documentCard(item: WebDocument): HTMLElement {
+    const shell = document.createElement("article");
+    shell.className = "document-card-shell";
+    const selector = document.createElement("label");
+    selector.className = "document-selector";
+    selector.title = `Select ${item.title}`;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = state.selectedDocumentIds.has(item.id);
+    checkbox.setAttribute("aria-label", `Select ${item.title}`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        state.selectedDocumentIds.add(item.id);
+      } else {
+        state.selectedDocumentIds.delete(item.id);
+      }
+      renderBulkActions(filterQueue(
+        state.documents,
+        state.filters,
+        state.reviewRequests,
+      ));
+    });
+    selector.append(checkbox);
+
     const card = document.createElement("button");
     card.type = "button";
     card.className = `document-card status-${item.status}`;
@@ -1030,7 +2229,7 @@ async function boot(): Promise<void> {
     const context = document.createElement("span");
     context.className = "card-context";
     context.textContent = [
-      item.workspaceId,
+      item.projectName ?? item.workspaceId,
       item.taskId,
       item.kind,
       sourceModeLabel(item.storage),
@@ -1070,7 +2269,8 @@ async function boot(): Promise<void> {
 
     card.append(top, title, detail, tags);
     card.addEventListener("click", () => void openDocument(item.id));
-    return card;
+    shell.append(selector, card);
+    return shell;
   }
 
   function renderGroupingControls(): void {
@@ -1081,16 +2281,56 @@ async function boot(): Promise<void> {
     }
   }
 
+  function renderReaderLayout(): void {
+    const readerOpen = state.selectedId !== undefined;
+    const hasContents =
+      readerOpen && !readerToc.hidden && readerTocList.childElementCount > 0;
+    const contentsOpen =
+      hasContents && (contentsPreference ?? !compactViewport.matches);
+    workspace.classList.toggle("reader-open", readerOpen);
+    workspace.classList.toggle("contents-open", contentsOpen);
+    sidebar.toggleAttribute("hidden", !contentsOpen);
+    contentsToggle.toggleAttribute("hidden", !hasContents);
+    contentsToggle.setAttribute("aria-expanded", String(contentsOpen));
+    contentsToggle.textContent = contentsOpen ? "hide contents" : "show contents";
+  }
+
+  contentsToggle.addEventListener("click", () => {
+    contentsPreference = sidebar.hidden;
+    renderReaderLayout();
+  });
+  compactViewport.addEventListener("change", renderReaderLayout);
+  const topbar = document.querySelector<HTMLElement>(".topbar");
+  const readerToolbar = document.querySelector<HTMLElement>(".reader-toolbar");
+  if (topbar) {
+    const observer = new ResizeObserver(() => {
+      document.documentElement.style.setProperty(
+        "--topbar-height",
+        `${Math.ceil(topbar.getBoundingClientRect().height)}px`,
+      );
+      if (readerToolbar) {
+        document.documentElement.style.setProperty(
+          "--reader-toolbar-height",
+          `${Math.ceil(readerToolbar.getBoundingClientRect().height)}px`,
+        );
+      }
+    });
+    observer.observe(topbar);
+    if (readerToolbar) observer.observe(readerToolbar);
+  }
+
   function render(): void {
+    renderReaderLayout();
     renderProjects();
     renderStatusCounts();
+    renderPendingDecisions();
     renderGroupingControls();
     renderQueue();
   }
 
   function renderDocumentOutline(): void {
     readerTocList.replaceChildren();
-    const outline = documentOutline(
+    const outline = readerContent.classList.contains("source-missing") ? [] : documentOutline(
       Array.from(
         readerContent.querySelectorAll<HTMLElement>(
           "h1, h2, h3, h4, h5, h6",
@@ -1114,30 +2354,206 @@ async function boot(): Promise<void> {
       entry.append(link);
       readerTocList.append(entry);
     }
+    renderReaderLayout();
   }
 
-  async function load(openSelected = true): Promise<void> {
-    const [documents, workspaces, reviewRequests] = await Promise.all([
-      api<WebDocument[]>("/api/v1/documents"),
-      api<WebWorkspace[]>("/api/v1/workspaces"),
-      api<WebReviewRequest[]>("/api/v1/review-requests"),
-    ]);
+  async function load(
+    openSelected = true,
+    clearBeforeLoad = true,
+  ): Promise<boolean> {
+    const sequence = ++loadSequence;
+    renderSequence += 1;
+    if (clearBeforeLoad) {
+      state.documents = [];
+      state.workspaces = [];
+      state.reviewRequests = [];
+      state.selectedDocumentIds.clear();
+      readerContent.replaceChildren();
+      reader.setAttribute("hidden", "");
+      queuePanel.removeAttribute("hidden");
+      render();
+    }
+    const routedFeedbackId = document.body.dataset.feedbackId;
+    if (state.selectedId === undefined && routedFeedbackId) {
+      const submission = await api<PublicFeedbackSubmission>(
+        `/api/v1/feedback/${routedFeedbackId}`,
+      );
+      state.selectedId = submission.documentId;
+      feedbackHistory = [submission];
+    }
+    let loaded: [WebDocument[], WebWorkspace[], WebReviewRequest[], PublicSpace[]];
+    try {
+      const documentsPath = state.filters.contentMode === "archive"
+        ? "/api/v1/documents?archived=true"
+        : "/api/v1/documents";
+      loaded = await Promise.all([
+        api<WebDocument[]>(documentsPath),
+        api<WebWorkspace[]>("/api/v1/workspaces"),
+        api<WebReviewRequest[]>("/api/v1/review-requests"),
+        api<PublicSpace[]>("/api/v1/spaces", {}, false),
+      ]);
+    } catch (error) {
+      if (sequence !== loadSequence) {
+        return false;
+      }
+      throw error;
+    }
+    if (sequence !== loadSequence) {
+      return false;
+    }
+    const [documents, workspaces, reviewRequests, spaces] = loaded;
     state.documents = documents;
     state.workspaces = workspaces;
     state.reviewRequests = reviewRequests;
+    state.spaces = spaces;
+    renderSpaceOptions();
+    const navigationWorkspaces = currentVisibleWorkspaces(documents, workspaces);
+    if (
+      state.filters.workspaceId !== undefined &&
+      !navigationWorkspaces.some(({ id }) => id === state.filters.workspaceId) &&
+      !workspaces.some(({ id }) => id === state.filters.workspaceId)
+    ) {
+      state.filters.workspaceId = undefined;
+    }
+    const selectedDocument = state.selectedId === undefined
+      ? undefined
+      : documents.find(({ id }) => id === state.selectedId);
+    if (selectedDocument) {
+      state.filters.contentMode = selectedDocument.archivedAt !== null
+        ? "archive"
+        : selectedDocument.kind === "change-review"
+          ? "change-reviews"
+          : "docs";
+      state.filters.changeReviewsOnly =
+        state.filters.contentMode === "change-reviews";
+      history.replaceState(
+        history.state,
+        "",
+        currentRoute(location.pathname),
+      );
+    }
+    if (openSelected) {
+      const visible = currentVisibleWorkspaces(
+        state.documents.filter(({ kind }) => kind !== "change-review"),
+      );
+      const queueWorkspaces = [...visible, ...state.workspaces];
+      const selection = state.selectedId
+        ? projectQueueSelectionForReaderHistory(
+            state.filters,
+            history.state,
+            queueWorkspaces,
+          )
+        : projectQueueSelectionForRoute(
+            state.filters,
+            location.pathname,
+            queueWorkspaces,
+            history.state,
+          );
+      if (selection) {
+        state.filters = selection.filters;
+        if (!state.selectedId && selection.route !== location.pathname) {
+          history.replaceState(queueHistoryState(selection.filters), "", currentRoute(selection.route));
+        }
+      } else if (state.selectedId) {
+        history.replaceState(
+          documentHistoryState(state.selectedId, state.filters, queueWorkspaces),
+          "",
+          currentRoute(location.pathname),
+        );
+      }
+    }
+    try {
+      cleanupReviewDrafts(
+        localStorage,
+        new Set(
+          reviewRequests
+            .filter(({ status }) => status !== "pending")
+            .map(({ id }) => id),
+        ),
+      );
+    } catch {
+      // An unavailable browser store must not block loading the workspace.
+    }
     render();
     if (openSelected && state.selectedId) {
       await openDocument(state.selectedId, false);
     } else if (state.selectedId) {
       renderReviewPanel(state.selectedId);
     }
+    return true;
+  }
+
+  function renderSpaceOptions(): void {
+    const selected = state.selectedSpace ?? "";
+    spaceSelect.replaceChildren();
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "All";
+    spaceSelect.append(all);
+    for (const space of state.spaces) {
+      const option = document.createElement("option");
+      option.value = space.id;
+      option.textContent = space.name;
+      spaceSelect.append(option);
+    }
+    if (
+      selected !== "" &&
+      !state.spaces.some(({ id }) => id === selected)
+    ) {
+      const unavailable = document.createElement("option");
+      unavailable.value = selected;
+      unavailable.textContent = `${selected} (unavailable)`;
+      unavailable.disabled = true;
+      spaceSelect.append(unavailable);
+    }
+    spaceSelect.value = selected;
+  }
+
+  function selectedSpaceLabel(): string {
+    if (state.selectedSpace === undefined) {
+      return "All spaces";
+    }
+    return state.spaces.find(({ id }) => id === state.selectedSpace)?.name ??
+      state.selectedSpace;
+  }
+
+  function setLiveStatus(status: string, offline = false): void {
+    live.textContent = `${offline ? "○" : "●"} ${selectedSpaceLabel()}: ${status}`;
+    live.classList.toggle("offline", offline);
+  }
+
+  async function failClosedLoad(error: unknown): Promise<void> {
+    state.documents = [];
+    state.workspaces = [];
+    state.reviewRequests = [];
+    closeReader(false);
+    let selectedSpaceMissing =
+      error instanceof WebApiError && error.code === "space_not_found";
+    if (state.selectedSpace !== undefined) {
+      try {
+        state.spaces = await api<PublicSpace[]>("/api/v1/spaces", {}, false);
+        selectedSpaceMissing = !state.spaces.some(
+          ({ id }) => id === state.selectedSpace,
+        );
+        renderSpaceOptions();
+      } catch {
+        // Preserve the fail-closed content state even if inventory reload fails.
+      }
+    }
+    render();
+    setLiveStatus(
+      selectedSpaceMissing
+        ? "space no longer exists"
+        : "unavailable",
+      true,
+    );
   }
 
   function renderReaderMetadata(selected: WebDocument | undefined): void {
     readerTitle.textContent = selected?.title ?? "Document";
     readerMeta.textContent = selected
       ? [
-          selected.workspaceId,
+          selected.projectName ?? selected.workspaceId,
           selected.taskId,
           selected.kind,
           sourceModeLabel(selected.storage),
@@ -1148,6 +2564,583 @@ async function boot(): Promise<void> {
     readerEyebrow.textContent = selected?.kind === "change-review"
       ? "change review"
       : "document";
+    const archived = selected?.archivedAt !== null && selected !== undefined;
+    archiveButton.toggleAttribute("hidden", archived);
+    restoreButton.toggleAttribute("hidden", !archived);
+    markRead.toggleAttribute("hidden", archived);
+    markUnread.toggleAttribute("hidden", archived);
+  }
+
+  function openFeedbackComposer(
+    anchor: WebFeedbackDraftAnchor,
+    item?: WebFeedbackCommentDraft | ReviewFeedbackItem,
+    rangeStart?: WebFeedbackAnchor,
+    preserveMessage = false,
+    label?: string,
+  ): void {
+    if (!state.selectedId) return;
+    const storedItem = item && "anchor" in item
+      ? item
+      : item
+        ? feedbackComments.find(({ id }) =>
+            id === item.id.replace(/^feedback-/, "comment-"))
+        : undefined;
+    closeMarkdownFeedbackPopup();
+    reviewFeedbackError.textContent = "";
+    feedbackDraft = anchor;
+    feedbackRangeStart = rangeStart ?? (isMarkdownFeedbackAnchor(anchor)
+      ? undefined
+      : anchor);
+    if (!preserveMessage) {
+      feedbackEditingId = storedItem?.id;
+    }
+    const anchorLabel = label ?? storedItem?.label ??
+      (isMarkdownFeedbackAnchor(anchor) ? "selected document text" : feedbackAnchorLabel(anchor));
+    reviewFeedbackAnchor.textContent = `Feedback on ${anchorLabel}`;
+    if (!preserveMessage) {
+      reviewFeedbackMessage.value = storedItem?.message ?? "";
+    }
+    reviewFeedbackSave.textContent = feedbackEditingId
+      ? "update feedback"
+      : "save feedback";
+    reviewFeedbackComposer.removeAttribute("hidden");
+    renderChangeReview();
+    const range = isMarkdownFeedbackAnchor(anchor) ? markdownFeedbackRange(anchor) : undefined;
+    reviewFeedbackComposer.classList.toggle("document-feedback-popup", Boolean(range));
+    if (range) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackComposer.setAttribute("role", "dialog");
+      reviewFeedbackComposer.setAttribute("aria-labelledby", "review-feedback-anchor");
+      document.body.append(reviewFeedbackComposer);
+      const bounds = markdownRangeEnd(range);
+      if (bounds.bottom < 0 || bounds.top > window.innerHeight) {
+        range.startContainer.parentElement?.scrollIntoView({ block: "center" });
+      }
+      positionMarkdownPopup(reviewFeedbackComposer, markdownRangeEnd(range));
+      reviewFeedbackMessage.focus({ preventScroll: true });
+    } else {
+      reviewFeedbackComposer.removeAttribute("role");
+      reviewFeedbackComposer.removeAttribute("aria-labelledby");
+      reviewFeedbackMessage.focus();
+      reviewFeedbackComposer.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }
+
+  function closeFeedbackComposer(): void {
+    feedbackDraft = undefined;
+    feedbackRangeStart = undefined;
+    feedbackEditingId = undefined;
+    reviewFeedbackMessage.value = "";
+    reviewFeedbackSave.textContent = "save feedback";
+    reviewFeedbackComposer.setAttribute("hidden", "");
+    reviewFeedbackComposer.classList.remove("document-feedback-popup");
+    reviewFeedbackComposer.removeAttribute("role");
+    reviewFeedbackComposer.removeAttribute("aria-labelledby");
+    reviewFeedbackComposer.style.removeProperty("top");
+    reviewFeedbackComposer.style.removeProperty("left");
+    reviewFeedbackError.textContent = "";
+    reviewFeedbackSection.append(reviewFeedbackComposer);
+  }
+
+  function persistCurrentFeedbackDraft(): void {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) return;
+    try {
+      persistDocumentFeedbackDraft(localStorage, {
+        id: selected.id,
+        revision: feedbackDraftRevision ?? selected.revision,
+      }, {
+        generalMessage: feedbackGeneralMessage.value,
+        comments: feedbackComments,
+      });
+    } catch {
+      // An unavailable browser store must not block feedback submission.
+    }
+  }
+
+  function persistCurrentReviewDraft(current?: WebReviewRequest): void {
+    const request = current ?? (state.selectedId
+      ? pendingReviewForDocument(state.reviewRequests, state.selectedId)
+      : undefined);
+    if (!request) return;
+    try {
+      persistReviewDraft(localStorage, request, {
+        message: reviewResponse.value,
+        items: [],
+      });
+    } catch {
+      // An unavailable browser store must not block the review decision.
+    }
+  }
+
+  function clearStoredReviewDraft(requestId: string): void {
+    try {
+      localStorage.removeItem(reviewDraftStorageKey(requestId));
+    } catch {
+      // An unavailable browser store must not block the review decision.
+    }
+  }
+
+  function renderFeedbackPanel(current: WebReviewRequest | undefined): void {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    const show = selected !== undefined;
+    feedbackPanel.toggleAttribute("hidden", !show);
+    reviewFeedbackSection.toggleAttribute("hidden", !show);
+    reviewFeedbackList.replaceChildren();
+    if (!feedbackDraft || (!isMarkdownFeedbackAnchor(feedbackDraft) && feedbackDraft.line === undefined)) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackSection.append(reviewFeedbackComposer);
+    }
+    if (!show) {
+      closeFeedbackComposer();
+      return;
+    }
+    for (const item of feedbackComments) {
+      const row = document.createElement("div");
+      row.className = "review-feedback-item";
+      const content = document.createElement("span");
+      content.textContent = `${item.label} — ${item.message}`;
+      row.append(content);
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "action";
+      edit.textContent = "edit";
+      edit.setAttribute("aria-label", `Edit feedback on ${item.label}`);
+      edit.addEventListener("click", () => openFeedbackComposer(
+        item.anchor.kind === "markdown-selection-v1"
+          ? item.anchor
+          : item.anchor.kind === "diff-file-v1"
+            ? { path: item.anchor.path }
+            : {
+                path: item.anchor.path,
+                hunkId: item.anchor.hunkId,
+                side: item.anchor.side,
+                line: item.anchor.line,
+                ...(item.anchor.endLine === undefined ? {} : { endLine: item.anchor.endLine }),
+              },
+        item,
+        undefined,
+        false,
+        item.label,
+      ));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "action";
+      remove.textContent = "remove";
+      remove.setAttribute("aria-label", `Remove feedback on ${item.label}`);
+      remove.addEventListener("click", () => {
+        feedbackComments = feedbackComments.filter(({ id }) => id !== item.id);
+        if (feedbackEditingId === item.id) closeFeedbackComposer();
+        persistCurrentFeedbackDraft();
+        renderFeedbackPanel(current);
+        renderChangeReview();
+      });
+      row.append(edit, remove);
+      reviewFeedbackList.append(row);
+    }
+    reviewFeedbackComposer.toggleAttribute("hidden", !feedbackDraft);
+    feedbackHistoryElement.replaceChildren();
+    for (const submission of feedbackHistory) {
+      const entry = document.createElement("section");
+      entry.className = "feedback-history-item";
+      entry.id = `feedback-history-${submission.id}`;
+      const link = document.createElement("a");
+      link.href = currentRoute(submission.route);
+      const historical = submission.documentRevision !== selected.revision;
+      link.textContent = `${submission.id} · revision ${submission.documentRevision}${historical ? " · historical" : " · current"} · ${submission.createdAt} · ${submission.comments.length} comment${submission.comments.length === 1 ? "" : "s"}`;
+      entry.append(link);
+      if (submission.generalMessage) {
+        const general = document.createElement("p");
+        general.textContent = submission.generalMessage;
+        entry.append(general);
+      }
+      for (const comment of submission.comments) {
+        const detail = document.createElement("p");
+        detail.textContent = `${storedFeedbackAnchorLabel(comment)} — ${comment.message}`;
+        entry.append(detail);
+      }
+      feedbackHistoryElement.append(entry);
+    }
+    feedbackHistoryElement.toggleAttribute("hidden", feedbackHistory.length === 0);
+    renderMarkdownFeedback();
+  }
+
+  function saveFeedback(): void {
+    if (!feedbackDraft) {
+      return;
+    }
+    const message = reviewFeedbackMessage.value.trim();
+    if (message === "") {
+      reviewFeedbackError.textContent = "Feedback text is required.";
+      reviewFeedbackMessage.focus();
+      return;
+    }
+    if (!feedbackEditingId && feedbackComments.length >= 32) {
+      reviewFeedbackError.textContent = "A feedback submission can contain at most 32 comments.";
+      return;
+    }
+    const label = reviewFeedbackAnchor.textContent?.replace(/^Feedback on /, "") ?? "selection";
+    const item: WebFeedbackCommentDraft = {
+      id: feedbackEditingId ??
+        `comment-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      intent: "feedback",
+      anchor: isMarkdownFeedbackAnchor(feedbackDraft)
+        ? feedbackDraft
+        : diffFeedbackAnchorInput(feedbackDraft),
+      label,
+      message,
+    };
+    const existingIndex = feedbackComments.findIndex(({ id }) => id === item.id);
+    feedbackComments = existingIndex < 0
+      ? [...feedbackComments, item]
+      : feedbackComments.map((candidate, index) => index === existingIndex ? item : candidate);
+    feedbackError.textContent = "";
+    closeFeedbackComposer();
+    if (state.selectedId) {
+      const current = pendingReviewForDocument(
+        state.reviewRequests,
+        state.selectedId,
+      );
+      persistCurrentFeedbackDraft();
+      renderFeedbackPanel(current);
+      renderChangeReview();
+    }
+  }
+
+  function mappedSourceSpan(node: Node): HTMLElement | undefined {
+    const element = node instanceof HTMLElement ? node : node.parentElement;
+    const span = element?.closest<HTMLElement>("[data-mdmaid-source-ref]");
+    return span && readerContent.contains(span) ? span : undefined;
+  }
+
+  // Keep icons textless so source-map offsets and later selections stay intact.
+  function markdownFeedbackRange(
+    anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>,
+  ): Range | undefined {
+    const spans = Array.from(readerContent.querySelectorAll<HTMLElement>("[data-mdmaid-source-ref]"));
+    const point = (boundary: { ref: string; offset: number }) => {
+      const span = spans.find((span) => span.dataset.mdmaidSourceRef === boundary.ref);
+      if (!span) return undefined;
+      const walker = document.createTreeWalker(span, NodeFilter.SHOW_TEXT);
+      let remaining = boundary.offset;
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const length = node.textContent?.length ?? 0;
+        if (remaining <= length) return { node, offset: remaining };
+        remaining -= length;
+      }
+      return undefined;
+    };
+    const start = point(anchor.start);
+    const end = point(anchor.end);
+    if (!start || !end) return undefined;
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+    return range;
+  }
+
+  function markdownRangeEnd(range: Range): DOMRect {
+    return Array.from(range.getClientRects()).filter(({ width }) => width > 0).at(-1)
+      ?? range.getBoundingClientRect();
+  }
+
+  function positionMarkdownPopup(popup: HTMLElement, anchor: DOMRect): void {
+    const margin = 8;
+    const bounds = popup.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(anchor.right, window.innerWidth - bounds.width - margin));
+    const below = anchor.bottom + margin;
+    const top = below + bounds.height <= window.innerHeight - margin
+      ? below
+      : Math.max(margin, anchor.top - bounds.height - margin);
+    popup.style.left = `${left}px`;
+    popup.style.top = `${top}px`;
+  }
+
+  function closeMarkdownFeedbackPopup(): void {
+    clearTimeout(markdownPopupTimer);
+    markdownFeedbackPopup.hidden = true;
+    markdownPopupMarker?.setAttribute("aria-expanded", "false");
+    markdownPopupMarker = undefined;
+    markdownPopupFocused = false;
+  }
+
+  function deferCloseMarkdownFeedbackPopup(): void {
+    clearTimeout(markdownPopupTimer);
+    markdownPopupTimer = setTimeout(() => {
+      if (!markdownFeedbackPopup.matches(":hover") &&
+          !markdownPopupMarker?.matches(":hover, :focus") &&
+          !markdownFeedbackPopup.contains(document.activeElement)) {
+        closeMarkdownFeedbackPopup();
+      }
+    }, 180);
+  }
+
+  function renderMarkdownFeedback(): void {
+    if (!renderedSourceMap || !renderedSourceWitness || readerContent.hidden || reader.hidden) {
+      closeMarkdownFeedbackPopup();
+      readerContent.querySelectorAll(".document-feedback-marker").forEach((marker) => marker.remove());
+      markdownFeedbackSignature = "";
+      return;
+    }
+    type InlineComment = { message: string; draft: boolean };
+    const groups = new Map<string, {
+      anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>;
+      comments: InlineComment[];
+    }>();
+    const add = (
+      anchor: Extract<WebFeedbackAnchorInput, { kind: "markdown-selection-v1" }>,
+      comment: InlineComment,
+    ) => {
+      const key = `${anchor.end.ref}:${anchor.end.offset}`;
+      const group = groups.get(key) ?? { anchor, comments: [] };
+      group.comments.push(comment);
+      groups.set(key, group);
+    };
+    for (const submission of feedbackHistory) {
+      if (submission.documentId !== state.selectedId || submission.documentRevision !== feedbackDraftRevision) continue;
+      for (const comment of submission.comments) {
+        if (comment.anchor.kind !== "markdown-v1") continue;
+        const witness = markdownFeedbackWitness(renderedSourceMap, comment.anchor);
+        if (witness) add(witness, { message: comment.message, draft: false });
+      }
+    }
+    for (const comment of feedbackComments) {
+      if (comment.anchor.kind === "markdown-selection-v1") {
+        add(comment.anchor, { message: comment.message, draft: true });
+      }
+    }
+    const signature = JSON.stringify(Array.from(groups));
+    if (signature === markdownFeedbackSignature) {
+      repositionMarkdownFeedback();
+      return;
+    }
+    markdownFeedbackSignature = signature;
+    const activePopupKey = markdownPopupMarker?.dataset.feedbackKey;
+    const restoreFocus = markdownPopupFocused;
+    closeMarkdownFeedbackPopup();
+    readerContent.querySelectorAll(".document-feedback-marker").forEach((marker) => marker.remove());
+    for (const [key, { anchor, comments }] of groups) {
+      const range = markdownFeedbackRange(anchor);
+      if (!range) continue;
+      const quote = range.toString().trim().slice(0, 160);
+      const marker = document.createElement("button");
+      marker.type = "button";
+      marker.className = "document-feedback-marker";
+      marker.dataset.feedbackKey = key;
+      marker.setAttribute("aria-label", `${comments.length} comment${comments.length === 1 ? "" : "s"} on “${quote}”`);
+      marker.setAttribute("aria-haspopup", "dialog");
+      marker.setAttribute("aria-controls", markdownFeedbackPopup.id);
+      marker.setAttribute("aria-expanded", "false");
+      const open = () => {
+        if (feedbackDraft) return;
+        closeMarkdownFeedbackPopup();
+        markdownPopupMarker = marker;
+        markdownPopupFocused = document.activeElement === marker;
+        markdownFeedbackPopup.replaceChildren();
+        const heading = document.createElement("strong");
+        heading.textContent = `${comments.length} comment${comments.length === 1 ? "" : "s"}`;
+        markdownFeedbackPopup.append(heading);
+        for (const comment of comments) {
+          const entry = document.createElement("p");
+          entry.textContent = comment.message;
+          if (comment.draft) {
+            const label = document.createElement("span");
+            label.className = "document-feedback-draft-label";
+            label.textContent = "Draft · ";
+            entry.prepend(label);
+          }
+          markdownFeedbackPopup.append(entry);
+        }
+        markdownFeedbackPopup.hidden = false;
+        marker.setAttribute("aria-expanded", "true");
+        positionMarkdownPopup(markdownFeedbackPopup, marker.getBoundingClientRect());
+      };
+      marker.addEventListener("mouseenter", open);
+      marker.addEventListener("focus", open);
+      marker.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        open();
+      });
+      marker.addEventListener("mouseleave", deferCloseMarkdownFeedbackPopup);
+      marker.addEventListener("blur", deferCloseMarkdownFeedbackPopup);
+      range.collapse(false);
+      range.insertNode(marker);
+      if (key === activePopupKey) {
+        if (restoreFocus) marker.focus({ preventScroll: true });
+        else open();
+      }
+    }
+    repositionMarkdownFeedback();
+  }
+
+  function repositionMarkdownFeedback(): void {
+    if (selectedMarkdownWitness && !feedbackAddSelection.hidden) {
+      const range = markdownFeedbackRange(selectedMarkdownWitness);
+      if (range) positionMarkdownPopup(feedbackAddSelection, markdownRangeEnd(range));
+    }
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft) &&
+        reviewFeedbackComposer.classList.contains("document-feedback-popup")) {
+      const range = markdownFeedbackRange(feedbackDraft);
+      if (range) positionMarkdownPopup(reviewFeedbackComposer, markdownRangeEnd(range));
+    }
+    if (markdownPopupMarker?.isConnected) {
+      positionMarkdownPopup(markdownFeedbackPopup, markdownPopupMarker.getBoundingClientRect());
+    }
+  }
+
+  function localTextOffset(
+    span: HTMLElement,
+    node: Node,
+    offset: number,
+  ): number | undefined {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(span);
+      range.setEnd(node, offset);
+      return range.toString().length;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function captureMarkdownSelection(): void {
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) return;
+    selectedMarkdownWitness = undefined;
+    selectedMarkdownLabel = "";
+    feedbackAddSelection.setAttribute("hidden", "");
+    if (!renderedSourceMap || readerContent.hasAttribute("hidden")) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return;
+    const range = selection.getRangeAt(0);
+    const startSpan = mappedSourceSpan(range.startContainer);
+    const endSpan = mappedSourceSpan(range.endContainer);
+    if (!startSpan || !endSpan) return;
+    const startRef = startSpan.dataset.mdmaidSourceRef;
+    const endRef = endSpan.dataset.mdmaidSourceRef;
+    const startOffset = localTextOffset(startSpan, range.startContainer, range.startOffset);
+    const endOffset = localTextOffset(endSpan, range.endContainer, range.endOffset);
+    if (!startRef || !endRef || startOffset === undefined || endOffset === undefined) return;
+    const witness = markdownSelectionWitness(
+      renderedSourceMap,
+      startRef,
+      startOffset,
+      endRef,
+      endOffset,
+    );
+    if (!witness) return;
+    selectedMarkdownWitness = witness;
+    selectedMarkdownLabel = selection.toString().trim().slice(0, 160);
+    if (selectedMarkdownLabel === "") return;
+    feedbackAddSelection.removeAttribute("hidden");
+    closeMarkdownFeedbackPopup();
+    positionMarkdownPopup(feedbackAddSelection, markdownRangeEnd(range));
+  }
+
+  async function loadFeedbackHistory(documentId: string): Promise<void> {
+    const selected = state.documents.find(({ id }) => id === documentId);
+    if (!selected) return;
+    try {
+      const loaded: PublicFeedbackSubmission[] = [];
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      do {
+        const page = await api<PublicFeedbackPage>(
+          `/api/v1/feedback?document=${encodeURIComponent(documentId)}&limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
+        );
+        loaded.push(...page.items);
+        cursor = page.nextCursor;
+        if (cursor && seenCursors.has(cursor)) {
+          throw new Error("Feedback history returned a repeated cursor.");
+        }
+        if (cursor) seenCursors.add(cursor);
+      } while (cursor);
+      if (state.selectedId !== documentId) return;
+      const routedFeedbackId = document.body.dataset.feedbackId;
+      feedbackHistory = [
+        ...feedbackHistory.filter(({ id }) => id === routedFeedbackId),
+        ...loaded.filter(({ id }, index) =>
+          id !== routedFeedbackId && loaded.findIndex((item) => item.id === id) === index
+        ),
+      ];
+      if (routedFeedbackId) {
+        feedbackHistory.sort((left, right) =>
+          left.id === routedFeedbackId ? -1 : right.id === routedFeedbackId ? 1 : 0
+        );
+      }
+      renderFeedbackPanel(pendingReviewForDocument(state.reviewRequests, documentId));
+      if (routedFeedbackId) {
+        document.getElementById(`feedback-history-${routedFeedbackId}`)
+          ?.scrollIntoView({ block: "center" });
+      }
+    } catch (error) {
+      if (state.selectedId === documentId) {
+        feedbackError.textContent = error instanceof Error
+          ? error.message
+          : "Could not load feedback history";
+      }
+    }
+  }
+
+  function currentFeedbackRegistration(
+    selected: WebDocument,
+    generalMessage: string,
+  ): FeedbackSubmissionRegistration {
+    if (feedbackComments.length > 0 && renderedSourceWitness === undefined) {
+      throw new Error("The rendered document changed; reopen it before sending anchored feedback.");
+    }
+    return {
+      id: `feedback-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+      documentId: selected.id,
+      documentRevision: selected.revision,
+      ...(feedbackComments.length === 0 || renderedSourceWitness === undefined
+        ? {}
+        : { sourceWitness: renderedSourceWitness }),
+      ...(generalMessage === "" ? {} : { generalMessage }),
+      comments: feedbackComments.map(({ label: _label, ...comment }) => comment),
+    };
+  }
+
+  async function submitFeedback(): Promise<void> {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) return;
+    const generalMessage = feedbackGeneralMessage.value.trim();
+    if (generalMessage === "" && feedbackComments.length === 0) {
+      feedbackError.textContent = "Add general feedback or at least one specific comment.";
+      feedbackGeneralMessage.focus();
+      return;
+    }
+    feedbackError.textContent = "";
+    feedbackSend.disabled = true;
+    try {
+      const submission = await api<PublicFeedbackSubmission>("/api/v1/feedback", {
+        method: "POST",
+        body: JSON.stringify(currentFeedbackRegistration(selected, generalMessage)),
+      });
+      feedbackComments = [];
+      feedbackGeneralMessage.value = "";
+      closeFeedbackComposer();
+      try {
+        localStorage.removeItem(documentFeedbackDraftStorageKey(selected));
+      } catch {
+        // Submission succeeded even when browser draft cleanup is unavailable.
+      }
+      feedbackHistory = [submission, ...feedbackHistory.filter(({ id }) => id !== submission.id)];
+      renderFeedbackPanel(pendingReviewForDocument(state.reviewRequests, selected.id));
+      feedbackError.replaceChildren();
+      const confirmation = document.createTextNode("Feedback saved: ");
+      const link = document.createElement("a");
+      link.href = currentRoute(submission.route);
+      link.textContent = submission.id;
+      feedbackError.append(confirmation, link);
+      renderChangeReview();
+    } catch (error) {
+      feedbackError.textContent = error instanceof Error
+        ? error.message
+        : "Could not submit feedback";
+    } finally {
+      feedbackSend.disabled = false;
+    }
   }
 
   function renderChangeReview(): void {
@@ -1157,12 +3150,19 @@ async function boot(): Promise<void> {
     );
     changeReviewViewer.toggleAttribute("hidden", !showDiff);
     readerContent.toggleAttribute("hidden", showDiff);
+    if (showDiff) {
+      feedbackAddSelection.hidden = true;
+      closeMarkdownFeedbackPopup();
+      if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) closeFeedbackComposer();
+    }
+    renderMarkdownFeedback();
     changeViewDiff.classList.toggle("active", showDiff);
     changeViewDocument.classList.toggle("active", !showDiff);
     changeViewDiff.toggleAttribute("hidden", !review);
     changeViewDocument.toggleAttribute("hidden", !review);
     if (showDiff) {
       readerToc.setAttribute("hidden", "");
+      renderReaderLayout();
     } else {
       renderDocumentOutline();
     }
@@ -1171,12 +3171,6 @@ async function boot(): Promise<void> {
     }
     changeFileIndex = clamp(changeFileIndex, 0, review.files.length - 1);
     const file = review.files[changeFileIndex]!;
-    changeHunkIndex = clamp(
-      changeHunkIndex,
-      0,
-      Math.max(0, file.hunks.length - 1),
-    );
-    const hunk = file.hunks[changeHunkIndex];
     changeFileList.replaceChildren();
     review.files.forEach((candidate, index) => {
       const button = document.createElement("button");
@@ -1186,22 +3180,16 @@ async function boot(): Promise<void> {
       button.textContent = `${changeStatusSymbol(candidate.status)} ${candidate.path}`;
       button.addEventListener("click", () => {
         changeFileIndex = index;
-        changeHunkIndex = 0;
         renderChangeReview();
       });
       changeFileList.append(button);
     });
     changeFilePrevious.disabled = changeFileIndex === 0;
     changeFileNext.disabled = changeFileIndex === review.files.length - 1;
-    changeHunkPrevious.disabled = !hunk || changeHunkIndex === 0;
-    changeHunkNext.disabled = !hunk || changeHunkIndex === file.hunks.length - 1;
     changeLayout.textContent = changeReviewLayout === "side-by-side"
       ? "side-by-side"
       : "unified";
-    changePosition.textContent = [
-      `file ${changeFileIndex + 1}/${review.files.length}`,
-      `hunk ${hunk ? changeHunkIndex + 1 : 0}/${file.hunks.length}`,
-    ].join(" · ");
+    changePosition.textContent = `file ${changeFileIndex + 1}/${review.files.length}`;
     changeDiffStage.replaceChildren();
     for (const warning of review.warnings) {
       const warningElement = document.createElement("p");
@@ -1218,58 +3206,255 @@ async function boot(): Promise<void> {
       ? `renamed from ${file.previousPath}`
       : file.status;
     heading.append(path, details);
+    const fileFeedback = document.createElement("button");
+    fileFeedback.type = "button";
+    fileFeedback.className = "action change-feedback-button";
+    fileFeedback.textContent = "feedback on file";
+    fileFeedback.addEventListener("click", () => {
+      openFeedbackComposer({ path: file.path });
+    });
+    heading.append(fileFeedback);
     changeDiffStage.append(heading);
-    if (!hunk) {
+    const feedbackHint = document.createElement("p");
+    feedbackHint.className = "change-line-feedback-hint";
+    feedbackHint.textContent = WEB_LINE_FEEDBACK_HINT;
+    changeDiffStage.append(feedbackHint);
+    if (file.hunks.length === 0) {
       const emptyHunk = document.createElement("p");
       emptyHunk.className = "change-empty";
-      emptyHunk.textContent = "No text hunks. This is a binary or mode-only change.";
+      emptyHunk.textContent = "No text changes. This is a binary or mode-only change.";
       changeDiffStage.append(emptyHunk);
+      restoreDetachedFeedbackComposer();
       return;
     }
-    const hunkHeader = document.createElement("div");
-    hunkHeader.className = "change-hunk-header";
-    hunkHeader.textContent = hunk.header;
-    changeDiffStage.append(hunkHeader);
-    const table = document.createElement("div");
-    table.className = `native-diff ${changeReviewLayout}`;
-    if (changeReviewLayout === "side-by-side") {
-      const labels = document.createElement("div");
-      labels.className = "diff-labels";
-      const oldLabel = document.createElement("span");
-      oldLabel.textContent = "old";
-      const newLabel = document.createElement("span");
-      newLabel.textContent = "new";
-      labels.append(oldLabel, newLabel);
-      table.append(labels);
-      for (const row of webDiffRows(hunk)) {
-        const rowElement = document.createElement("div");
-        rowElement.className = "diff-row";
-        rowElement.append(
-          renderDiffCell(row.old, file.path),
-          renderDiffCell(row.new, file.path),
-        );
-        table.append(rowElement);
-      }
-    } else {
-      for (const row of webDiffRows(hunk)) {
-        if (row.old?.kind === "context") {
-          table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path));
-        } else {
-          if (row.old) table.append(renderUnifiedCell(row.old, null, file.path));
-          if (row.new) table.append(renderUnifiedCell(row.new, row.new.line, file.path));
+    const inlineFeedback = [
+      ...storedDiffItems(feedbackHistory.filter(
+        ({ documentRevision }) => documentRevision === renderedRevision,
+      )),
+      ...draftDiffItems(feedbackComments),
+    ];
+    for (const hunk of file.hunks) {
+      const region = document.createElement("section");
+      region.className = "change-region";
+      const regionHeader = document.createElement("div");
+      regionHeader.className = "change-region-header";
+      regionHeader.textContent = hunk.header;
+      region.append(regionHeader);
+      const table = document.createElement("div");
+      table.className = `native-diff ${changeReviewLayout}`;
+      if (changeReviewLayout === "side-by-side") {
+        const labels = document.createElement("div");
+        labels.className = "diff-labels";
+        const oldLabel = document.createElement("span");
+        oldLabel.textContent = "old";
+        const newLabel = document.createElement("span");
+        newLabel.textContent = "new";
+        labels.append(oldLabel, newLabel);
+        table.append(labels);
+        for (const row of webDiffRows(hunk)) {
+          const rowElement = document.createElement("div");
+          rowElement.className = "diff-row";
+          rowElement.append(
+            renderDiffCell(row.old, file.path, hunk.id, "old"),
+            renderDiffCell(row.new, file.path, hunk.id, "new"),
+          );
+          table.append(rowElement);
+          appendInlineFeedback(table, [
+            ...(row.old?.line === null || row.old?.line === undefined
+              ? []
+              : feedbackEndingAtLine(inlineFeedback, {
+                  path: file.path,
+                  hunkId: hunk.id,
+                  line: row.old.line,
+                  side: "old",
+                })),
+            ...(row.new?.line === null || row.new?.line === undefined
+              ? []
+              : feedbackEndingAtLine(inlineFeedback, {
+                  path: file.path,
+                  hunkId: hunk.id,
+                  line: row.new.line,
+                  side: "new",
+                })),
+          ], true);
+          appendInlineComposer(table, [
+            ...(row.old?.line === null || row.old?.line === undefined
+              ? []
+              : [{ line: row.old.line, side: "old" as const }]),
+            ...(row.new?.line === null || row.new?.line === undefined
+              ? []
+              : [{ line: row.new.line, side: "new" as const }]),
+          ], file.path, hunk.id);
+        }
+      } else {
+        for (const row of webDiffRows(hunk)) {
+          if (row.old?.kind === "context") {
+            table.append(renderUnifiedCell(row.old, row.new?.line ?? null, file.path, hunk.id));
+            appendInlineFeedback(table, unifiedLineFeedback(
+              inlineFeedback,
+              row.old,
+              row.new?.line ?? null,
+              file.path,
+              hunk.id,
+            ), true);
+            appendInlineComposer(table, [
+              ...(row.old.line === null
+                ? []
+                : [{ line: row.old.line, side: "old" as const }]),
+              ...(row.new?.line === null || row.new?.line === undefined
+                ? []
+                : [{ line: row.new.line, side: "new" as const }]),
+            ], file.path, hunk.id);
+          } else {
+            if (row.old) {
+              table.append(renderUnifiedCell(row.old, null, file.path, hunk.id));
+              appendInlineFeedback(table, unifiedLineFeedback(
+                inlineFeedback,
+                row.old,
+                null,
+                file.path,
+                hunk.id,
+              ), true);
+              appendInlineComposer(table, row.old.line === null ? [] : [
+                { line: row.old.line, side: "old" },
+              ], file.path, hunk.id);
+            }
+            if (row.new) {
+              table.append(renderUnifiedCell(row.new, row.new.line, file.path, hunk.id));
+              appendInlineFeedback(table, unifiedLineFeedback(
+                inlineFeedback,
+                row.new,
+                row.new.line,
+                file.path,
+                hunk.id,
+              ), true);
+              appendInlineComposer(table, row.new.line === null ? [] : [
+                { line: row.new.line, side: "new" },
+              ], file.path, hunk.id);
+            }
+          }
         }
       }
+      region.append(table);
+      changeDiffStage.append(region);
     }
-    changeDiffStage.append(table);
+    restoreDetachedFeedbackComposer();
   }
 
-  function renderDiffCell(cell: WebDiffCell | undefined, path: string): HTMLElement {
+  function restoreDetachedFeedbackComposer(): void {
+    if (feedbackDraft && !reviewFeedbackComposer.isConnected) {
+      reviewFeedbackComposer.classList.remove("diff-inline-composer");
+      reviewFeedbackSection.append(reviewFeedbackComposer);
+    }
+  }
+
+  function unifiedLineFeedback(
+    items: readonly ReviewFeedbackItem[],
+    cell: WebDiffCell,
+    newLine: number | null,
+    path: string,
+    hunkId: string,
+  ): ReviewFeedbackItem[] {
+    const oldLine = cell.kind === "addition" ? null : cell.line;
+    const matches = [
+      ...(oldLine === null
+        ? []
+        : feedbackEndingAtLine(items, { path, hunkId, line: oldLine, side: "old" })),
+      ...(newLine === null
+        ? []
+        : feedbackEndingAtLine(items, { path, hunkId, line: newLine, side: "new" })),
+    ];
+    return matches.filter(
+      (item, index) => matches.findIndex((candidate) => candidate.id === item.id) === index,
+    );
+  }
+
+  function appendInlineFeedback(
+    parent: HTMLElement,
+    items: readonly ReviewFeedbackItem[],
+    editable: boolean,
+  ): void {
+    for (const item of items) {
+      const block = document.createElement("div");
+      block.className = "diff-inline-feedback";
+      const content = document.createElement("div");
+      const label = document.createElement("strong");
+      label.textContent = `comment · ${feedbackAnchorLabel(item)}`;
+      const message = document.createElement("p");
+      message.textContent = item.message;
+      content.append(label, message);
+      block.append(content);
+      const draftId = item.id.replace(/^feedback-/, "comment-");
+      if (editable && feedbackComments.some(({ id }) => id === draftId)) {
+        const actions = document.createElement("div");
+        actions.className = "diff-inline-feedback-actions";
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "action";
+        edit.textContent = "edit";
+        edit.addEventListener("click", () => openFeedbackComposer({
+          path: item.path,
+          ...(item.hunkId === undefined ? {} : { hunkId: item.hunkId }),
+          ...(item.line === undefined ? {} : { line: item.line }),
+          ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          ...(item.side === undefined ? {} : { side: item.side }),
+        }, item));
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "action";
+        remove.textContent = "remove";
+        remove.addEventListener("click", () => {
+          const commentId = item.id.replace(/^feedback-/, "comment-");
+          feedbackComments = feedbackComments.filter(({ id }) => id !== commentId);
+          if (feedbackEditingId === commentId) closeFeedbackComposer();
+          persistCurrentFeedbackDraft();
+          if (state.selectedId) {
+            renderFeedbackPanel(pendingReviewForDocument(
+              state.reviewRequests,
+              state.selectedId,
+            ));
+          }
+          renderChangeReview();
+        });
+        actions.append(edit, remove);
+        block.append(actions);
+      }
+      parent.append(block);
+    }
+  }
+
+  function appendInlineComposer(
+    parent: HTMLElement,
+    endpoints: ReadonlyArray<{ line: number; side: "old" | "new" }>,
+    path: string,
+    hunkId: string,
+  ): void {
+    const draft = feedbackDraft;
+    if (
+      !draft ||
+      isMarkdownFeedbackAnchor(draft) ||
+      draft.line === undefined ||
+      draft.path !== path ||
+      draft.hunkId !== hunkId ||
+      !endpoints.some(({ line, side }) =>
+        line === (draft.endLine ?? draft.line) &&
+        side === draft.side
+      )
+    ) return;
+    reviewFeedbackComposer.classList.add("diff-inline-composer");
+    parent.append(reviewFeedbackComposer);
+  }
+
+  function renderDiffCell(
+    cell: WebDiffCell | undefined,
+    path: string,
+    hunkId: string,
+    side: "old" | "new",
+  ): HTMLElement {
     const value = document.createElement("div");
     value.className = `diff-cell${cell ? ` ${cell.kind}` : " empty-cell"}`;
     if (!cell) return value;
-    const line = document.createElement("span");
-    line.className = "diff-line-number";
-    line.textContent = cell.line === null ? "" : String(cell.line);
+    const line = renderDiffLineControl(cell.line, { path, hunkId, side });
     value.append(line, diffText(cell, path));
     return value;
   }
@@ -1278,18 +3463,83 @@ async function boot(): Promise<void> {
     cell: WebDiffCell,
     newLine: number | null,
     path: string,
+    hunkId: string,
   ): HTMLElement {
     const value = document.createElement("div");
     value.className = `diff-unified-line ${cell.kind}`;
-    const oldNumber = document.createElement("span");
-    oldNumber.className = "diff-line-number";
-    oldNumber.textContent = cell.kind === "addition" || cell.line === null
-      ? ""
-      : String(cell.line);
-    const newNumber = document.createElement("span");
-    newNumber.className = "diff-line-number";
-    newNumber.textContent = newLine === null ? "" : String(newLine);
+    const oldLine = cell.kind === "addition" ? null : cell.line;
+    const oldNumber = renderDiffLineControl(oldLine, {
+      path,
+      hunkId,
+      side: "old",
+    });
+    const newNumber = renderDiffLineControl(newLine, {
+      path,
+      hunkId,
+      side: "new",
+    });
     value.append(oldNumber, newNumber, diffText(cell, path));
+    return value;
+  }
+
+  function renderDiffLineControl(
+    line: number | null,
+    anchor: Pick<WebFeedbackAnchor, "path" | "hunkId"> & {
+      side: "old" | "new";
+    },
+  ): HTMLElement {
+    const model = webDiffLineControlModel(line, anchor.side, state.selectedId !== undefined);
+    const value = document.createElement(model.feedbackLabel ? "button" : "span");
+    value.className = "diff-line-number";
+    const number = document.createElement("span");
+    number.className = "diff-line-number-value";
+    number.textContent = model.lineText;
+    value.append(number);
+    if (
+      value instanceof HTMLButtonElement &&
+      line !== null &&
+      model.feedbackLabel &&
+      model.feedbackMarker
+    ) {
+      value.type = "button";
+      const clickedAnchor = { ...anchor, line } as Required<
+        Pick<WebFeedbackAnchor, "path" | "hunkId" | "line" | "side">
+      >;
+      value.classList.toggle(
+        "selected-range",
+        feedbackDraft !== undefined &&
+          !isMarkdownFeedbackAnchor(feedbackDraft) &&
+          feedbackAnchorContainsLine(feedbackDraft, clickedAnchor),
+      );
+      const feedbackLabel = `${model.feedbackLabel}; Shift-click another line to select a range`;
+      value.title = feedbackLabel;
+      value.setAttribute("aria-label", feedbackLabel);
+      const marker = document.createElement("span");
+      marker.className = "diff-line-feedback-marker";
+      marker.setAttribute("aria-hidden", "true");
+      marker.textContent = model.feedbackMarker;
+      value.append(marker);
+      value.addEventListener("click", (event) => {
+        const rangeStart = feedbackRangeStart;
+        if (
+          event.shiftKey &&
+          rangeStart?.line !== undefined &&
+          rangeStart.path === clickedAnchor.path &&
+          rangeStart.hunkId === clickedAnchor.hunkId &&
+          rangeStart.side === clickedAnchor.side
+        ) {
+          const start = Math.min(rangeStart.line, line);
+          const end = Math.max(rangeStart.line, line);
+          openFeedbackComposer({
+            ...clickedAnchor,
+            line: start,
+            ...(end === start ? {} : { endLine: end }),
+          }, undefined, rangeStart, true);
+          return;
+        }
+        openFeedbackComposer(clickedAnchor, undefined, clickedAnchor);
+      });
+    }
     return value;
   }
 
@@ -1368,6 +3618,17 @@ async function boot(): Promise<void> {
     }
   }
 
+  function pushDocumentHistory(id: string, route: string): void {
+    const visible = currentVisibleWorkspaces(
+      state.documents.filter(({ kind }) => kind !== "change-review"),
+    );
+    history.pushState(
+      documentHistoryState(id, state.filters, [...visible, ...state.workspaces]),
+      "",
+      currentRoute(route),
+    );
+  }
+
   async function renderSelectedDocument(
     id: string,
     options: {
@@ -1395,6 +3656,7 @@ async function boot(): Promise<void> {
     if (options.showLoading) {
       readerContent.textContent = "Rendering…";
     }
+    let documentRendered = false;
     try {
       const rendered = await api<RenderedDocument>(
         `/api/v1/documents/${id}/render?target=web`,
@@ -1404,20 +3666,69 @@ async function boot(): Promise<void> {
       }
       setMissingReader(false);
       renderedChangeReview = rendered.changeReview;
+      if (feedbackDraftRevision !== rendered.document.revision) {
+        persistCurrentFeedbackDraft();
+        const draft = loadDocumentFeedbackDraft(localStorage, rendered.document);
+        feedbackComments = draft.comments;
+        feedbackGeneralMessage.value = draft.generalMessage;
+        feedbackDraftRevision = rendered.document.revision;
+        closeFeedbackComposer();
+      }
+      renderedSourceWitness = rendered.sourceWitness;
+      renderedSourceMap = rendered.sourceMap;
+      selectedMarkdownWitness = undefined;
+      feedbackAddSelection.hidden = true;
       changeFileIndex = 0;
-      changeHunkIndex = 0;
       changeReviewView = rendered.changeReview ? "diff" : "document";
       readerContent.innerHTML = rendered.content;
+      markdownFeedbackSignature = "";
+      for (const link of Array.from(
+        readerContent.querySelectorAll<HTMLAnchorElement>("a[href^='/d/']"),
+      )) {
+        const target = new URL(link.getAttribute("href") ?? "", location.origin);
+        link.setAttribute(
+          "href",
+          currentRoute(`${target.pathname}${target.search}${target.hash}`),
+        );
+      }
+      for (const media of Array.from(
+        readerContent.querySelectorAll<HTMLImageElement>("img[src^='/d/']"),
+      )) {
+        const target = new URL(media.getAttribute("src") ?? "", location.origin);
+        media.setAttribute(
+          "src",
+          currentRoute(`${target.pathname}${target.search}${target.hash}`),
+        );
+      }
+      documentRendered = true;
       renderChangeReview();
-      if (window.mermaid) {
-        window.mermaid.initialize({
+      if (options.pushHistory) {
+        pushDocumentHistory(id, rendered.document.route);
+      }
+      const mermaid = window.mermaid;
+      if (mermaid) {
+        mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
           theme: document.documentElement.dataset.theme === "dark" ? "dark" : "default",
           fontFamily: "Departure Mono, monospace",
         });
-        await window.mermaid.run({
-          nodes: Array.from(readerContent.querySelectorAll(".mermaid")),
+        const nodes = Array.from(
+          readerContent.querySelectorAll<HTMLElement>(".mermaid"),
+        );
+        const sources = new Map(nodes.map((node) => [node, node.textContent ?? ""]));
+        await withVisibleMermaidLayout(readerContent, async () => {
+          await renderMermaidNodes(mermaid, nodes, (node, error) => {
+            const element = node as HTMLElement;
+            const diagnostic = mermaidErrorMessage(error);
+            element.classList.add("mermaid-error");
+            element.removeAttribute("data-processed");
+            element.textContent = [
+              `Diagram could not render: ${diagnostic}`,
+              "",
+              sources.get(element) ?? "",
+            ].join("\n");
+          }, document.fonts.ready);
         });
       }
       if (sequence !== renderSequence || state.selectedId !== id) {
@@ -1434,6 +3745,7 @@ async function boot(): Promise<void> {
       renderedRevision = rendered.document.revision;
       readerReady = true;
       updateExportAvailability();
+      void loadFeedbackHistory(id);
       if (!options.markOpened) {
         return;
       }
@@ -1445,9 +3757,6 @@ async function boot(): Promise<void> {
         return;
       }
       replaceDocument(updated);
-      if (options.pushHistory) {
-        history.pushState({ documentId: id }, "", updated.route);
-      }
     } catch (error) {
       if (sequence !== renderSequence || state.selectedId !== id) {
         return;
@@ -1458,11 +3767,17 @@ async function boot(): Promise<void> {
             api<WebDocument[]>("/api/v1/documents"),
             api<WebReviewRequest[]>("/api/v1/review-requests"),
           ]);
+          if (sequence !== renderSequence || state.selectedId !== id) {
+            return;
+          }
           state.documents = documents;
           state.reviewRequests = reviewRequests;
           render();
         } catch {
           // The safe missing-source state remains actionable without a refresh.
+        }
+        if (sequence !== renderSequence || state.selectedId !== id) {
+          return;
         }
         const missing =
           state.documents.find((item) => item.id === id) ?? selected;
@@ -1470,12 +3785,12 @@ async function boot(): Promise<void> {
           showMissingSource(missing);
           renderedRevision = missing.revision;
           if (options.pushHistory) {
-            history.pushState({ documentId: id }, "", missing.route);
+            pushDocumentHistory(id, missing.route);
           }
           return;
         }
       }
-      if (options.markOpened) {
+      if (options.markOpened && !documentRendered) {
         readerContent.textContent =
           error instanceof Error ? error.message : "Could not render document";
       }
@@ -1483,11 +3798,27 @@ async function boot(): Promise<void> {
   }
 
   async function openDocument(id: string, pushHistory = true): Promise<void> {
+    if (state.selectedId !== id) {
+      feedbackComments = [];
+      feedbackHistory = [];
+      feedbackGeneralMessage.value = "";
+      activeReviewDraftId = undefined;
+      closeFeedbackComposer();
+      renderedSourceWitness = undefined;
+    }
     state.selectedId = id;
+    const selected = state.documents.find((item) => item.id === id);
+    if (selected) {
+      const draft = loadDocumentFeedbackDraft(localStorage, selected);
+      feedbackComments = draft.comments;
+      feedbackGeneralMessage.value = draft.generalMessage;
+      feedbackDraftRevision = selected.revision;
+    }
     queuePanel.setAttribute("hidden", "");
     reader.removeAttribute("hidden");
     readerToc.setAttribute("hidden", "");
     readerTocList.replaceChildren();
+    renderReaderLayout();
     setMissingReader(false);
     await renderSelectedDocument(id, {
       markOpened: true,
@@ -1498,6 +3829,8 @@ async function boot(): Promise<void> {
   }
 
   async function refreshOpenDocument(id: string): Promise<void> {
+    queuePanel.setAttribute("hidden", "");
+    reader.removeAttribute("hidden");
     await renderSelectedDocument(id, {
       markOpened: false,
       preserveHeading: true,
@@ -1518,12 +3851,27 @@ async function boot(): Promise<void> {
       reviewStatus.textContent = "";
       reviewResponse.value = "";
       reviewError.textContent = "";
+      renderFeedbackPanel(undefined);
       return;
     }
     reviewPanel.removeAttribute("hidden");
     reviewRequestMessage.textContent = current.requestMessage;
     reviewError.textContent = "";
     const pending = current.status === "pending";
+    const activation = activateReviewDraft(
+      localStorage,
+      current,
+      activeReviewDraftId,
+    );
+    if (activation) {
+      closeFeedbackComposer();
+      reviewResponse.value = activation.draft.message;
+      activeReviewDraftId = activation.requestId;
+    } else if (!pending) {
+      clearStoredReviewDraft(current.id);
+      activeReviewDraftId = undefined;
+    }
+    renderFeedbackPanel(current);
     reviewResponse.toggleAttribute("hidden", !pending);
     reviewActions.toggleAttribute("hidden", !pending);
     if (pending) {
@@ -1549,20 +3897,39 @@ async function boot(): Promise<void> {
     if (!request) {
       return;
     }
-    const message = reviewResponse.value;
     const selected = state.documents.find(({ id }) => id === state.selectedId);
-    const validation =
-      selected?.kind === "change-review" && outcome === "approved"
+    if (!selected) return;
+    const decisionMessage = reviewResponse.value.trim();
+    const feedbackMessage = feedbackGeneralMessage.value.trim();
+    const hasFeedbackDraft = feedbackMessage !== "" || feedbackComments.length > 0;
+    const message = decisionMessage === ""
+      ? feedbackMessage
+      : feedbackMessage === "" || feedbackMessage === decisionMessage
+        ? decisionMessage
+        : `Feedback:\n${feedbackMessage}\n\nDecision:\n${decisionMessage}`;
+    const structuredFeedback = hasFeedbackDraft
+      ? currentFeedbackRegistration(selected, message)
+      : undefined;
+    const validation = selected?.kind === "change-review" && outcome === "approved"
         ? changeReviewApprovalError(renderedChangeReview) ??
-          reviewResponseError(outcome, message)
-        : reviewResponseError(outcome, message);
+          reviewResponseError(outcome, message, feedbackComments.length > 0
+            ? draftDiffItems(feedbackComments)
+            : [])
+        : outcome === "changes_requested" && message === "" && feedbackComments.length > 0
+          ? undefined
+          : reviewResponseError(outcome, message);
     if (validation) {
       reviewError.textContent = validation;
       reviewResponse.focus();
       return;
     }
     reviewError.textContent = "";
-    for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+    for (const button of [
+      reviewApprove,
+      reviewChanges,
+      reviewReject,
+      reviewSupersede,
+    ]) {
       button.disabled = true;
     }
     try {
@@ -1570,26 +3937,55 @@ async function boot(): Promise<void> {
         `/api/v1/review-requests/${request.id}/respond`,
         {
           method: "POST",
-          body: JSON.stringify({ outcome, message }),
+          body: JSON.stringify({
+            outcome,
+            message,
+            ...(structuredFeedback === undefined ? {} : { feedback: structuredFeedback }),
+          }),
         },
       );
       state.reviewRequests = state.reviewRequests.map((item) =>
         item.id === updated.id ? updated : item,
       );
       reviewResponse.value = "";
+      if (structuredFeedback !== undefined) {
+        feedbackComments = [];
+        feedbackGeneralMessage.value = "";
+        try {
+          localStorage.removeItem(documentFeedbackDraftStorageKey(selected));
+        } catch {
+          // The decision and feedback were already stored atomically.
+        }
+        void loadFeedbackHistory(selected.id);
+      }
+      clearStoredReviewDraft(request.id);
+      activeReviewDraftId = undefined;
+      closeFeedbackComposer();
       render();
       renderReviewPanel(state.selectedId);
+      renderChangeReview();
     } catch (error) {
       reviewError.textContent =
         error instanceof Error ? error.message : "Could not submit response";
     } finally {
-      for (const button of [reviewApprove, reviewChanges, reviewReject]) {
+      for (const button of [
+        reviewApprove,
+        reviewChanges,
+        reviewReject,
+        reviewSupersede,
+      ]) {
         button.disabled = false;
       }
     }
   }
 
   function showMissingSource(item: WebDocument): void {
+    closeFeedbackComposer();
+    closeMarkdownFeedbackPopup();
+    feedbackAddSelection.hidden = true;
+    selectedMarkdownWitness = undefined;
+    renderedSourceMap = undefined;
+    renderedSourceWitness = undefined;
     setMissingReader(true);
     renderedChangeReview = undefined;
     renderChangeReview();
@@ -1612,22 +4008,45 @@ async function boot(): Promise<void> {
     if (missing) {
       readerToc.setAttribute("hidden", "");
       readerTocList.replaceChildren();
+      renderReaderLayout();
     }
   }
 
   function closeReader(pushHistory = true): void {
+    closeFeedbackComposer();
+    closeMarkdownFeedbackPopup();
     renderSequence += 1;
     readerReady = false;
     updateExportAvailability();
     renderedRevision = undefined;
+    renderedSourceWitness = undefined;
+    feedbackDraftRevision = undefined;
     renderedChangeReview = undefined;
+    renderedSourceMap = undefined;
+    selectedMarkdownWitness = undefined;
+    feedbackAddSelection.setAttribute("hidden", "");
+    feedbackPanel.setAttribute("hidden", "");
+    reviewPanel.setAttribute("hidden", "");
     state.selectedId = undefined;
     reader.setAttribute("hidden", "");
     readerToc.setAttribute("hidden", "");
     readerTocList.replaceChildren();
+    renderReaderLayout();
     queuePanel.removeAttribute("hidden");
     if (pushHistory) {
-      history.pushState({}, "", "/");
+      const workspaces = currentVisibleWorkspaces(
+        state.documents.filter(({ kind }) => kind !== "change-review"),
+      );
+      history.pushState(
+        queueHistoryState(state.filters),
+        "",
+        currentRoute(
+          projectQueueRoute(
+            state.filters.workspaceId,
+            [...workspaces, ...state.workspaces],
+          ),
+        ),
+      );
     }
   }
 
@@ -1638,23 +4057,112 @@ async function boot(): Promise<void> {
     render();
   }
 
-  async function act(action: "read" | "unread" | "archive"): Promise<void> {
-    if (!state.selectedId) {
+  async function act(action: "read" | "unread"): Promise<void> {
+    const id = state.selectedId;
+    if (!id) {
       return;
     }
-    const selected = state.documents.find(({ id }) => id === state.selectedId);
-    if (action !== "archive" && selected && isSourceMissing(selected)) {
+    const selected = state.documents.find((item) => item.id === id);
+    if (selected && isSourceMissing(selected)) {
       return;
     }
     const updated = await api<WebDocument>(
-      `/api/v1/documents/${state.selectedId}/${action}`,
+      `/api/v1/documents/${id}/${action}`,
       { method: "POST" },
     );
     replaceDocument(updated);
-    if (action === "archive") {
-      state.documents = state.documents.filter(({ id }) => id !== updated.id);
+  }
+
+  function requestMutation(
+    action: "archive" | "purge",
+    ids: string[],
+  ): void {
+    if (ids.length === 0) {
+      return;
+    }
+    pendingMutation = { action, ids: [...ids] };
+    const confirmation = webMutationConfirmation(action, ids.length);
+    actionDialogTitle.textContent = confirmation.title;
+    actionDialogMessage.textContent = confirmation.message;
+    actionConfirm.textContent = confirmation.confirmLabel;
+    actionConfirm.classList.toggle("danger", action === "purge");
+    actionDialog.showModal();
+  }
+
+  function showQueueFailure(title: string, error: unknown): void {
+    queueErrorTitle.textContent = title;
+    queueErrorGuidance.textContent = error instanceof Error
+      ? error.message
+      : "The operation failed. Please try again.";
+    queueError.removeAttribute("hidden");
+  }
+
+  async function mutateDocuments(
+    action: WebMutationAction,
+    ids: string[],
+  ): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    const previousDocuments = state.documents;
+    const selectedId = state.selectedId;
+    queueError.setAttribute("hidden", "");
+    state.documents = state.documents.filter((document) => !ids.includes(document.id));
+    for (const id of ids) {
+      state.selectedDocumentIds.delete(id);
+    }
+    if (selectedId !== undefined && ids.includes(selectedId)) {
       closeReader();
+    }
+    render();
+    try {
+      await api<BulkDocumentResult>("/api/v1/documents/bulk", {
+        method: "POST",
+        body: JSON.stringify({ action, ids }),
+      });
+      if (action === "archive") {
+        lastArchivedIds = [...ids];
+        archiveUndoMessage.textContent = ids.length === 1
+          ? "Document archived."
+          : `${ids.length} documents archived.`;
+        archiveUndo.removeAttribute("hidden");
+      }
+    } catch (error) {
+      state.documents = previousDocuments;
       render();
+      showQueueFailure(
+        action === "archive"
+          ? "Could not archive documents"
+          : action === "restore"
+            ? "Could not restore documents"
+            : "Could not purge documents",
+        error,
+      );
+    }
+  }
+
+  async function switchContentMode(mode: WebContentMode): Promise<void> {
+    state.filters.contentMode = mode;
+    state.filters.changeReviewsOnly = mode === "change-reviews";
+    if (mode === "archive") {
+      state.filters.actionsOnly = false;
+      state.filters.status = "all";
+    }
+    state.selectedDocumentIds.clear();
+    closeReader(false);
+    history.pushState(
+      queueHistoryState(state.filters),
+      "",
+      currentRoute(currentProjectRoute()),
+    );
+    setLiveStatus("loading");
+    try {
+      const loaded = await load(false);
+      if (loaded) {
+        setLiveStatus(state.documents.length === 0 ? "loaded, empty" : "loaded");
+      }
+    } catch (error) {
+      failClosedLoad(error);
     }
   }
 
@@ -1662,33 +4170,144 @@ async function boot(): Promise<void> {
     state.filters.search = search.value;
     renderQueue();
   });
+  selectVisible.addEventListener("click", () => {
+    const ids = bulkDocumentIds(
+      state.documents,
+      state.filters,
+      state.reviewRequests,
+    );
+    const allSelected = ids.length > 0 &&
+      ids.every((id) => state.selectedDocumentIds.has(id));
+    for (const id of ids) {
+      if (allSelected) {
+        state.selectedDocumentIds.delete(id);
+      } else {
+        state.selectedDocumentIds.add(id);
+      }
+    }
+    renderQueue();
+  });
+  bulkArchive.addEventListener("click", () =>
+    requestMutation("archive", [...state.selectedDocumentIds])
+  );
+  bulkRestore.addEventListener("click", () =>
+    void mutateDocuments("restore", [...state.selectedDocumentIds])
+  );
+  bulkPurge.addEventListener("click", () =>
+    requestMutation("purge", [...state.selectedDocumentIds])
+  );
   actionsFilter.addEventListener("click", () => {
-    state.filters.actionsOnly = state.filters.actionsOnly !== true;
-    state.filters.changeReviewsOnly = false;
+    if (state.filters.actionsOnly === true) {
+      return;
+    }
+    const workspaces = currentVisibleWorkspaces(
+      state.documents.filter(({ kind }) => kind !== "change-review"),
+    );
+    const transition = actionsQueueTransition(
+      state.filters,
+      state.selectedId !== undefined,
+      [...workspaces, ...state.workspaces],
+    );
+    state.filters = transition.filters;
+    state.filters.status = "all";
+    if (transition.pushHistory) {
+      closeReader(false);
+      history.pushState(
+        transition.historyState,
+        "",
+        currentRoute(transition.route),
+      );
+      window.scrollTo(0, 0);
+    } else {
+      history.replaceState(
+        transition.historyState,
+        "",
+        currentRoute(transition.route),
+      );
+    }
     render();
   });
   changeReviewsFilter.addEventListener("click", () => {
-    state.filters.changeReviewsOnly = true;
-    state.filters.actionsOnly = false;
-    state.filters.workspaceId = undefined;
-    render();
+    void switchContentMode("change-reviews");
+  });
+  docsFilter.addEventListener("click", () => {
+    void switchContentMode("docs");
+  });
+  archiveFilter.addEventListener("click", () => void switchContentMode("archive"));
+  spaceSelect.addEventListener("change", () => {
+    state.selectedSpace = spaceSelect.value === "" ? undefined : spaceSelect.value;
+    closeReader(false);
+    history.pushState(
+      queueHistoryState(state.filters),
+      "",
+      currentRoute(currentProjectRoute()),
+    );
+    setLiveStatus("loading");
+    void load(false)
+      .then((loaded) => {
+        if (!loaded) {
+          return;
+        }
+        setLiveStatus(state.documents.length === 0 ? "loaded, empty" : "loaded");
+        spaceSelect.focus();
+      })
+      .catch(failClosedLoad);
+  });
+  projectSelect.addEventListener("focus", () => {
+    if (!projectPickerOpen) {
+      openProjectPicker();
+    }
+  });
+  projectSelect.addEventListener("click", () => {
+    if (!projectPickerOpen) {
+      openProjectPicker();
+    }
+  });
+  projectSelect.addEventListener("input", () => {
+    if (!projectPickerOpen) {
+      projectPickerOpen = true;
+      projectSelect.setAttribute("aria-expanded", "true");
+      projectOptions.removeAttribute("hidden");
+    }
+    renderProjectOptions(projectSelect.value);
+  });
+  projectSelect.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!projectPickerOpen) {
+        openProjectPicker();
+        return;
+      }
+      highlightProjectChoice(
+        highlightedProjectIndex + (event.key === "ArrowDown" ? 1 : -1),
+      );
+      return;
+    }
+    if (event.key === "Enter" && projectPickerOpen) {
+      event.preventDefault();
+      const choice = displayedProjectChoices[highlightedProjectIndex];
+      if (highlightedProjectIndex >= 0) {
+        selectProjectChoice(choice);
+      }
+      return;
+    }
+    if (event.key === "Escape" && projectPickerOpen) {
+      event.preventDefault();
+      closeProjectPicker();
+      projectSelect.select();
+    }
+  });
+  projectSelect.addEventListener("blur", () => {
+    if (projectPickerOpen) {
+      closeProjectPicker();
+    }
   });
   changeFilePrevious.addEventListener("click", () => {
     changeFileIndex -= 1;
-    changeHunkIndex = 0;
     renderChangeReview();
   });
   changeFileNext.addEventListener("click", () => {
     changeFileIndex += 1;
-    changeHunkIndex = 0;
-    renderChangeReview();
-  });
-  changeHunkPrevious.addEventListener("click", () => {
-    changeHunkIndex -= 1;
-    renderChangeReview();
-  });
-  changeHunkNext.addEventListener("click", () => {
-    changeHunkIndex += 1;
     renderChangeReview();
   });
   changeLayout.addEventListener("click", () => {
@@ -1705,8 +4324,13 @@ async function boot(): Promise<void> {
   });
   for (const button of statusButtons) {
     button.addEventListener("click", () => {
+      const wasActionsOnly = state.filters.actionsOnly === true;
+      state.filters.actionsOnly = false;
       state.filters.status =
         button.dataset.statusFilter as WebFilters["status"];
+      if (wasActionsOnly) {
+        history.replaceState(queueHistoryState(state.filters), "", currentRoute());
+      }
       renderStatusCounts();
       renderQueue();
     });
@@ -1722,10 +4346,76 @@ async function boot(): Promise<void> {
   element("reader-back").addEventListener("click", () => closeReader());
   markRead.addEventListener("click", () => void act("read"));
   markUnread.addEventListener("click", () => void act("unread"));
+  copyLink.addEventListener("click", () => {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    if (!selected) {
+      return;
+    }
+    void navigator.clipboard
+      .writeText(new URL(currentRoute(selected.route), location.origin).href)
+      .then(() => {
+        copyLink.textContent = "copied";
+        window.setTimeout(() => {
+          copyLink.textContent = "copy link";
+        }, 1_500);
+      })
+      .catch(() => {
+        copyLink.textContent = "copy failed";
+      });
+  });
   print.addEventListener("click", () => void exportSelectedDocument("print"));
   exportPdf.addEventListener("click", () => void exportSelectedDocument("pdf"));
   exportHtml.addEventListener("click", () => void exportSelectedDocument("html"));
-  element("archive").addEventListener("click", () => void act("archive"));
+  archiveButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      requestMutation("archive", [state.selectedId]);
+    }
+  });
+  restoreButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      void mutateDocuments("restore", [state.selectedId]);
+    }
+  });
+  purgeButton.addEventListener("click", () => {
+    if (state.selectedId !== undefined) {
+      requestMutation("purge", [state.selectedId]);
+    }
+  });
+  actionCancel.addEventListener("click", () => {
+    pendingMutation = undefined;
+    actionDialog.close();
+  });
+  actionDialog.addEventListener("cancel", () => {
+    pendingMutation = undefined;
+  });
+  actionConfirm.addEventListener("click", () => {
+    const mutation = pendingMutation;
+    pendingMutation = undefined;
+    actionDialog.close();
+    if (mutation !== undefined) {
+      void mutateDocuments(mutation.action, mutation.ids);
+    }
+  });
+  archiveUndoButton.addEventListener("click", () => {
+    const ids = [...lastArchivedIds];
+    if (ids.length === 0) {
+      return;
+    }
+    archiveUndo.setAttribute("hidden", "");
+    lastArchivedIds = [];
+    void api<BulkDocumentResult>("/api/v1/documents/bulk", {
+      method: "POST",
+      body: JSON.stringify({ action: "restore", ids }),
+    })
+      .then(async () => {
+        await load(false, false);
+      })
+      .catch((error: unknown) => {
+        lastArchivedIds = ids;
+        archiveUndo.removeAttribute("hidden");
+        showQueueFailure("Could not restore documents", error);
+      });
+  });
   reviewApprove.addEventListener("click", () =>
     void respondToReview("approved"),
   );
@@ -1735,6 +4425,58 @@ async function boot(): Promise<void> {
   reviewReject.addEventListener("click", () =>
     void respondToReview("rejected"),
   );
+  reviewSupersede.addEventListener("click", () =>
+    void respondToReview("superseded"),
+  );
+  reviewFeedbackSave.addEventListener("click", saveFeedback);
+  reviewFeedbackMessage.addEventListener("input", () => {
+    reviewFeedbackError.textContent = "";
+  });
+  reviewFeedbackCancel.addEventListener("click", () => {
+    closeFeedbackComposer();
+    renderChangeReview();
+  });
+  feedbackAddSelection.addEventListener("click", () => {
+    if (!selectedMarkdownWitness) return;
+    openFeedbackComposer(
+      selectedMarkdownWitness,
+      undefined,
+      undefined,
+      false,
+      `“${selectedMarkdownLabel}”`,
+    );
+    feedbackAddSelection.setAttribute("hidden", "");
+  });
+  readerContent.addEventListener("mouseup", captureMarkdownSelection);
+  readerContent.addEventListener("keyup", captureMarkdownSelection);
+  markdownFeedbackPopup.addEventListener("mouseenter", () => clearTimeout(markdownPopupTimer));
+  markdownFeedbackPopup.addEventListener("mouseleave", deferCloseMarkdownFeedbackPopup);
+  window.addEventListener("resize", repositionMarkdownFeedback);
+  window.addEventListener("scroll", repositionMarkdownFeedback, true);
+  const markdownFeedbackResize = new ResizeObserver(repositionMarkdownFeedback);
+  markdownFeedbackResize.observe(readerContent);
+  markdownFeedbackResize.observe(reviewFeedbackComposer);
+  markdownFeedbackResize.observe(markdownFeedbackPopup);
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (markdownFeedbackPopup.hidden && feedbackAddSelection.hidden &&
+        !(feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft))) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    closeMarkdownFeedbackPopup();
+    feedbackAddSelection.hidden = true;
+    if (feedbackDraft && isMarkdownFeedbackAnchor(feedbackDraft)) closeFeedbackComposer();
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!(event.target instanceof Node)) return;
+    if (!markdownFeedbackPopup.contains(event.target) && !markdownPopupMarker?.contains(event.target)) {
+      closeMarkdownFeedbackPopup();
+    }
+    if (!feedbackAddSelection.contains(event.target)) feedbackAddSelection.hidden = true;
+  });
+  feedbackGeneralMessage.addEventListener("input", persistCurrentFeedbackDraft);
+  feedbackSend.addEventListener("click", () => void submitFeedback());
+  reviewResponse.addEventListener("input", () => persistCurrentReviewDraft());
 
   const theme = localStorage.getItem("mdmaid-desk-theme");
   document.documentElement.dataset.theme =
@@ -1778,45 +4520,108 @@ async function boot(): Promise<void> {
     }
   });
 
-  window.addEventListener("popstate", () => {
-    const match = location.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/);
-    if (match?.[1]) {
-      void openDocument(match[1], false);
-    } else {
-      closeReader(false);
-    }
-  });
-
-  const events = new EventSource("/api/v1/events");
-  events.addEventListener("open", () => {
-    live.textContent = "● live";
-    live.classList.remove("offline");
-  });
-  events.addEventListener("catalog", (event) => {
-    const liveSourceEvent = parseLiveSourceCatalogEvent(
-      (event as MessageEvent<string>).data,
-    );
-    catalogRefresh = catalogRefresh
-      .then(async () => {
-        await load(false);
-        if (
-          shouldRefreshWebReader(
-            liveSourceEvent,
-            state.selectedId,
-            renderedRevision,
-          ) && state.selectedId
-        ) {
-          await refreshOpenDocument(state.selectedId);
+  window.addEventListener("popstate", (event) => {
+    void (async () => {
+      const queryState = workspaceQueryState(location.search);
+      const scopeChanged = queryState.selectedSpace !== state.selectedSpace;
+      const contentModeChanged =
+        queryState.contentMode !== state.filters.contentMode;
+      state.selectedSpace = queryState.selectedSpace;
+      state.filters.contentMode = queryState.contentMode;
+      state.filters.changeReviewsOnly = queryState.contentMode === "change-reviews";
+      state.filters.actionsOnly = queryState.actionsOnly;
+      if (queryState.actionsOnly) {
+        state.filters.status = "all";
+      }
+      const match = location.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/);
+      state.selectedId = match?.[1];
+      if (scopeChanged || contentModeChanged) {
+        setLiveStatus("loading");
+        if (!await load(false)) {
+          return;
         }
-      })
-      .catch(() => undefined);
-  });
-  events.addEventListener("error", () => {
-    live.textContent = "○ reconnecting";
-    live.classList.add("offline");
+        setLiveStatus(state.documents.length === 0 ? "loaded, empty" : "loaded");
+      }
+      const navigationDocuments = filterQueue(
+        state.documents,
+        {
+          contentMode: state.filters.contentMode,
+          actionsOnly: state.filters.actionsOnly,
+          status: "all",
+        },
+        state.reviewRequests,
+      );
+      const workspaces = currentVisibleWorkspaces(navigationDocuments);
+      const queueWorkspaces = [...workspaces, ...state.workspaces];
+      if (match?.[1]) {
+        const selection = projectQueueSelectionForReaderHistory(
+          state.filters,
+          event.state,
+          queueWorkspaces,
+        );
+        if (selection) {
+          state.filters = {
+            ...selection.filters,
+            contentMode: queryState.contentMode,
+            changeReviewsOnly: queryState.contentMode === "change-reviews",
+            actionsOnly: queryState.actionsOnly,
+          };
+        }
+        render();
+        await openDocument(match[1], false);
+        return;
+      }
+      const selection = projectQueueSelectionForRoute(
+        state.filters,
+        location.pathname,
+        queueWorkspaces,
+      );
+      if (selection) {
+        state.filters = {
+          ...selection.filters,
+          contentMode: queryState.contentMode,
+          changeReviewsOnly: queryState.contentMode === "change-reviews",
+          actionsOnly: queryState.actionsOnly,
+        };
+      }
+      closeReader(false);
+      render();
+    })().catch((error: unknown) => {
+      state.documents = [];
+      state.workspaces = [];
+      state.reviewRequests = [];
+      closeReader(false);
+      render();
+      setLiveStatus(error instanceof Error ? error.message : "unavailable", true);
+    });
   });
 
   await load();
+
+  const events = new EventSource("/api/v1/events");
+  events.addEventListener("open", () => {
+    setLiveStatus("connected");
+  });
+  const refreshCatalog = (): void => {
+    catalogRefresh = catalogRefresh
+      .then(async () => {
+        const selectedId = state.selectedId;
+        await load(false, false);
+        if (
+          selectedId &&
+          state.selectedId === selectedId &&
+          state.documents.some(({ id }) => id === selectedId)
+        ) {
+          await refreshOpenDocument(selectedId);
+        }
+      })
+      .catch(failClosedLoad);
+  };
+  events.addEventListener("ready", refreshCatalog);
+  events.addEventListener("catalog-invalidated", refreshCatalog);
+  events.addEventListener("error", () => {
+    setLiveStatus("reconnecting", true);
+  });
 }
 
 function element(id: string): HTMLElement {

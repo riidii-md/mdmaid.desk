@@ -51,6 +51,10 @@ test("adds a workspace, registers a document, and lists it", async () => {
         "example",
         "--name",
         "Example",
+        "--repository",
+        "github.com/riidii-md/eywizards",
+        "--repository-name",
+        "EyWizards",
       ],
       stdout,
       stderr,
@@ -69,6 +73,8 @@ test("adds a workspace, registers a document, and lists it", async () => {
         "plan",
         "--task",
         "PROJECT-123",
+        "--feature-name",
+        "Durable Project Naming",
         "--attention",
         "approval",
       ],
@@ -96,6 +102,294 @@ test("adds a workspace, registers a document, and lists it", async () => {
   assert.match(stdout.text(), /registered doc-/);
   assert.match(stdout.text(), /PROJECT-123/);
   assert.equal(stderr.text(), "");
+
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  assert.equal(
+    catalog.listDocuments()[0]?.projectName,
+    "EyWizards / PROJECT-123 (Durable Project Naming)",
+  );
+  catalog.close();
+});
+
+test("routes dry-run-first workspace reconciliation through the daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-reconcile-"));
+  const statePath = join(root, "missing", "catalog.sqlite3");
+  const calls: unknown[] = [];
+  const client = {
+    requireCapabilities: async (...capabilities: string[]) => {
+      calls.push(["capabilities", capabilities]);
+    },
+    reconcileWorkspace: async (sourceWorkspaceId: string, input: unknown) => {
+      calls.push(["reconcile", sourceWorkspaceId, input]);
+      return {
+        sourceWorkspaceId,
+        targetWorkspaceId: "stable-repository",
+        applied: true,
+        movedDocumentIds: ["doc-0123456789abcdefabcd"],
+        discardedDocumentIds: [],
+        blockingConflicts: [],
+        reviewRequestCount: 1,
+      };
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      [
+        "workspace",
+        "reconcile",
+        "task-derived",
+        "--into",
+        "stable-repository",
+        "--apply",
+        "--json",
+      ],
+      stdout,
+      stderr,
+      { statePath, connectDaemon: async () => client },
+    ),
+    0,
+  );
+  assert.deepEqual(calls, [
+    ["capabilities", ["workspace-reconciliation-v1"]],
+    ["reconcile", "task-derived", {
+      targetWorkspaceId: "stable-repository",
+      discardArchivedConflicts: false,
+      apply: true,
+    }],
+  ]);
+  assert.equal(JSON.parse(stdout.text()).data.applied, true);
+  assert.equal(stderr.text(), "");
+  await assert.rejects(readFile(statePath), /ENOENT/);
+});
+
+test("manages Spaces from repeatable matcher flags and emits stable JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-spaces-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  await mkdir(workspace);
+  await run([
+    "workspace", "add", workspace, "--id", "example",
+    "--repository", "github.com/acme/product",
+    "--repository-name", "Product",
+  ], output(), output(), { statePath });
+
+  const created = output();
+  assert.equal(await run([
+    "space", "add", "work", "--name", "Work",
+    "--workspace", "example", "--tag", "urgent", "--json",
+  ], created, output(), { statePath }), 0);
+  assert.deepEqual(JSON.parse(created.text()), {
+    schemaVersion: 1,
+    data: {
+      id: "work",
+      name: "Work",
+      matchers: [
+        { kind: "repository", value: "github.com/acme/product" },
+        { kind: "tag", value: "urgent" },
+      ],
+    },
+  });
+
+  const listed = output();
+  assert.equal(await run(["space", "list", "--json"], listed, output(), { statePath }), 0);
+  assert.equal(JSON.parse(listed.text()).data[0].id, "work");
+  assert.equal(await run([
+    "space", "matchers", "set", "work", "--namespace", "github.com/acme",
+  ], output(), output(), { statePath }), 0);
+  assert.equal(await run([
+    "space", "rename", "work", "--name", "Office",
+  ], output(), output(), { statePath }), 0);
+  assert.equal(await run(["space", "delete", "work"], output(), output(), { statePath }), 0);
+});
+
+test("refuses a live daemon without Space capabilities without local fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-old-daemon-"));
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const client = {
+    requireCapabilities: async () => {
+      throw new Error("restart it after upgrading");
+    },
+  } as unknown as DeskApiClient;
+  const stderr = output();
+  assert.equal(await run(
+    ["space", "list"],
+    output(),
+    stderr,
+    { statePath, connectDaemon: async () => client },
+  ), 1);
+  assert.match(stderr.text(), /restart it after upgrading/);
+  await assert.rejects(readFile(statePath), /ENOENT/);
+});
+
+test("shows and lists durable feedback as stable JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-feedback-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "brief.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, "# Brief\n", "utf8");
+  const catalog = await Catalog.open(statePath, { legacyStatePath: false });
+  await catalog.addWorkspace({
+    id: "example",
+    name: "Example",
+    root: workspace,
+    artifactRoots: [workspace],
+  });
+  const document = await catalog.registerDocument({
+    workspaceId: "example",
+    kind: "brief",
+    title: "Brief",
+    path: documentPath,
+    attention: "none",
+  });
+  const feedback = await catalog.createFeedback({
+    id: "feedback-0123456789abcdef0123",
+    documentId: document.id,
+    documentRevision: document.revision,
+    generalMessage: "Read this later.",
+    comments: [],
+  });
+  catalog.close();
+
+  const shown = output();
+  assert.equal(await run(
+    ["feedback", "show", feedback.id, "--json"],
+    shown,
+    output(),
+    { statePath, connectDaemon: async () => undefined },
+  ), 0);
+  assert.deepEqual(JSON.parse(shown.text()), {
+    schemaVersion: 1,
+    feedback,
+  });
+
+  const listed = output();
+  assert.equal(await run(
+    ["feedback", "list", "--document", document.id, "--json"],
+    listed,
+    output(),
+    { statePath, connectDaemon: async () => undefined },
+  ), 0);
+  assert.deepEqual(JSON.parse(listed.text()), {
+    schemaVersion: 1,
+    page: { items: [feedback] },
+  });
+});
+
+test("preflights Mermaid and returns every issue as JSON", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-validate-"));
+  const documentPath = join(root, "review.md");
+  await writeFile(documentPath, [
+    "```mermaid",
+    "flowchart LR",
+    "  A --> B",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"), "utf8");
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(["validate", documentPath, "--json"], stdout, stderr, {
+      statePath: join(root, "unused.sqlite3"),
+    }),
+    1,
+  );
+  const result = JSON.parse(stdout.text()) as {
+    schemaVersion: number;
+    validation: {
+      kind: string;
+      valid: boolean;
+      diagramCount: number;
+      issues: Array<{ block: number; line: number; message: string }>;
+    };
+  };
+  assert.equal(result.schemaVersion, 1);
+  assert.equal(result.validation.kind, "mermaid");
+  assert.equal(result.validation.valid, false);
+  assert.equal(result.validation.diagramCount, 3);
+  assert.deepEqual(
+    result.validation.issues.map(({ block, line }) => ({ block, line })),
+    [
+      { block: 2, line: 6 },
+      { block: 3, line: 11 },
+    ],
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("returns structured Mermaid failures from JSON registration", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-register-mermaid-"));
+  const workspace = join(root, "workspace");
+  const statePath = join(root, "state", "catalog.sqlite3");
+  const documentPath = join(workspace, "broken.md");
+  await mkdir(workspace);
+  await writeFile(documentPath, [
+    "```mermaid",
+    "stateDiagram-v2",
+    "  [*] -->",
+    "```",
+    "",
+    "```mermaid",
+    "stateDiagram-v2",
+    "  Ready -->",
+    "```",
+  ].join("\n"), "utf8");
+  assert.equal(
+    await run(
+      ["workspace", "add", workspace, "--id", "example"],
+      output(),
+      output(),
+      { statePath },
+    ),
+    0,
+  );
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run([
+      "register",
+      documentPath,
+      "--workspace",
+      "example",
+      "--json",
+    ], stdout, stderr, { statePath }),
+    1,
+  );
+  const result = JSON.parse(stderr.text()) as {
+    schemaVersion: number;
+    error: {
+      code: string;
+      validation: {
+        diagramCount: number;
+        issues: Array<{ block: number; line: number }>;
+      };
+    };
+  };
+  assert.equal(result.schemaVersion, 1);
+  assert.equal(result.error.code, "invalid_mermaid");
+  assert.equal(result.error.validation.diagramCount, 2);
+  assert.deepEqual(
+    result.error.validation.issues.map(({ block, line }) => ({ block, line })),
+    [
+      { block: 1, line: 1 },
+      { block: 2, line: 6 },
+    ],
+  );
+  assert.equal(stdout.text(), "");
 });
 
 test("publishes an explicit review gate and returns its response as JSON", async () => {
@@ -351,6 +645,281 @@ test("waits on daemon events and returns the durable review decision", async () 
     result.reviewRequest.response.message,
     "Proceed after the canary check.",
   );
+  assert.equal(stderr.text(), "");
+});
+
+test("returns a superseded review so a waiting agent can ignore it", async () => {
+  const request = {
+    id: "review-0123456789abcdefabcd",
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review the old implementation.",
+    status: "superseded" as const,
+    response: {
+      outcome: "superseded" as const,
+      message: "A newer change review is available.",
+      createdAt: "2026-09-18T09:05:00.000Z",
+    },
+    staleAt: null,
+    createdAt: "2026-09-18T09:00:00.000Z",
+  };
+  const client = {
+    getReviewRequest: async () => request,
+  } as unknown as DeskApiClient;
+  const stdout = output();
+
+  assert.equal(
+    await run(["review", "wait", request.id, "--json"], stdout, output(), {
+      statePath: "/unused/catalog.sqlite3",
+      connectDaemon: async () => client,
+    }),
+    0,
+  );
+  assert.equal(JSON.parse(stdout.text()).reviewRequest.status, "superseded");
+});
+
+test("hands an active review wait to the updated CLI when its installed version changes", async () => {
+  const pending = {
+    id: "review-0123456789abcdefabcd",
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review the exact implementation.",
+    status: "pending" as const,
+    response: null,
+    staleAt: null,
+    createdAt: "2026-09-18T14:59:03.835Z",
+  };
+  const changed = {
+    ...pending,
+    status: "changes_requested" as const,
+    response: {
+      outcome: "changes_requested" as const,
+      message: "Keep the migration plan unchanged.",
+      items: [{
+        id: "feedback-cf4ac9f1f7fe422f8076",
+        kind: "feedback" as const,
+        path: "docs/ai/agentic/harness-migration-plan.md",
+        message: "Remove this file from the change.",
+      }],
+      createdAt: "2026-09-18T19:59:27.931Z",
+    },
+  };
+  let installedVersion = "0.1.17";
+  let subscriptionStarted: (() => void) | undefined;
+  const subscribed = new Promise<void>((resolvePromise) => {
+    subscriptionStarted = resolvePromise;
+  });
+  let subscriptionAborted = false;
+  const client = {
+    getReviewRequest: async () => pending,
+    subscribeCatalog: async (
+      _onEvent: (event: { action: string; reviewRequestId: string }) => void,
+      options: { signal?: AbortSignal; onReady?: () => void },
+    ) => {
+      options.onReady?.();
+      subscriptionStarted?.();
+      await new Promise<void>((resolvePromise) => {
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            subscriptionAborted = true;
+            resolvePromise();
+          },
+          { once: true },
+        );
+      });
+    },
+  } as unknown as DeskApiClient;
+  const resumed: string[] = [];
+  const stdout = output();
+  const stderr = output();
+
+  const waiting = run(
+    ["review", "wait", pending.id, "--json"],
+    stdout,
+    stderr,
+    {
+      statePath: "/unused/catalog.sqlite3",
+      connectDaemon: async () => client,
+      reviewPollIntervalMs: 1,
+      runningPackageVersion: "0.1.17",
+      readInstalledPackageVersion: () => installedVersion,
+      resumeReviewWait: async (id) => {
+        resumed.push(id);
+        return changed;
+      },
+    },
+  );
+  await subscribed;
+  installedVersion = "0.1.18";
+
+  assert.equal(await waiting, 0);
+  assert.deepEqual(resumed, [pending.id]);
+  assert.equal(subscriptionAborted, true);
+  assert.deepEqual(JSON.parse(stdout.text()).reviewRequest, changed);
+  assert.equal(stderr.text(), "");
+});
+
+test("continues the wait through the updated CLI entrypoint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-"));
+  const entryPath = join(root, "updated-cli.mjs");
+  await writeFile(
+    entryPath,
+    [
+      "const id = process.argv[4];",
+      "if (process.argv.slice(2, 4).join(' ') !== 'review wait' || process.argv[5] !== '--json') process.exit(2);",
+      "process.stdout.write(JSON.stringify({",
+      "  schemaVersion: 1,",
+      "  reviewRequest: {",
+      "    id,",
+      "    documentId: 'doc-0123456789abcdefabcd',",
+      "    documentRevision: 1,",
+      "    kind: 'change-decision',",
+      "    requestMessage: 'Review the exact implementation.',",
+      "    status: 'changes_requested',",
+      "    response: { outcome: 'changes_requested', message: 'Keep the migration plan unchanged.',",
+      "      items: [{ id: 'feedback-11111111111111111111', kind: 'feedback',",
+      "        path: 'docs/ai/agentic/harness-migration-plan.md', message: 'Leave this file unchanged.' }],",
+      "      createdAt: '2026-09-18T20:00:00.000Z' },",
+      "    staleAt: null,",
+      "    createdAt: '2026-09-18T14:59:03.835Z'",
+      "  }",
+      "}) + '\\n');",
+    ].join("\n"),
+    "utf8",
+  );
+  const stdout = output();
+  const stderr = output();
+  const id = "review-0123456789abcdefabcd";
+
+  assert.equal(
+    await run(
+      ["review", "wait", id, "--json"],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        updatedCliEntryPath: entryPath,
+      },
+    ),
+    0,
+  );
+  const result = JSON.parse(stdout.text());
+  assert.equal(result.reviewRequest.id, id);
+  assert.equal(result.reviewRequest.status, "changes_requested");
+  assert.equal(result.reviewRequest.response.items[0].path, "docs/ai/agentic/harness-migration-plan.md");
+  assert.equal(stderr.text(), "");
+});
+
+test("rejects an invalid decision returned by the updated CLI", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-invalid-"));
+  const entryPath = join(root, "updated-cli.mjs");
+  await writeFile(
+    entryPath,
+    "process.stdout.write(JSON.stringify({ schemaVersion: 1, reviewRequest: { id: process.argv[4], status: 'approved' } }) + '\\n');\n",
+    "utf8",
+  );
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      ["review", "wait", "review-0123456789abcdefabcd", "--json"],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        updatedCliEntryPath: entryPath,
+      },
+    ),
+    1,
+  );
+  assert.equal(stdout.text(), "");
+  assert.match(stderr.text(), /invalid review request/);
+});
+
+test("preserves register output without repeating publication during waiter handoff", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-update-register-"));
+  const documentPath = join(root, "change-review.md");
+  await writeFile(documentPath, "# Change review\n", "utf8");
+  const id = "review-0123456789abcdefabcd";
+  const pending = {
+    id,
+    documentId: "doc-0123456789abcdefabcd",
+    documentRevision: 1,
+    kind: "change-decision" as const,
+    requestMessage: "Review this change.",
+    status: "pending" as const,
+    response: null,
+    staleAt: null,
+    createdAt: "2026-09-18T14:59:03.835Z",
+  };
+  const approved = {
+    ...pending,
+    status: "approved" as const,
+    response: {
+      outcome: "approved" as const,
+      message: "Ship it.",
+      createdAt: "2026-09-18T20:00:00.000Z",
+    },
+  };
+  let registrations = 0;
+  let reviewCreations = 0;
+  const client = {
+    registerDocument: async () => {
+      registrations += 1;
+      return { id: pending.documentId, revision: 1 };
+    },
+    createReviewRequest: async () => {
+      reviewCreations += 1;
+      return pending;
+    },
+  } as unknown as DeskApiClient;
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(
+    await run(
+      [
+        "register",
+        documentPath,
+        "--workspace",
+        "example",
+        "--kind",
+        "change-review",
+        "--expect",
+        "change-decision",
+        "--request-message",
+        pending.requestMessage,
+        "--wait",
+        "--json",
+      ],
+      stdout,
+      stderr,
+      {
+        statePath: "/unused/catalog.sqlite3",
+        connectDaemon: async () => client,
+        runningPackageVersion: "0.1.17",
+        readInstalledPackageVersion: () => "0.1.18",
+        resumeReviewWait: async (reviewId) => {
+          assert.equal(reviewId, id);
+          return approved;
+        },
+      },
+    ),
+    0,
+  );
+  const result = JSON.parse(stdout.text());
+  assert.equal(registrations, 1);
+  assert.equal(reviewCreations, 1);
+  assert.equal(result.document.id, pending.documentId);
+  assert.deepEqual(result.reviewRequest, approved);
   assert.equal(stderr.text(), "");
 });
 
@@ -621,6 +1190,27 @@ test("documents live registration in global and command help", async () => {
   assert.equal(stderr.text(), "");
 });
 
+test("documents change-review registration and its decision request in help", async () => {
+  const stdout = output();
+  const stderr = output();
+
+  assert.equal(await run(["--help"], stdout, stderr), 0);
+  assert.match(
+    stdout.text(),
+    /--kind change-review\s+--attention approval --expect change-decision/,
+  );
+  assert.equal(stderr.text(), "");
+
+  const registerHelp = output();
+  assert.equal(await run(["register", "--help"], registerHelp, stderr), 0);
+  assert.match(registerHelp.text(), /\[--expect plan-decision\|change-decision\]/);
+  assert.match(
+    registerHelp.text(),
+    /--kind change-review with\s+--attention approval --expect change-decision/,
+  );
+  assert.equal(stderr.text(), "");
+});
+
 test("prints the published package version without opening the catalog", async () => {
   const stdout = output();
   const stderr = output();
@@ -679,6 +1269,10 @@ test("runs the web service until shutdown and prints its browser URL", async () 
       );
       assert.equal(descriptor?.port, 43121);
       assert.equal(descriptor?.token, "test-token");
+      assert.equal(
+        descriptor?.publicUrl,
+        "http://mdmaid.desk.localhost:43121",
+      );
     },
   });
 
@@ -721,6 +1315,94 @@ test("reuses a running daemon when opening the web workspace", async () => {
     "mdmaid.desk web: http://mdmaid.desk.localhost:43121/?token=test-token\n",
   );
   assert.equal(stderr.text(), "");
+});
+
+test("prints the portless canonical URL when reusing the default daemon", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-default-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("prints a proxied daemon's recorded public URL", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-proxied-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(
+    43127,
+    "http://mdmaid.desk.localhost",
+  );
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("reuses the default daemon when its port is selected explicitly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-selected-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web", "--port", "80"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 0);
+  assert.equal(
+    stdout.text(),
+    "mdmaid.desk web: http://mdmaid.desk.localhost/?token=test-token\n",
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("rejects a second web server on a different port for the same state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-web-conflict-"));
+  const stdout = output();
+  const stderr = output();
+  const connection = fakeConnection(80);
+
+  const exit = await run(["web", "--port", "43128"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    connectDaemonInfo: async () => connection,
+    startServer: async () => {
+      throw new Error("must not start another daemon");
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(stdout.text(), "");
+  assert.match(stderr.text(), /daemon is already running on port 80/);
 });
 
 test("exposes explicit daemon lifecycle and user-service commands", async () => {
@@ -795,25 +1477,25 @@ test("uses the canonical direct localhost HTTP origin by default", async () => {
 
   assert.equal(exit, 0);
   assert.equal(started?.host, "127.0.0.1");
-  assert.equal(started?.port, 43127);
+  assert.equal(started?.port, 80);
   assert.equal(
     started?.publicUrl,
-    "http://mdmaid.desk.localhost:43127",
+    "http://mdmaid.desk.localhost",
   );
   assert.match(
     stdout.text(),
-    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost\/\?token=/,
   );
   assert.doesNotMatch(stdout.text(), /proxy target/);
   assert.equal(stderr.text(), "");
 });
 
-test("lets the daemon choose an available port when the default is occupied", async () => {
+test("uses Traefik with a fixed backend port when port 80 is occupied", async () => {
   const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-open-port-"));
   const statePath = join(root, "catalog.sqlite3");
   const stdout = output();
   const stderr = output();
-  const attempted: number[] = [];
+  const attempted: Array<{ port: number | undefined; publicUrl: string | undefined }> = [];
 
   const exit = await run(
     ["__daemon-serve", "--state-path", statePath],
@@ -821,31 +1503,147 @@ test("lets the daemon choose an available port when the default is occupied", as
     stderr,
     {
       startServer: async (options) => {
-        attempted.push(options.port ?? -1);
+        attempted.push({ port: options.port, publicUrl: options.publicUrl });
         if (attempted.length === 1) {
           const error = new Error("address in use") as NodeJS.ErrnoException;
           error.code = "EADDRINUSE";
           throw error;
         }
         return fakeServer(() => undefined, {
-          port: 49876,
-          url: "http://127.0.0.1:49876",
-          webUrl: "http://127.0.0.1:49876/?token=test-token",
+          port: options.port ?? 0,
+          url: `http://127.0.0.1:${options.port}`,
+          webUrl: `${options.publicUrl}/?token=${options.token ?? ""}`,
         });
       },
-      waitForShutdown: async () => {
-        const descriptor = await readDaemonDescriptor(
-          daemonDescriptorPath(statePath),
-        );
-        assert.equal(descriptor?.port, 49876);
-      },
+      ensureTraefikRoute: async () => true,
+      waitForShutdown: async () => undefined,
     },
   );
 
   assert.equal(exit, 0);
-  assert.deepEqual(attempted, [43127, 0]);
+  assert.deepEqual(attempted, [
+    { port: 80, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost" },
+  ]);
   assert.equal(stdout.text(), "");
   assert.equal(stderr.text(), "");
+});
+
+test("uses the fixed direct fallback when another service owns port 80", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-fallback-port-"));
+  const stdout = output();
+  const stderr = output();
+  const attempted: Array<{ port: number | undefined; publicUrl: string | undefined }> = [];
+
+  const exit = await run(["web"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      attempted.push({ port: options.port, publicUrl: options.publicUrl });
+      if (attempted.length === 1) {
+        const error = new Error("permission denied") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return fakeServer(() => undefined, {
+        port: options.port ?? 0,
+        url: `http://127.0.0.1:${options.port}`,
+        webUrl: `${options.publicUrl}/?token=${options.token ?? ""}`,
+      });
+    },
+    ensureTraefikRoute: async () => false,
+    waitForShutdown: async () => undefined,
+  });
+
+  assert.equal(exit, 0);
+  assert.deepEqual(attempted, [
+    { port: 80, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost" },
+    { port: 43127, publicUrl: "http://mdmaid.desk.localhost:43127" },
+  ]);
+  assert.match(
+    stdout.text(),
+    /mdmaid\.desk web: http:\/\/mdmaid\.desk\.localhost:43127\/\?token=/,
+  );
+  assert.equal(stderr.text(), "");
+});
+
+test("does not publish a Traefik route when the backend port is occupied", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-busy-backend-"));
+  const stderr = output();
+  const attempted: number[] = [];
+  let routeChecks = 0;
+
+  const exit = await run(["web"], output(), stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async (options) => {
+      attempted.push(options.port ?? -1);
+      const error = new Error("address in use") as NodeJS.ErrnoException;
+      error.code = "EADDRINUSE";
+      throw error;
+    },
+    ensureTraefikRoute: async () => {
+      routeChecks += 1;
+      return true;
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.deepEqual(attempted, [80, 43127]);
+  assert.equal(routeChecks, 0);
+  assert.match(stderr.text(), /address in use/);
+});
+
+test("closes a reserved backend if Traefik route setup fails unexpectedly", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-route-error-"));
+  const stderr = output();
+  let attempts = 0;
+  let closed = false;
+
+  const exit = await run(["web"], output(), stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("address in use") as NodeJS.ErrnoException;
+        error.code = "EADDRINUSE";
+        throw error;
+      }
+      return fakeServer(() => {
+        closed = true;
+      });
+    },
+    ensureTraefikRoute: async () => {
+      throw new Error("Docker route failed");
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(closed, true);
+  assert.match(stderr.text(), /Docker route failed/);
+});
+
+test("keeps an explicit port strict when binding fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mdmaid-desk-cli-strict-port-"));
+  const stdout = output();
+  const stderr = output();
+  let routeChecks = 0;
+
+  const exit = await run(["web", "--port", "80"], stdout, stderr, {
+    statePath: join(root, "catalog.sqlite3"),
+    startServer: async () => {
+      const error = new Error("address in use") as NodeJS.ErrnoException;
+      error.code = "EADDRINUSE";
+      throw error;
+    },
+    ensureTraefikRoute: async () => {
+      routeChecks += 1;
+      return true;
+    },
+  });
+
+  assert.equal(exit, 1);
+  assert.equal(routeChecks, 0);
+  assert.match(stderr.text(), /address in use/);
 });
 
 test("runs the terminal workspace through the same daemon API", async () => {
@@ -946,7 +1744,10 @@ test("reports usage errors for invalid commands and options", async () => {
   const statePath = join(root, "catalog.sqlite3");
   const cases: Array<{ args: string[]; message: RegExp }> = [
     { args: ["unknown"], message: /unknown command/ },
-    { args: ["workspace", "remove"], message: /action must be add or list/ },
+    {
+      args: ["workspace", "remove"],
+      message: /action must be add, reconcile, or list/,
+    },
     {
       args: ["workspace", "add", root, root, "--id", "example"],
       message: /accepts one root/,
@@ -1024,17 +1825,21 @@ function fakeServer(
   };
 }
 
-function fakeConnection(): DaemonConnection {
+function fakeConnection(
+  port = 43121,
+  publicUrl?: string,
+): DaemonConnection {
   return {
-    client: new DeskApiClient("http://127.0.0.1:43121", "test-token"),
+    client: new DeskApiClient(`http://127.0.0.1:${port}`, "test-token"),
     descriptor: {
       protocolVersion: 1,
       pid: process.pid,
       host: "127.0.0.1",
-      port: 43121,
+      port,
       token: "test-token",
       startedAt: "2026-08-12T00:00:00.000Z",
+      ...(publicUrl === undefined ? {} : { publicUrl }),
     },
-    url: "http://127.0.0.1:43121",
+    url: `http://127.0.0.1:${port}`,
   };
 }

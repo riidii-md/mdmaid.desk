@@ -4,7 +4,8 @@
 
 ```bash
 npm install
-npm test
+npx playwright install --only-shell chromium
+npm run check
 ```
 
 ## Development Rules

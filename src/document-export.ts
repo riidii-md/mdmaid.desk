@@ -28,10 +28,20 @@ export function documentExportFilename(title: string): string {
 }
 
 export function isExportImageSource(source: string, documentId: string): boolean {
-  return IMAGE_DATA.test(source) || (
-    /^doc-[a-f0-9]{20}$/.test(documentId) &&
-    new RegExp(`^/d/${documentId}/media/source-[a-f0-9]{20}$`).test(source)
-  );
+  if (IMAGE_DATA.test(source)) return true;
+  if (!/^doc-[a-f0-9]{20}$/.test(documentId)) return false;
+  const match = new RegExp(`^/d/${documentId}/media/source-[a-f0-9]{20}(?:\\?([^#]*))?$`).exec(source);
+  if (!match) return false;
+  const parameters = new URLSearchParams(match[1] ?? "");
+  let valid = true;
+  parameters.forEach((value, key) => {
+    if (parameters.getAll(key).length !== 1 || !(
+      (key === "space" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value)) ||
+      (key === "view" && (value === "docs" || value === "change-reviews")) ||
+      (key === "actions" && value === "1")
+    )) valid = false;
+  });
+  return valid;
 }
 
 export function selfContainedDocumentHtml(input: {

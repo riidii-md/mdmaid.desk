@@ -7,19 +7,23 @@ import stringWidth from "string-width";
 
 import {
   DeskApiError,
-  type CatalogEvent,
   type DeskApiClient,
 } from "./api-client.js";
 import {
   documentStorageLabel,
+  type BulkDocumentAction,
+  type FeedbackSubmissionRegistration,
   type DocumentAction,
   type PublicDocument,
+  type PublicFeedbackSubmission,
   type PublicReviewRequest,
+  type PublicSpace,
   type PublicWorkspace,
   type ReadingStatus,
   type ReviewOutcome,
   type ReviewFeedbackItem,
 } from "./api-types.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
 import { sanitizeTerminalText } from "./terminal-text.js";
 import {
   changedSegments,
@@ -28,11 +32,22 @@ import {
   type ChangeReviewHunk,
   type ChangeReviewLine,
 } from "./change-review.js";
-import { highlightDiffLine, type WebSyntaxKind } from "./web-client.js";
+import {
+  feedbackAnchorLabel,
+  feedbackEndingAtLine,
+  highlightDiffLine,
+  type WebSyntaxKind,
+} from "./web-client.js";
 
 type TuiMode = "queue" | "reader";
 type StatusFilter = "all" | ReadingStatus;
 export type TuiQueueGrouping = "project" | "tag" | "all";
+export type TuiContentMode = "docs" | "change-reviews" | "archive";
+
+interface TuiConfirmation {
+  action: "archive" | "purge";
+  documentIds: string[];
+}
 
 export interface TuiDocumentGroup {
   key: string;
@@ -50,7 +65,15 @@ interface TuiReader {
   changeLayout: "unified" | "side-by-side";
   changeFileIndex: number;
   changeHunkIndex: number;
+  changeLineIndex: number;
+  changeRangeStartIndex?: number | undefined;
   feedbackItems: ReviewFeedbackItem[];
+  markdownFeedbackItems: FeedbackSubmissionRegistration["comments"];
+  feedbackGeneralMessage: string;
+  feedbackHistory: PublicFeedbackSubmission[];
+  sourceWitness?: string;
+  sourceLineIndex: number;
+  sourceMap?: MarkdownSourceMapV1;
 }
 
 interface TuiReviewComposer {
@@ -60,10 +83,22 @@ interface TuiReviewComposer {
   items: ReviewFeedbackItem[];
 }
 
+interface TuiFeedbackComposer {
+  message: string;
+}
+
 interface TuiAnnotationComposer {
   kind: "feedback" | "todo";
-  path: string;
+  path?: string;
   hunkId?: string;
+  line?: number;
+  endLine?: number;
+  side?: "old" | "new";
+  markdownAnchor?: Extract<
+    FeedbackSubmissionRegistration["comments"][number]["anchor"],
+    { kind: "markdown-selection-v1" }
+  >;
+  label?: string;
   message: string;
 }
 
@@ -71,15 +106,22 @@ export interface TuiState {
   documents: PublicDocument[];
   reviewRequests: PublicReviewRequest[];
   reviewComposer?: TuiReviewComposer | undefined;
+  feedbackComposer?: TuiFeedbackComposer | undefined;
   annotationComposer?: TuiAnnotationComposer | undefined;
   actionsOnly: boolean;
   changeReviewsOnly: boolean;
+  contentMode: TuiContentMode;
+  confirmation?: TuiConfirmation | undefined;
   grouping: TuiQueueGrouping;
   mode: TuiMode;
   reader?: TuiReader | undefined;
   search: string;
   searching: boolean;
   selectedIndex: number;
+  selectedDocumentIds: string[];
+  selectedSpace?: string | undefined;
+  scopeGeneration: number;
+  spaces: PublicSpace[];
   statusFilter: StatusFilter;
   queueGroups: TuiDocumentGroup[];
   visibleDocuments: PublicDocument[];
@@ -91,14 +133,22 @@ export interface TuiState {
 
 export type TuiEffect =
   | { type: "open"; documentId: string }
+  | { type: "reload" }
   | { type: "action"; documentId: string; action: DocumentAction }
+  | {
+      type: "bulk-action";
+      action: BulkDocumentAction;
+      documentIds: string[];
+    }
   | {
       type: "review-response";
       requestId: string;
       outcome: ReviewOutcome;
       message: string;
       items?: ReviewFeedbackItem[];
+      feedback?: FeedbackSubmissionRegistration;
     }
+  | { type: "feedback-submit"; input: FeedbackSubmissionRegistration }
   | { type: "quit" };
 
 export interface TuiTransition {
@@ -129,6 +179,7 @@ export function createTuiState(
   documents: PublicDocument[],
   workspaces: PublicWorkspace[],
   reviewRequests: PublicReviewRequest[] = [],
+  spaces: PublicSpace[] = [],
 ): TuiState {
   const visibleWorkspaces = workspacesForDocuments(documents, workspaces);
   const state: TuiState = {
@@ -136,11 +187,15 @@ export function createTuiState(
     reviewRequests,
     actionsOnly: false,
     changeReviewsOnly: false,
+    contentMode: "docs",
     grouping: "project",
     mode: "queue",
     search: "",
     searching: false,
     selectedIndex: 0,
+    selectedDocumentIds: [],
+    scopeGeneration: 0,
+    spaces,
     statusFilter: "all",
     queueGroups: [],
     visibleDocuments: [],
@@ -157,6 +212,8 @@ export function applyTuiReader(
   backend: string,
   warnings: string[],
   changeReview?: ChangeReviewDiff,
+  sourceMap?: MarkdownSourceMapV1,
+  sourceWitness?: string,
 ): TuiState {
   return {
     ...state,
@@ -167,14 +224,22 @@ export function applyTuiReader(
       document,
       warnings,
       ...(changeReview === undefined ? {} : { changeReview }),
+      ...(sourceMap === undefined ? {} : { sourceMap }),
+      ...(sourceWitness === undefined ? {} : { sourceWitness }),
       changeView: changeReview && changeReview.files.length > 0 ? "diff" : "document",
       changeLayout: "unified",
       changeFileIndex: 0,
       changeHunkIndex: 0,
+      changeLineIndex: 0,
       feedbackItems: [],
+      markdownFeedbackItems: [],
+      feedbackGeneralMessage: "",
+      feedbackHistory: [],
+      sourceLineIndex: 0,
     },
     reviewComposer: undefined,
     annotationComposer: undefined,
+    feedbackComposer: undefined,
     scroll: 0,
     searching: false,
     message: undefined,
@@ -199,13 +264,15 @@ export function applyTuiMissingReader(
   );
 }
 
-function refreshTuiReader(
+export function refreshTuiReader(
   state: TuiState,
   document: PublicDocument,
   content: string,
   backend: string,
   warnings: string[],
   changeReview?: ChangeReviewDiff,
+  sourceMap?: MarkdownSourceMapV1,
+  sourceWitness?: string,
 ): TuiState {
   const previous = state.reader;
   const next = applyTuiReader(
@@ -215,8 +282,15 @@ function refreshTuiReader(
     backend,
     warnings,
     changeReview,
+    sourceMap,
+    sourceWitness,
   );
-  if (!previous || previous.document.id !== document.id || !next.reader) {
+  if (
+    !previous ||
+    previous.document.id !== document.id ||
+    previous.document.revision !== document.revision ||
+    !next.reader
+  ) {
     return next;
   }
   const fileCount = next.reader.changeReview?.files.length ?? 0;
@@ -232,13 +306,35 @@ function refreshTuiReader(
       changeLayout: previous.changeLayout,
       changeFileIndex,
       changeHunkIndex: clamp(previous.changeHunkIndex, 0, Math.max(0, hunkCount - 1)),
+      changeLineIndex: clamp(
+        previous.changeLineIndex,
+        0,
+        Math.max(
+          0,
+          (next.reader.changeReview?.files[changeFileIndex]
+            ?.hunks[clamp(previous.changeHunkIndex, 0, Math.max(0, hunkCount - 1))]
+            ?.lines.length ?? 0) - 1,
+        ),
+      ),
       feedbackItems: previous.feedbackItems,
+      markdownFeedbackItems: previous.markdownFeedbackItems,
+      feedbackGeneralMessage: previous.feedbackGeneralMessage,
+      feedbackHistory: previous.feedbackHistory,
+      sourceLineIndex: clamp(
+        previous.sourceLineIndex,
+        0,
+        Math.max(0, (sourceMap?.logicalLines.length ?? 1) - 1),
+      ),
     },
   };
 }
 
 export function shouldRefreshTuiReader(
-  event: CatalogEvent,
+  event: {
+    action: string;
+    documentId?: string;
+    revision?: number;
+  },
   readerDocumentId: string | undefined,
   renderedRevision: number | undefined,
 ): boolean {
@@ -253,6 +349,21 @@ export function shouldRefreshTuiReader(
         renderedRevision === undefined ||
         (event.revision !== undefined && event.revision > renderedRevision)),
   );
+}
+
+export function completeTuiReviewResponse(state: TuiState): TuiState {
+  return {
+    ...state,
+    reviewComposer: undefined,
+    reader: state.reader
+      ? {
+          ...state.reader,
+          feedbackItems: [],
+          markdownFeedbackItems: [],
+          feedbackGeneralMessage: "",
+        }
+      : undefined,
+  };
 }
 
 export function replaceTuiDocuments(
@@ -280,6 +391,9 @@ export function replaceTuiDocuments(
     : -1;
   next = {
     ...next,
+    selectedDocumentIds: next.selectedDocumentIds.filter((id) =>
+      next.visibleDocuments.some((document) => document.id === id)
+    ),
     selectedIndex:
       selectedIndex >= 0
         ? selectedIndex
@@ -287,15 +401,34 @@ export function replaceTuiDocuments(
   };
   if (next.reader) {
     const readerDocumentId = next.reader.document.id;
+    const previousPendingId = pendingReviewForDocument(
+      state.reviewRequests,
+      readerDocumentId,
+    )?.id;
+    const nextPendingId = pendingReviewForDocument(
+      reviewRequests,
+      readerDocumentId,
+    )?.id;
     const updated = documents.find(({ id }) => id === readerDocumentId);
     if (updated) {
       next = { ...next, reader: { ...next.reader, document: updated } };
+    } else {
+      next = {
+        ...next,
+        annotationComposer: undefined,
+        mode: "queue",
+        reader: undefined,
+        reviewComposer: undefined,
+        scroll: 0,
+      };
     }
-    if (
-      pendingReviewForDocument(reviewRequests, readerDocumentId) ===
-      undefined
-    ) {
-      next = { ...next, reviewComposer: undefined };
+    if (next.reader && (nextPendingId === undefined || previousPendingId !== nextPendingId)) {
+      next = {
+        ...next,
+        annotationComposer: undefined,
+        reviewComposer: undefined,
+        reader: { ...next.reader!, feedbackItems: [] },
+      };
     }
   }
   return next;
@@ -305,11 +438,33 @@ export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   if (key === "ctrl-c") {
     return { state, effects: [{ type: "quit" }] };
   }
+  if (state.confirmation) {
+    if (key === "y") {
+      return {
+        state: { ...state, confirmation: undefined, message: undefined },
+        effects: [{
+          type: "bulk-action",
+          action: state.confirmation.action,
+          documentIds: state.confirmation.documentIds,
+        }],
+      };
+    }
+    if (key === "n" || key === "escape") {
+      return {
+        state: { ...state, confirmation: undefined, message: undefined },
+        effects: [],
+      };
+    }
+    return { state, effects: [] };
+  }
   if (state.searching) {
     return handleSearchKey(state, key);
   }
   if (state.annotationComposer) {
     return handleAnnotationComposerKey(state, key);
+  }
+  if (state.feedbackComposer) {
+    return handleFeedbackComposerKey(state, key);
   }
   if (state.reviewComposer) {
     return handleReviewComposerKey(state, key);
@@ -393,9 +548,16 @@ export function renderTui(
     `${borders.middleLeft}${borders.horizontal.repeat(innerWidth)}${borders.middleRight}`,
   );
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
-  const footer = state.annotationComposer
+  const footer = state.confirmation
+    ? `${theme.accent(theme.styles.bold("CONFIRM"))} ${theme.ink(confirmationMessage(state.confirmation))}  ${theme.accent("y")} yes  ${theme.accent("n")} no`
+    : state.annotationComposer
     ? renderShortcutBar(
         [["enter", "newline"], ["ctrl-d", "save note"], ["esc", "cancel"]],
+        theme,
+      )
+    : state.feedbackComposer
+    ? renderShortcutBar(
+        [["enter", "newline"], ["ctrl-d", "save general feedback"], ["esc", "cancel"]],
         theme,
       )
     : state.reviewComposer
@@ -406,26 +568,30 @@ export function renderTui(
     : state.mode === "reader"
       ? renderShortcutBar(
           state.reader?.document.missingAt
-            ? [["a", "archive"], ["b", "queue"], ["q", "quit"]]
+            ? [["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
             : state.reader?.changeView === "diff"
               ? pendingReviewForDocument(
                     state.reviewRequests,
                     state.reader.document.id,
                   )
-                ? [["j/k", "file"], ["p/n", "hunk"], ["m", "layout"], ["d", "document"], ["f", "feedback"], ["t", "todo"], ["z", "undo note"], ["y/c/x", "decide"], ["b", "queue"]]
-                : [["j/k", "file"], ["p/n", "hunk"], ["m", "layout"], ["d", "document"], ["b", "queue"]]
+                ? [["p/n", "file"], ["j/k", "line"], ["v", "range"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["y/c/x/o", "decide"], ["b", "queue"]]
+                : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["b", "queue"]]
             : pendingReviewForDocument(
                   state.reviewRequests,
                   state.reader?.document.id ?? "",
                 )
-              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["j/k", "scroll"], ["b", "queue"]]
-              : [["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["b", "queue"], ["q", "quit"]],
+              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["b", "queue"]]
+              : state.contentMode === "archive"
+                ? [["j/k", "scroll"], ["u", "restore"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
+                : [["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"]],
           theme,
         )
     : state.searching
       ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
       : renderShortcutBar(
-          [["j/k", "move"], ["enter", "open"], ["r", "actions"], ["a", "archive"], ["s", "status"], ["p", "project"], ["g", "group"], ["/", "search"], ["q", "quit"], ["c", "changes"]],
+          state.contentMode === "archive"
+            ? [["j/k", "move"], ["space", "select"], ["A", "select all"], ["u", "restore"], ["X", "purge"], ["v", "documents"], ["q", "quit"]]
+            : [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["X", "purge"], ["space", "select"], ["A", "all"], ["c", "content"], ["v", "archive"], ["p", "project"], ["x", "space"], ["/", "search"], ["q", "quit"]],
           theme,
         );
   const bodyHeight = safeHeight - 6;
@@ -450,16 +616,23 @@ export async function runTui(
   const color = !("NO_COLOR" in env) &&
     (io.color ?? Boolean(output.isTTY && env.TERM !== "dumb"));
   const unicode = io.unicode ?? env.TERM !== "dumb";
-  const [initialDocuments, initialWorkspaces, initialReviewRequests] =
+  if (typeof client.requireCapabilities === "function") {
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+  }
+  const [initialDocuments, initialWorkspaces, initialReviewRequests, spaces] =
     await Promise.all([
       client.listDocuments(),
       client.listWorkspaces(),
       client.listReviewRequests(),
+      typeof client.listSpaces === "function"
+        ? client.listSpaces()
+        : Promise.resolve([]),
     ]);
   let state = createTuiState(
     initialDocuments,
     initialWorkspaces,
     initialReviewRequests,
+    spaces,
   );
   const wasRaw = input.isRaw;
   const eventController = new AbortController();
@@ -471,6 +644,21 @@ export async function runTui(
   let renderedRevision: number | undefined;
   let inputBuffer = "";
   let previousFrame: string[] | undefined;
+  const currentScope = (): { spaceId?: string } =>
+    state.selectedSpace === undefined ? {} : { spaceId: state.selectedSpace };
+  const documentFilters = (): { archived?: boolean } =>
+    state.contentMode === "archive" ? { archived: true } : {};
+  type ScopeContext = {
+    generation: number;
+    scope: { spaceId?: string };
+  };
+  const scopeContext = (): ScopeContext => ({
+    generation: state.scopeGeneration,
+    scope: currentScope(),
+  });
+  const scopeContextMatches = (context: ScopeContext): boolean =>
+    context.generation === state.scopeGeneration &&
+    context.scope.spaceId === state.selectedSpace;
 
   const draw = (): void => {
     const width = output.columns ?? 100;
@@ -510,19 +698,52 @@ export async function runTui(
     output.write("\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[?1049l");
   };
 
-  const execute = async (effect: TuiEffect): Promise<void> => {
+  const execute = async (
+    effect: TuiEffect,
+    context: ScopeContext,
+  ): Promise<void> => {
     if (effect.type === "quit") {
       cleanup();
       return;
     }
+    if (!scopeContextMatches(context)) {
+      return;
+    }
+    const scope = context.scope;
     try {
+      if (effect.type === "reload") {
+        const [documents, workspaces, reviewRequests, nextSpaces] =
+          await Promise.all([
+            client.listDocuments(scope, documentFilters()),
+            client.listWorkspaces(scope),
+            client.listReviewRequests({}, scope),
+            typeof client.listSpaces === "function"
+              ? client.listSpaces()
+              : Promise.resolve(state.spaces),
+          ]);
+        if (!scopeContextMatches(context)) {
+          return;
+        }
+        state = replaceTuiDocuments(
+          { ...state, spaces: nextSpaces, message: undefined },
+          documents,
+          workspaces,
+          reviewRequests,
+        );
+        draw();
+        return;
+      }
       if (effect.type === "open") {
         const rendered = await client.renderDocument(
           effect.documentId,
           "terminal",
           readerRenderWidth(output.columns ?? 100),
           { color, unicode },
+          scope,
         );
+        if (!scopeContextMatches(context)) {
+          return;
+        }
         renderedWidth = readerRenderWidth(output.columns ?? 100);
         renderedRevision = rendered.document.revision;
         state = applyTuiReader(
@@ -532,33 +753,99 @@ export async function runTui(
           rendered.backend,
           rendered.warnings,
           rendered.changeReview,
+          rendered.sourceMap,
+          rendered.sourceWitness,
         );
         draw();
-        await client.act(effect.documentId, "opened");
+        await client.act(effect.documentId, "opened", scope);
+        if (!scopeContextMatches(context)) {
+          return;
+        }
       } else if (effect.type === "action") {
-        await client.act(effect.documentId, effect.action);
+        await client.act(effect.documentId, effect.action, scope);
+        if (!scopeContextMatches(context)) {
+          return;
+        }
         if (effect.action === "archive") {
           state = { ...state, mode: "queue", reader: undefined, scroll: 0 };
         }
+      } else if (effect.type === "bulk-action") {
+        if (effect.action === "purge") {
+          await client.bulkAct("purge", effect.documentIds, scope);
+        } else {
+          await client.bulkAct(effect.action, effect.documentIds, scope);
+        }
+        if (!scopeContextMatches(context)) {
+          return;
+        }
+        state = {
+          ...state,
+          confirmation: undefined,
+          mode: "queue",
+          reader: undefined,
+          scroll: 0,
+          selectedDocumentIds: [],
+          message: effect.action === "archive"
+            ? `${effect.documentIds.length} archived · open Archive with v to restore`
+            : effect.action === "restore"
+              ? `${effect.documentIds.length} restored`
+              : `${effect.documentIds.length} purged forever`,
+        };
+      } else if (effect.type === "feedback-submit") {
+        const submission = await client.createFeedback(effect.input, scope);
+        if (!scopeContextMatches(context)) return;
+        state = {
+          ...state,
+          reader: state.reader
+            ? {
+                ...state.reader,
+                feedbackItems: [],
+                markdownFeedbackItems: [],
+                feedbackGeneralMessage: "",
+                feedbackHistory: [submission, ...state.reader.feedbackHistory],
+              }
+            : undefined,
+          feedbackComposer: undefined,
+          message: `Feedback saved: ${submission.id} · ${submission.route}`,
+        };
       } else {
         await client.respondToReviewRequest(effect.requestId, {
           outcome: effect.outcome,
           message: effect.message,
           ...(effect.items === undefined ? {} : { items: effect.items }),
-        });
-        state = { ...state, reviewComposer: undefined };
+          ...(effect.feedback === undefined ? {} : { feedback: effect.feedback }),
+        }, scope);
+        if (!scopeContextMatches(context)) {
+          return;
+        }
+        state = completeTuiReviewResponse(state);
       }
       const [documents, workspaces, reviewRequests] = await Promise.all([
-        client.listDocuments(),
-        client.listWorkspaces(),
-        client.listReviewRequests(),
+        client.listDocuments(scope, documentFilters()),
+        client.listWorkspaces(scope),
+        client.listReviewRequests({}, scope),
       ]);
+      if (!scopeContextMatches(context)) {
+        return;
+      }
       state = replaceTuiDocuments(
         state,
         documents,
         workspaces,
         reviewRequests,
       );
+      if (state.reader && typeof client.listFeedback === "function") {
+        const feedbackItems = await listAllFeedback(
+          client,
+          state.reader.document.id,
+          scope,
+        );
+        if (!scopeContextMatches(context)) return;
+        state = {
+          ...state,
+          reader: { ...state.reader, feedbackHistory: feedbackItems },
+        };
+      }
       draw();
     } catch (error) {
       if (
@@ -568,9 +855,12 @@ export async function runTui(
       ) {
         try {
           const [documents, reviewRequests] = await Promise.all([
-            client.listDocuments(),
-            client.listReviewRequests(),
+            client.listDocuments(scope, documentFilters()),
+            client.listReviewRequests({}, scope),
           ]);
+          if (!scopeContextMatches(context)) {
+            return;
+          }
           state = replaceTuiDocuments(
             state,
             documents,
@@ -588,11 +878,23 @@ export async function runTui(
           // Fall through to a safe message; queue archive remains available.
         }
       }
-      state = {
-        ...state,
-        message: error instanceof Error ? error.message : "TUI request failed",
-      };
-      draw();
+      if (scopeContextMatches(context)) {
+        state = effect.type === "reload"
+          ? applyFilters({
+              ...state,
+              documents: [],
+              workspaces: [],
+              reviewRequests: [],
+              reader: undefined,
+              mode: "queue",
+              message: error instanceof Error ? error.message : "TUI request failed",
+            })
+          : {
+              ...state,
+              message: error instanceof Error ? error.message : "TUI request failed",
+            };
+        draw();
+      }
     }
   };
 
@@ -615,8 +917,9 @@ export async function runTui(
         : handleTuiKey(state, inputEvent.key);
       state = clampReaderScroll(transition.state, output.rows ?? 30);
       changed = true;
+      const context = scopeContext();
       for (const effect of transition.effects) {
-        processing = processing.then(() => execute(effect));
+        processing = processing.then(() => execute(effect, context));
       }
     }
     if (changed) {
@@ -641,6 +944,7 @@ export async function runTui(
       if (!documentId || finished) {
         return;
       }
+      const context = scopeContext();
       processing = processing.then(async () => {
         try {
           const rendered = await client.renderDocument(
@@ -648,7 +952,11 @@ export async function runTui(
             "terminal",
             nextWidth,
             { color, unicode },
+            context.scope,
           );
+          if (!scopeContextMatches(context)) {
+            return;
+          }
           renderedWidth = nextWidth;
           renderedRevision = rendered.document.revision;
           const scroll = state.scroll;
@@ -659,10 +967,14 @@ export async function runTui(
             rendered.backend,
             rendered.warnings,
             rendered.changeReview,
+            rendered.sourceMap,
           );
           state = { ...state, scroll };
           draw();
         } catch (error) {
+          if (!scopeContextMatches(context)) {
+            return;
+          }
           state = {
             ...state,
             message: error instanceof Error ? error.message : "Resize render failed",
@@ -681,24 +993,27 @@ export async function runTui(
   input.on("data", onData);
   process.on("SIGWINCH", onResize);
   draw();
-  void client
-    .subscribeCatalog((event) => {
-      refreshing = refreshing
-        .then(async () => {
+  const scheduleCatalogRefresh = (): void => {
+    const context = scopeContext();
+    refreshing = refreshing
+      .then(async () => {
+          if (!scopeContextMatches(context)) {
+            return;
+          }
           const readerDocumentId = state.reader?.document.id;
-          const refreshReader = shouldRefreshTuiReader(
-            event,
-            readerDocumentId,
-            renderedRevision,
-          );
+          const refreshReader = readerDocumentId !== undefined;
           const scroll = state.scroll;
-          const [documents, workspaces, reviewRequests] = await Promise.all([
-            client.listDocuments(),
-            client.listWorkspaces(),
-            client.listReviewRequests(),
+          const [documents, workspaces, reviewRequests, spaces] = await Promise.all([
+            client.listDocuments(context.scope, documentFilters()),
+            client.listWorkspaces(context.scope),
+            client.listReviewRequests({}, context.scope),
+            client.listSpaces(),
           ]);
+          if (!scopeContextMatches(context)) {
+            return;
+          }
           state = replaceTuiDocuments(
-            state,
+            { ...state, spaces },
             documents,
             workspaces,
             reviewRequests,
@@ -719,7 +1034,11 @@ export async function runTui(
                 "terminal",
                 width,
                 { color, unicode },
+                context.scope,
               );
+              if (!scopeContextMatches(context)) {
+                return;
+              }
               renderedWidth = width;
               renderedRevision = rendered.document.revision;
               state = refreshTuiReader(
@@ -729,7 +1048,22 @@ export async function runTui(
                 rendered.backend,
                 rendered.warnings,
                 rendered.changeReview,
+                rendered.sourceMap,
+                rendered.sourceWitness,
               );
+              if (typeof client.listFeedback === "function") {
+                const feedbackItems = await listAllFeedback(
+                  client,
+                  rendered.document.id,
+                  context.scope,
+                );
+                if (state.reader?.document.id === rendered.document.id) {
+                  state = {
+                    ...state,
+                    reader: { ...state.reader, feedbackHistory: feedbackItems },
+                  };
+                }
+              }
               state = clampReaderScroll(
                 { ...state, scroll },
                 output.rows ?? 30,
@@ -738,25 +1072,65 @@ export async function runTui(
           }
           draw();
         })
-        .catch((error: unknown) => {
-          if (!finished) {
-            state = {
+      .catch(async (error: unknown) => {
+          if (finished || !scopeContextMatches(context)) {
+            return;
+          }
+          let spaces = state.spaces;
+          try {
+            spaces = await client.listSpaces();
+          } catch {
+            // Preserve the last trusted inventory when its refresh also fails.
+          }
+          if (!finished && scopeContextMatches(context)) {
+            state = applyFilters({
               ...state,
+              spaces,
+              documents: [],
+              workspaces: [],
+              reviewRequests: [],
+              reader: undefined,
+              mode: "queue",
               message: error instanceof Error ? error.message : "Live refresh failed",
-            };
+            });
             draw();
           }
         });
-    }, { signal: eventController.signal })
-    .catch((error: unknown) => {
-      if (!finished) {
-        state = {
-          ...state,
-          message: error instanceof Error ? error.message : "Live events failed",
-        };
-        draw();
-      }
+  };
+  const waitForReconnect = (): Promise<void> =>
+    new Promise((resolve) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        eventController.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, 250);
+      eventController.signal.addEventListener("abort", onAbort, { once: true });
     });
+  const subscribeCatalog = async (): Promise<void> => {
+    while (!finished) {
+      try {
+        await client.subscribeCatalog(scheduleCatalogRefresh, {
+          signal: eventController.signal,
+          onReady: scheduleCatalogRefresh,
+        });
+      } catch (error) {
+        if (!finished) {
+          state = {
+            ...state,
+            message: error instanceof Error ? error.message : "Live events failed",
+          };
+          draw();
+        }
+      }
+      if (!finished) {
+        await waitForReconnect();
+      }
+    }
+  };
+  void subscribeCatalog();
 
   await new Promise<void>((resolve) => {
     const interval = setInterval(() => {
@@ -807,13 +1181,88 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
       effects: document ? [{ type: "open", documentId: document.id }] : [],
     };
   }
-  if (key === "a") {
+  if (key === " ") {
     const document = state.visibleDocuments[state.selectedIndex];
+    if (!document) {
+      return { state, effects: [] };
+    }
+    const selected = new Set(state.selectedDocumentIds);
+    if (selected.has(document.id)) {
+      selected.delete(document.id);
+    } else {
+      selected.add(document.id);
+    }
+    return {
+      state: { ...state, selectedDocumentIds: [...selected], message: undefined },
+      effects: [],
+    };
+  }
+  if (key === "A") {
+    const ids = [...new Set(state.visibleDocuments.map(({ id }) => id))];
+    const allSelected = ids.length > 0 &&
+      ids.every((id) => state.selectedDocumentIds.includes(id));
+    return {
+      state: {
+        ...state,
+        selectedDocumentIds: allSelected ? [] : ids,
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "a") {
+    if (state.contentMode === "archive") {
+      return { state, effects: [] };
+    }
+    const documentIds = selectedOrCurrentDocumentIds(state);
+    return {
+      state: documentIds.length === 0
+        ? state
+        : {
+            ...state,
+            confirmation: { action: "archive", documentIds },
+            message: undefined,
+          },
+      effects: [],
+    };
+  }
+  if (key === "X") {
+    const documentIds = selectedOrCurrentDocumentIds(state);
+    return {
+      state: documentIds.length === 0
+        ? state
+        : {
+            ...state,
+            confirmation: { action: "purge", documentIds },
+            message: undefined,
+          },
+      effects: [],
+    };
+  }
+  if (key === "u" && state.contentMode === "archive") {
+    const documentIds = selectedOrCurrentDocumentIds(state);
     return {
       state,
-      effects: document
-        ? [{ type: "action", action: "archive", documentId: document.id }]
-        : [],
+      effects: documentIds.length === 0
+        ? []
+        : [{ type: "bulk-action", action: "restore", documentIds }],
+    };
+  }
+  if (key === "v") {
+    const contentMode = state.contentMode === "archive" ? "docs" : "archive";
+    return {
+      state: applyFilters({
+        ...state,
+        contentMode,
+        changeReviewsOnly: false,
+        actionsOnly: false,
+        statusFilter: "all",
+        documents: [],
+        selectedDocumentIds: [],
+        selectedIndex: 0,
+        message: contentMode === "archive" ? "Loading Archive…" : "Loading documents…",
+      }),
+      effects: [{ type: "reload" }],
     };
   }
   if (key === "r") {
@@ -821,28 +1270,57 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
       state: applyFilters({
         ...state,
         actionsOnly: !state.actionsOnly,
+        statusFilter: "all",
         selectedIndex: 0,
       }),
       effects: [],
     };
   }
   if (key === "c") {
+    if (state.contentMode === "archive") {
+      return { state, effects: [] };
+    }
+    const contentMode = state.contentMode === "docs" ? "change-reviews" : "docs";
     return {
       state: applyFilters({
         ...state,
-        changeReviewsOnly: !state.changeReviewsOnly,
+        contentMode,
+        changeReviewsOnly: contentMode === "change-reviews",
         selectedIndex: 0,
       }),
       effects: [],
     };
   }
-  if (key === "s") {
-    const filters: StatusFilter[] = ["all", "unread", "reading", "done"];
-    const index = filters.indexOf(state.statusFilter);
+  if (key === "x") {
+    const spaceIds = [undefined, ...state.spaces.map(({ id }) => id)];
+    const index = spaceIds.indexOf(state.selectedSpace);
+    const selectedSpace = spaceIds[(index + 1) % spaceIds.length];
     return {
       state: applyFilters({
         ...state,
-        statusFilter: filters[(index + 1) % filters.length] ?? "all",
+        selectedSpace,
+        scopeGeneration: state.scopeGeneration + 1,
+        documents: [],
+        workspaces: [],
+        reviewRequests: [],
+        reader: undefined,
+        mode: "queue",
+        selectedIndex: 0,
+        message: "Loading Space…",
+      }),
+      effects: [{ type: "reload" }],
+    };
+  }
+  if (key === "s") {
+    const filters = ["all", "actions", "unread", "reading", "done"] as const;
+    const current = state.actionsOnly ? "actions" : state.statusFilter;
+    const index = filters.indexOf(current);
+    const next = filters[(index + 1) % filters.length] ?? "all";
+    return {
+      state: applyFilters({
+        ...state,
+        actionsOnly: next === "actions",
+        statusFilter: next === "actions" ? "all" : next,
       }),
       effects: [],
     };
@@ -881,6 +1359,29 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
       effects: [],
     };
   }
+  if ((key === "a" || key === "X") && state.reader) {
+    return {
+      state: {
+        ...state,
+        confirmation: {
+          action: key === "a" ? "archive" : "purge",
+          documentIds: [state.reader.document.id],
+        },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "u" && state.contentMode === "archive" && state.reader) {
+    return {
+      state,
+      effects: [{
+        type: "bulk-action",
+        action: "restore",
+        documentIds: [state.reader.document.id],
+      }],
+    };
+  }
   if (key === "d" && state.reader?.changeReview) {
     return {
       state: {
@@ -897,18 +1398,25 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
   if (state.reader?.changeView === "diff" && state.reader.changeReview) {
     const reader = state.reader;
     const files = reader.changeReview?.files ?? [];
-    if ((key === "[" || key === "left" || key === "k" || key === "up") && files.length > 0) {
+    if (
+      (key === "p" || key === "[" || key === "left" || key === "pageup") &&
+      files.length > 0
+    ) {
       return moveChangeFile(state, -1);
     }
-    if ((key === "]" || key === "right" || key === "j" || key === "down") && files.length > 0) {
+    if (
+      (key === "n" || key === "]" || key === "right" || key === "pagedown") &&
+      files.length > 0
+    ) {
       return moveChangeFile(state, 1);
     }
     const file = files[reader.changeFileIndex];
-    if ((key === "p" || key === "pageup") && file && file.hunks.length > 0) {
-      return moveChangeHunk(state, -1);
+    const hunk = file?.hunks[reader.changeHunkIndex];
+    if ((key === "j" || key === "down") && hunk && hunk.lines.length > 0) {
+      return moveChangeLine(state, 1);
     }
-    if ((key === "n" || key === "pagedown") && file && file.hunks.length > 0) {
-      return moveChangeHunk(state, 1);
+    if ((key === "k" || key === "up") && hunk && hunk.lines.length > 0) {
+      return moveChangeLine(state, -1);
     }
     if (key === "m") {
       return {
@@ -925,18 +1433,67 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         effects: [],
       };
     }
-    if ((key === "f" || key === "t") && file) {
-      const hunk = file.hunks[reader.changeHunkIndex];
-      if (key === "f" && !hunk) {
-        return { state, effects: [] };
-      }
+    if (key === "v" && hunk && hunk.lines.length > 0) {
       return {
         state: {
           ...state,
+          reader: {
+            ...reader,
+            changeRangeStartIndex: reader.changeRangeStartIndex === undefined
+              ? reader.changeLineIndex
+              : undefined,
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+    if ((key === "f" || key === "t") && file) {
+      if (key === "f" && !hunk) {
+        return { state, effects: [] };
+      }
+      const line = key === "f" ? hunk?.lines[reader.changeLineIndex] : undefined;
+      if (key === "f" && !line) {
+        return { state, effects: [] };
+      }
+      const selectedLines = key === "f" && hunk && line
+        ? hunk.lines.slice(
+            Math.min(reader.changeRangeStartIndex ?? reader.changeLineIndex, reader.changeLineIndex),
+            Math.max(reader.changeRangeStartIndex ?? reader.changeLineIndex, reader.changeLineIndex) + 1,
+          )
+        : [];
+      const anchors = selectedLines.map(changeLineAnchor);
+      const side = anchors[0]?.side;
+      if (
+        key === "f" &&
+        (anchors.some((anchor) => anchor.line === null) ||
+          anchors.some((anchor) => anchor.side !== side))
+      ) {
+        return {
+          state: { ...state, message: "A feedback range must stay on one diff side." },
+          effects: [],
+        };
+      }
+      const lineNumbers = anchors.flatMap(({ line: value }) =>
+        value === null ? [] : [value]
+      );
+      const lineNumber = lineNumbers.length === 0 ? undefined : Math.min(...lineNumbers);
+      const endLine = lineNumbers.length === 0 ? undefined : Math.max(...lineNumbers);
+      return {
+        state: {
+          ...state,
+          reader: { ...reader, changeRangeStartIndex: undefined },
           annotationComposer: {
-            kind: key === "f" ? "feedback" : "todo",
+            kind: "feedback",
             path: file.path,
             ...(key === "f" && hunk ? { hunkId: hunk.id } : {}),
+            ...(line && lineNumber !== null && lineNumber !== undefined
+              ? {
+                  line: lineNumber,
+                  ...(endLine !== undefined && endLine > lineNumber ? { endLine } : {}),
+                  side: side ?? (line.kind === "deletion" ? "old" as const : "new" as const),
+                }
+              : {}),
             message: "",
           },
           message: undefined,
@@ -957,6 +1514,94 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         effects: [],
       };
     }
+  }
+  if (state.reader?.changeView === "document") {
+    const reader = state.reader;
+    const logicalLines = reader.sourceMap?.logicalLines ?? [];
+    if ((key === "[" || key === "]") && logicalLines.length > 0) {
+      return {
+        state: {
+          ...state,
+          reader: {
+            ...reader,
+            sourceLineIndex: clamp(
+              reader.sourceLineIndex + (key === "]" ? 1 : -1),
+              0,
+              logicalLines.length - 1,
+            ),
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+    if (key === "f") {
+      const logicalLine = logicalLines[reader.sourceLineIndex];
+      const firstRef = logicalLine?.segmentRefs[0];
+      const lastRef = logicalLine?.segmentRefs.at(-1);
+      const lastSegment = reader.sourceMap?.segments.find(({ ref }) => ref === lastRef);
+      if (!logicalLine || !firstRef || !lastRef || !lastSegment) {
+        return {
+          state: { ...state, message: "This document row is not commentable." },
+          effects: [],
+        };
+      }
+      return {
+        state: {
+          ...state,
+          annotationComposer: {
+            kind: "feedback",
+            markdownAnchor: {
+              kind: "markdown-selection-v1",
+              start: { ref: firstRef, offset: 0 },
+              end: { ref: lastRef, offset: lastSegment.text.length },
+            },
+            label: `source row ${logicalLine.sourceStart.line}: ${logicalLine.text.slice(0, 80)}`,
+            message: "",
+          },
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+  }
+  if (key === "g" && state.reader) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: state.reader.feedbackGeneralMessage },
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key === "s" && state.reader) {
+    const input = tuiFeedbackRegistration(state.reader);
+    if (!input) {
+      return {
+        state: { ...state, message: "Add general feedback or a specific comment first." },
+        effects: [],
+      };
+    }
+    return { state: { ...state, message: undefined }, effects: [{ type: "feedback-submit", input }] };
+  }
+  if (
+    key === "z" &&
+    state.reader &&
+    state.reader.changeView === "document" &&
+    state.reader.markdownFeedbackItems.length > 0
+  ) {
+    return {
+      state: {
+        ...state,
+        reader: {
+          ...state.reader,
+          markdownFeedbackItems: state.reader.markdownFeedbackItems.slice(0, -1),
+        },
+        message: undefined,
+      },
+      effects: [],
+    };
   }
   if (key === "j" || key === "down") {
     return { state: { ...state, scroll: state.scroll + 1 }, effects: [] };
@@ -986,6 +1631,7 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
     y: "approved",
     c: "changes_requested",
     x: "rejected",
+    o: "superseded",
   };
   const reviewOutcome = reviewOutcomes[key];
   if (pending && reviewOutcome) {
@@ -1014,19 +1660,8 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         effects: [],
       };
     }
-    if (
-      reviewOutcome !== "changes_requested" &&
-      (state.reader?.feedbackItems.length ?? 0) > 0
-    ) {
-      return {
-        state: {
-          ...state,
-          message: "Request changes or remove the open feedback with z before deciding.",
-        },
-        effects: [],
-      };
-    }
-    const items = reviewOutcome === "changes_requested"
+    const items = reviewOutcome === "changes_requested" ||
+        reviewOutcome === "approved"
       ? state.reader?.feedbackItems ?? []
       : [];
     return {
@@ -1035,9 +1670,7 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
         reviewComposer: {
           requestId: pending.id,
           outcome: reviewOutcome,
-          message: reviewOutcome === "changes_requested"
-            ? formatFeedbackMessage(items)
-            : "",
+          message: "",
           items,
         },
         message: undefined,
@@ -1048,13 +1681,12 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
   const actions: Partial<Record<string, DocumentAction>> = {
     m: "read",
     u: "unread",
-    a: "archive",
   };
   const action = actions[key];
   if (
     action &&
     state.reader &&
-    (action === "archive" || state.reader.document.missingAt === null)
+    state.reader.document.missingAt === null
   ) {
     return {
       state,
@@ -1105,9 +1737,27 @@ function handleReviewComposerKey(
     };
   }
   if (key === "ctrl-d") {
+    const reader = state.reader;
+    const generalFeedback = reader?.feedbackGeneralMessage.trim() ?? "";
+    const decisionMessage = composer.message.trim();
+    const combinedMessage = decisionMessage === ""
+      ? generalFeedback
+      : generalFeedback === "" || generalFeedback === decisionMessage
+        ? decisionMessage
+        : `Feedback:\n${generalFeedback}\n\nDecision:\n${decisionMessage}`;
+    const hasStructuredFeedback = Boolean(
+      reader &&
+        (reader.feedbackGeneralMessage.trim() !== "" ||
+          reader.markdownFeedbackItems.length > 0),
+    );
+    const feedback = reader && hasStructuredFeedback
+      ? tuiFeedbackRegistration(reader, combinedMessage)
+      : undefined;
     if (
       composer.outcome === "changes_requested" &&
-      composer.message.trim() === ""
+      combinedMessage === "" &&
+      composer.items.length === 0 &&
+      (reader?.markdownFeedbackItems.length ?? 0) === 0
     ) {
       return {
         state: { ...state, message: "Explain what needs to change." },
@@ -1121,8 +1771,10 @@ function handleReviewComposerKey(
           type: "review-response",
           requestId: composer.requestId,
           outcome: composer.outcome,
-          message: composer.message,
-          ...(composer.items.length === 0 ? {} : { items: composer.items }),
+          message: combinedMessage,
+          ...(feedback === undefined
+            ? composer.items.length === 0 ? {} : { items: composer.items }
+            : { feedback }),
         },
       ],
     };
@@ -1132,6 +1784,115 @@ function handleReviewComposerKey(
       state: {
         ...state,
         reviewComposer: { ...composer, message: composer.message + key },
+      },
+      effects: [],
+    };
+  }
+  return { state, effects: [] };
+}
+
+function tuiFeedbackRegistration(
+  reader: TuiReader,
+  generalMessage = reader.feedbackGeneralMessage.trim(),
+): FeedbackSubmissionRegistration | undefined {
+  const comments: FeedbackSubmissionRegistration["comments"] = [
+    ...reader.markdownFeedbackItems,
+    ...reader.feedbackItems.map((item) => ({
+      id: item.id.replace(/^feedback-/, "comment-"),
+      intent: item.kind,
+      anchor: item.line === undefined
+        ? { kind: "diff-file-v1" as const, path: item.path }
+        : {
+            kind: "diff-lines-v1" as const,
+            path: item.path,
+            hunkId: item.hunkId!,
+            side: item.side!,
+            line: item.line,
+            ...(item.endLine === undefined ? {} : { endLine: item.endLine }),
+          },
+      message: item.message,
+    })),
+  ];
+  if (generalMessage === "" && comments.length === 0) return undefined;
+  return {
+    id: `feedback-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
+    documentId: reader.document.id,
+    documentRevision: reader.document.revision,
+    ...(comments.length === 0 ? {} : { sourceWitness: reader.sourceWitness }),
+    ...(generalMessage === "" ? {} : { generalMessage }),
+    comments,
+  };
+}
+
+async function listAllFeedback(
+  client: DeskApiClient,
+  documentId: string,
+  scope: { spaceId?: string },
+): Promise<PublicFeedbackSubmission[]> {
+  const items: PublicFeedbackSubmission[] = [];
+  let cursor: string | undefined;
+  const seenCursors = new Set<string>();
+  do {
+    const page = await client.listFeedback({
+      documentId,
+      limit: 100,
+      ...(cursor === undefined ? {} : { cursor }),
+    }, scope);
+    items.push(...page.items);
+    cursor = page.nextCursor;
+    if (cursor !== undefined && seenCursors.has(cursor)) {
+      throw new Error("Feedback history returned a repeated cursor.");
+    }
+    if (cursor !== undefined) seenCursors.add(cursor);
+  } while (cursor !== undefined);
+  return items;
+}
+
+function handleFeedbackComposerKey(
+  state: TuiState,
+  key: string,
+): TuiTransition {
+  const composer = state.feedbackComposer;
+  if (!composer || !state.reader) return { state, effects: [] };
+  if (key === "escape") {
+    return { state: { ...state, feedbackComposer: undefined }, effects: [] };
+  }
+  if (key === "backspace") {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: {
+          message: Array.from(composer.message).slice(0, -1).join(""),
+        },
+      },
+      effects: [],
+    };
+  }
+  if (key === "enter" && composer.message.length < 16 * 1024) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: `${composer.message}\n` },
+      },
+      effects: [],
+    };
+  }
+  if (key === "ctrl-d") {
+    return {
+      state: {
+        ...state,
+        reader: { ...state.reader, feedbackGeneralMessage: composer.message.trim() },
+        feedbackComposer: undefined,
+        message: undefined,
+      },
+      effects: [],
+    };
+  }
+  if (key.length === 1 && key >= " " && composer.message.length < 16 * 1024) {
+    return {
+      state: {
+        ...state,
+        feedbackComposer: { message: composer.message + key },
       },
       effects: [],
     };
@@ -1181,17 +1942,43 @@ function handleAnnotationComposerKey(
         effects: [],
       };
     }
-    if (state.reader.feedbackItems.length >= 32) {
+    if (
+      state.reader.feedbackItems.length + state.reader.markdownFeedbackItems.length >= 32
+    ) {
       return {
-        state: { ...state, message: "A review can contain at most 32 feedback items." },
+        state: { ...state, message: "A feedback submission can contain at most 32 comments." },
         effects: [],
       };
     }
+    if (composer.markdownAnchor) {
+      const item: FeedbackSubmissionRegistration["comments"][number] = {
+        id: `comment-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
+        intent: composer.kind,
+        anchor: composer.markdownAnchor,
+        message: composer.message.replaceAll("\r", "").trim(),
+      };
+      return {
+        state: {
+          ...state,
+          reader: {
+            ...state.reader,
+            markdownFeedbackItems: [...state.reader.markdownFeedbackItems, item],
+          },
+          annotationComposer: undefined,
+          message: undefined,
+        },
+        effects: [],
+      };
+    }
+    if (!composer.path) return { state, effects: [] };
     const item: ReviewFeedbackItem = {
       id: `feedback-${randomUUID().replaceAll("-", "").slice(0, 20)}`,
       kind: composer.kind,
       path: composer.path,
       ...(composer.hunkId === undefined ? {} : { hunkId: composer.hunkId }),
+      ...(composer.line === undefined ? {} : { line: composer.line }),
+      ...(composer.endLine === undefined ? {} : { endLine: composer.endLine }),
+      ...(composer.side === undefined ? {} : { side: composer.side }),
       message: composer.message.replaceAll("\r", "").trim(),
     };
     return {
@@ -1232,29 +2019,12 @@ function moveChangeFile(state: TuiState, amount: number): TuiTransition {
   return {
     state: {
       ...state,
-      reader: { ...reader, changeFileIndex, changeHunkIndex: 0 },
-      scroll: 0,
-    },
-    effects: [],
-  };
-}
-
-function moveChangeHunk(state: TuiState, amount: number): TuiTransition {
-  const reader = state.reader;
-  const file = reader?.changeReview?.files[reader.changeFileIndex];
-  if (!reader || !file || file.hunks.length === 0) {
-    return { state, effects: [] };
-  }
-  return {
-    state: {
-      ...state,
       reader: {
         ...reader,
-        changeHunkIndex: clamp(
-          reader.changeHunkIndex + amount,
-          0,
-          file.hunks.length - 1,
-        ),
+        changeFileIndex,
+        changeHunkIndex: 0,
+        changeLineIndex: 0,
+        changeRangeStartIndex: undefined,
       },
       scroll: 0,
     },
@@ -1262,29 +2032,60 @@ function moveChangeHunk(state: TuiState, amount: number): TuiTransition {
   };
 }
 
-function formatFeedbackMessage(items: ReviewFeedbackItem[]): string {
-  if (items.length === 0) {
-    return "";
+function moveChangeLine(state: TuiState, amount: number): TuiTransition {
+  const reader = state.reader;
+  const file = reader?.changeReview?.files[reader.changeFileIndex];
+  if (!reader || !file || file.hunks.length === 0 || amount === 0) {
+    return { state, effects: [] };
   }
-  const feedback = items.filter(({ kind }) => kind === "feedback");
-  const todos = items.filter(({ kind }) => kind === "todo");
-  const lines: string[] = [];
-  if (feedback.length > 0) {
-    lines.push("## Hunk feedback");
-    for (const item of feedback) {
-      lines.push(`- [ ] ${item.message} — ${item.path}#${item.hunkId ?? "unknown"}`);
+  let hunkIndex = clamp(
+    reader.changeHunkIndex,
+    0,
+    file.hunks.length - 1,
+  );
+  let lineIndex = reader.changeLineIndex;
+  const direction = amount < 0 ? -1 : 1;
+  const steps = Math.abs(amount);
+  for (let step = 0; step < steps; step += 1) {
+    const hunk = file.hunks[hunkIndex]!;
+    if (direction > 0 && lineIndex < hunk.lines.length - 1) {
+      lineIndex += 1;
+      continue;
     }
+    if (direction < 0 && lineIndex > 0) {
+      lineIndex -= 1;
+      continue;
+    }
+    let nextHunkIndex = hunkIndex + direction;
+    while (
+      nextHunkIndex >= 0 &&
+      nextHunkIndex < file.hunks.length &&
+      file.hunks[nextHunkIndex]!.lines.length === 0
+    ) {
+      nextHunkIndex += direction;
+    }
+    const nextHunk = file.hunks[nextHunkIndex];
+    if (!nextHunk || nextHunk.lines.length === 0) {
+      break;
+    }
+    hunkIndex = nextHunkIndex;
+    lineIndex = direction > 0 ? 0 : nextHunk.lines.length - 1;
   }
-  if (todos.length > 0) {
-    if (lines.length > 0) {
-      lines.push("");
-    }
-    lines.push("## File todos");
-    for (const item of todos) {
-      lines.push(`- [ ] ${item.message} — ${item.path}`);
-    }
-  }
-  return lines.join("\n");
+  return {
+    state: {
+      ...state,
+      reader: {
+        ...reader,
+        changeHunkIndex: hunkIndex,
+        changeLineIndex: lineIndex,
+        changeRangeStartIndex: hunkIndex === reader.changeHunkIndex
+          ? reader.changeRangeStartIndex
+          : undefined,
+      },
+      scroll: 0,
+    },
+    effects: [],
+  };
 }
 
 function moveQueueSelection(state: TuiState, amount: number): TuiTransition {
@@ -1299,6 +2100,27 @@ function moveQueueSelection(state: TuiState, amount: number): TuiTransition {
     },
     effects: [],
   };
+}
+
+function selectedOrCurrentDocumentIds(state: TuiState): string[] {
+  if (state.selectedDocumentIds.length > 0) {
+    const visibleIds = new Set(state.visibleDocuments.map(({ id }) => id));
+    return state.selectedDocumentIds.filter((id) => visibleIds.has(id));
+  }
+  const current = state.visibleDocuments[state.selectedIndex];
+  return current ? [current.id] : [];
+}
+
+function confirmationMessage(confirmation: TuiConfirmation): string {
+  const count = confirmation.documentIds.length;
+  if (confirmation.action === "archive") {
+    return count === 1
+      ? "Archive this document? You can restore it later."
+      : `Archive ${count} documents? You can restore them later.`;
+  }
+  return count === 1
+    ? "Purge this document forever? This cannot be undone."
+    : `Purge ${count} documents forever? This cannot be undone.`;
 }
 
 function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
@@ -1335,9 +2157,12 @@ export function groupTuiQueue(
   if (grouping === "project") {
     const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
     for (const document of documents) {
+      const projectId = document.projectId ?? document.workspaceId;
       add(
-        `project:${document.workspaceId}`,
-        workspaceNames.get(document.workspaceId) ?? document.workspaceId,
+        `project:${projectId}`,
+        document.projectName ??
+          workspaceNames.get(document.workspaceId) ??
+          document.workspaceId,
         document,
       );
     }
@@ -1353,7 +2178,14 @@ export function groupTuiQueue(
 function applyFilters(state: TuiState): TuiState {
   const terms = state.search.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const filteredDocuments = state.documents.filter((document) => {
-    if (state.changeReviewsOnly && document.kind !== "change-review") {
+    const changeReviews = state.changeReviewsOnly ||
+      state.contentMode === "change-reviews";
+    if (
+      state.contentMode !== "archive" &&
+      (!changeReviews && document.kind === "change-review") ||
+      state.contentMode !== "archive" &&
+        (changeReviews && document.kind !== "change-review")
+    ) {
       return false;
     }
     if (
@@ -1367,12 +2199,14 @@ function applyFilters(state: TuiState): TuiState {
     }
     if (
       state.workspaceFilter !== undefined &&
+      (document.projectId ?? document.workspaceId) !== state.workspaceFilter &&
       document.workspaceId !== state.workspaceFilter
     ) {
       return false;
     }
     const searchable = [
       document.title,
+      document.projectName ?? "",
       document.workspaceId,
       document.taskId ?? "",
       document.producer ?? "",
@@ -1416,16 +2250,29 @@ function workspacesForDocuments(
   workspaces: PublicWorkspace[],
 ): PublicWorkspace[] {
   const counts = new Map<string, number>();
+  const labels = new Map<string, string>();
+  const workspaceNames = new Map(workspaces.map(({ id, name }) => [id, name]));
   for (const document of documents) {
+    const projectId = document.projectId ?? document.workspaceId;
     counts.set(
-      document.workspaceId,
-      (counts.get(document.workspaceId) ?? 0) + 1,
+      projectId,
+      (counts.get(projectId) ?? 0) + 1,
+    );
+    labels.set(
+      projectId,
+      document.projectName ??
+        workspaceNames.get(document.workspaceId) ??
+        document.workspaceId,
     );
   }
-  return workspaces.flatMap((workspace) => {
-    const documentCount = counts.get(workspace.id) ?? 0;
-    return documentCount === 0 ? [] : [{ ...workspace, documentCount }];
-  });
+  return [...counts].map(([id, documentCount]) => ({
+    id,
+    name: labels.get(id) ?? id,
+    documentCount,
+    route: documents.some(({ projectId }) => projectId === id)
+      ? `/p/${id}`
+      : `/w/${id}`,
+  }));
 }
 
 interface TuiBorders {
@@ -1521,7 +2368,9 @@ function renderWorkspaceTitle(
     ? state.reader?.document.kind === "change-review"
       ? "CHANGE REVIEW"
       : "DOCUMENT READER"
-    : state.changeReviewsOnly
+    : state.contentMode === "archive"
+      ? "ARCHIVE"
+    : state.changeReviewsOnly || state.contentMode === "change-reviews"
       ? "CHANGE REVIEWS"
       : "DOCUMENT INBOX";
   const left = `${theme.brand("mdmaid.desk")} ${theme.muted("/")} ${theme.styles.bold(section)}`;
@@ -1586,25 +2435,24 @@ function handleQueueMouse(
     event.x < 2 + sidebarWidth
   ) {
     if (bodyIndex === 2) {
-      return {
-        state: applyFilters({ ...state, workspaceFilter: undefined }),
-        effects: [],
-      };
+      return handleQueueKey(state, "p");
     }
-    const workspaceIndex = bodyIndex - 3;
-    const workspace = state.workspaces[workspaceIndex];
-    if (workspace) {
-      return {
-        state: applyFilters({ ...state, workspaceFilter: workspace.id }),
-        effects: [],
-      };
+    if (bodyIndex === 3) {
+      return handleQueueKey(state, "x");
     }
-    const statusIndex = bodyIndex - (6 + state.workspaces.length);
-    const statuses: StatusFilter[] = ["all", "unread", "reading", "done"];
+    if (bodyIndex === 4) {
+      return handleQueueKey(state, "c");
+    }
+    const statusIndex = bodyIndex - 8;
+    const statuses = ["all", "actions", "unread", "reading", "done"] as const;
     const status = statuses[statusIndex];
     if (status) {
       return {
-        state: applyFilters({ ...state, statusFilter: status }),
+        state: applyFilters({
+          ...state,
+          actionsOnly: status === "actions",
+          statusFilter: status === "actions" ? "all" : status,
+        }),
         effects: [],
       };
     }
@@ -1662,27 +2510,40 @@ function footerKeyAt(state: TuiState, x: number): string | undefined {
       ? state.reader?.document.missingAt
         ? [
             ["a", "archive", "a"],
+            ["X", "purge", "X"],
             ["b", "queue", "b"],
             ["q", "quit", "q"],
           ]
-        : [
-            ["j/k", "scroll", undefined],
-            ["m", "read", "m"],
-            ["u", "unread", "u"],
-            ["a", "archive", "a"],
-            ["b", "queue", "b"],
-            ["q", "quit", "q"],
-          ]
+        : state.contentMode === "archive"
+          ? [
+              ["j/k", "scroll", undefined],
+              ["u", "restore", "u"],
+              ["X", "purge", "X"],
+              ["b", "queue", "b"],
+              ["q", "quit", "q"],
+            ]
+          : [
+              ["j/k", "scroll", undefined],
+              ["m", "read", "m"],
+              ["u", "unread", "u"],
+              ["a", "archive", "a"],
+              ["X", "purge", "X"],
+              ["b", "queue", "b"],
+              ["q", "quit", "q"],
+            ]
       : [
           ["j/k", "move", undefined],
           ["enter", "open", "enter"],
           ["a", "archive", "a"],
-          ["s", "status", "s"],
+          ["X", "purge", "X"],
+          ["space", "select", " "],
+          ["A", "all", "A"],
+          ["c", "content", "c"],
+          ["v", "archive", "v"],
           ["p", "project", "p"],
-          ["g", "group", "g"],
+          ["x", "space", "x"],
           ["/", "search", "/"],
           ["q", "quit", "q"],
-          ["c", "changes", "c"],
         ];
   let cursor = 2;
   for (const [label, action, key] of shortcuts) {
@@ -1702,63 +2563,98 @@ function sidebarLines(
   theme: TuiTheme,
   unicode: boolean,
 ): string[] {
-  const lines: string[] = [theme.accent(theme.styles.bold(" PROJECTS")), ""];
-  lines.push(
+  const selectedProjectName = state.workspaceFilter === undefined
+    ? "All projects"
+    : state.workspaces.find(({ id }) => id === state.workspaceFilter)?.name ??
+      state.workspaceFilter;
+  const selectedSpaceName = state.selectedSpace === undefined
+    ? "All spaces"
+    : state.spaces.find(({ id }) => id === state.selectedSpace)?.name ??
+      state.selectedSpace;
+  const contentName = state.changeReviewsOnly || state.contentMode === "change-reviews"
+    ? "Change reviews"
+    : "Documents";
+  const lines: string[] = [
+    theme.accent(theme.styles.bold(" FILTERS")),
+    "",
     navigationLine(
-      "All documents",
-      state.documents.length,
-      state.workspaceFilter === undefined,
+      "Project",
+      selectedProjectName,
+      true,
       width,
       theme,
       unicode,
     ),
-  );
-  for (const workspace of state.workspaces) {
-    lines.push(
-      navigationLine(
-        workspace.name,
-        workspace.documentCount,
-        state.workspaceFilter === workspace.id,
-        width,
-        theme,
-        unicode,
-      ),
-    );
-  }
-  lines.push("", theme.accent(theme.styles.bold(" ACTIONS")), "");
+    navigationLine(
+      "Space",
+      selectedSpaceName,
+      true,
+      width,
+      theme,
+      unicode,
+    ),
+    navigationLine(
+      "Content",
+      contentName,
+      true,
+      width,
+      theme,
+      unicode,
+    ),
+    "",
+    theme.accent(theme.styles.bold(" STATUS")),
+    "",
+  ];
+  const contextDocuments = state.documents.filter((document) => {
+    const changeReviews = state.changeReviewsOnly || state.contentMode === "change-reviews";
+    if (changeReviews !== (document.kind === "change-review")) return false;
+    return state.workspaceFilter === undefined ||
+      (document.projectId ?? document.workspaceId) === state.workspaceFilter ||
+      document.workspaceId === state.workspaceFilter;
+  });
+  const pendingCount = contextDocuments.filter((document) =>
+    pendingReviewForDocument(state.reviewRequests, document.id) !== undefined
+  ).length;
+  const counts: Record<StatusFilter, number> = {
+    all: contextDocuments.length,
+    unread: contextDocuments.filter(({ status }) => status === "unread").length,
+    reading: contextDocuments.filter(({ status }) => status === "reading").length,
+    done: contextDocuments.filter(({ status }) => status === "done").length,
+  };
   lines.push(
     navigationLine(
+      "All",
+      counts.all,
+      !state.actionsOnly && state.statusFilter === "all",
+      width,
+      theme,
+      unicode,
+    ),
+    navigationLine(
       "Waiting for you",
-      state.reviewRequests.filter(({ status }) => status === "pending").length,
+      pendingCount,
       state.actionsOnly,
       width,
       theme,
       unicode,
     ),
   );
-  lines.push("", theme.accent(theme.styles.bold(" STATUS")), "");
-  const counts: Record<StatusFilter, number> = {
-    all: state.documents.length,
-    unread: state.documents.filter(({ status }) => status === "unread").length,
-    reading: state.documents.filter(({ status }) => status === "reading").length,
-    done: state.documents.filter(({ status }) => status === "done").length,
-  };
   const labels: Record<StatusFilter, string> = {
     all: "All",
     unread: "New",
     reading: "Reading",
     done: "Done",
   };
-  for (const status of ["all", "unread", "reading", "done"] as const) {
+  for (const status of ["unread", "reading", "done"] as const) {
     lines.push(
       navigationLine(
         labels[status],
         counts[status],
-        state.statusFilter === status,
+        !state.actionsOnly && state.statusFilter === status,
         width,
         theme,
         unicode,
-        status === "all" ? undefined : status,
+        status,
       ),
     );
   }
@@ -1767,7 +2663,7 @@ function sidebarLines(
 
 function navigationLine(
   label: string,
-  count: number,
+  count: number | string,
   selected: boolean,
   width: number,
   theme: TuiTheme,
@@ -1858,19 +2754,31 @@ function queueMainLines(
   const project = state.workspaceFilter
     ? state.workspaces.find(({ id }) => id === state.workspaceFilter)?.name ?? state.workspaceFilter
     : "All projects";
-  const filter = state.statusFilter === "all" ? "All statuses" : statusLabel(state.statusFilter);
-  const space = state.changeReviewsOnly
+  const filter = state.actionsOnly
+    ? "Waiting for you"
+    : state.statusFilter === "all"
+      ? "All statuses"
+      : statusLabel(state.statusFilter);
+  const selectedSpace = state.selectedSpace === undefined
+    ? "All spaces"
+    : state.spaces.find(({ id }) => id === state.selectedSpace)?.name ??
+      state.selectedSpace;
+  const space = state.contentMode === "archive"
+    ? "Archive · v Documents"
+    : state.changeReviewsOnly || state.contentMode === "change-reviews"
     ? "Change reviews"
     : "Documents · c Change reviews";
   const groupLabel = state.grouping === "all"
     ? "ordered"
     : `grouped by ${state.grouping}`;
-  const baseView = `${space} · ${groupLabel} · ${project} · ${filter}`;
+  const baseView = `${project} · ${selectedSpace} · ${space} · ${filter} · ${groupLabel}`;
   const view = state.search ? `${baseView} · “${state.search}”` : baseView;
   const lines = [
     spread(
       theme.styles.bold(
-        state.changeReviewsOnly
+        state.contentMode === "archive"
+          ? `${count} archived ${count === 1 ? "document" : "documents"}`
+        : state.changeReviewsOnly || state.contentMode === "change-reviews"
           ? `${count} ${count === 1 ? "change review" : "change reviews"}`
           : `${count} ${count === 1 ? "document" : "documents"}`,
       ),
@@ -1908,6 +2816,7 @@ function queueMainLines(
         state.reviewRequests,
         state.visibleDocuments[firstIndex]!.id,
       ) !== undefined,
+      state.selectedDocumentIds.includes(state.visibleDocuments[firstIndex]!.id),
       theme,
       borders,
     );
@@ -1922,6 +2831,7 @@ function queueMainLines(
           secondIndex === state.selectedIndex,
           pendingReviewForDocument(state.reviewRequests, secondDocument.id) !==
             undefined,
+          state.selectedDocumentIds.includes(secondDocument.id),
           theme,
           borders,
         )
@@ -1943,6 +2853,7 @@ function renderDocumentCard(
   width: number,
   selected: boolean,
   actionRequired: boolean,
+  batchSelected: boolean,
   theme: TuiTheme,
   borders: TuiBorders,
 ): string[] {
@@ -1956,7 +2867,7 @@ function renderDocumentCard(
   const topPrefix = `${borderStyle(`${borders.topLeft}${borders.horizontal}`)} ${label} `;
   const topFill = Math.max(0, width - stringWidth(topPrefix) - 1);
   const top = `${topPrefix}${borderStyle(`${borders.horizontal.repeat(topFill)}${borders.topRight}`)}`;
-  const marker = selected ? theme.accent("› ") : "  ";
+  const marker = `${selected ? theme.accent("›") : " "}${batchSelected ? theme.accent("✓") : " "}`;
   const title = selected
     ? theme.styles.bold(sanitizeTerminalText(document.title))
     : theme.ink(sanitizeTerminalText(document.title));
@@ -2052,6 +2963,52 @@ function readerLines(
         "",
       ]
     : [];
+  const selectedSourceLine = state.reader.sourceMap?.logicalLines[state.reader.sourceLineIndex];
+  const showFeedbackDraft = Boolean(
+    state.reader.sourceMap ||
+      state.reader.feedbackGeneralMessage !== "" ||
+      state.reader.markdownFeedbackItems.length > 0 ||
+      state.reader.feedbackHistory.length > 0,
+  );
+  const feedbackLines = showFeedbackDraft ? [
+    theme.accent(theme.styles.bold("FEEDBACK DRAFT")),
+    theme.muted(selectedSourceLine
+      ? `selected source row ${selectedSourceLine.sourceStart.line}: ${sanitizeTerminalText(selectedSourceLine.text.slice(0, 100))}`
+      : "no commentable source row"),
+    ...(state.reader.feedbackGeneralMessage === ""
+      ? []
+      : [`general · ${sanitizeTerminalText(state.reader.feedbackGeneralMessage)}`]),
+    ...state.reader.markdownFeedbackItems.map((item) =>
+      `[ ] ${item.intent} · ${sanitizeTerminalText(item.message)}`
+    ),
+    ...state.reader.feedbackHistory.flatMap((submission) => [
+      `saved · ${submission.id} · revision ${submission.documentRevision}${submission.documentRevision === state.reader!.document.revision ? " · current" : " · historical"} · ${submission.comments.length} comment${submission.comments.length === 1 ? "" : "s"}`,
+      ...(submission.generalMessage === undefined
+        ? []
+        : [`  general · ${sanitizeTerminalText(submission.generalMessage)}`]),
+      ...submission.comments.map((comment) =>
+        `  ${comment.intent} · ${sanitizeTerminalText(comment.message)} — ${sanitizeTerminalText(tuiStoredFeedbackAnchorLabel(comment))}`
+      ),
+    ]),
+    theme.muted("[/] select source row · f comment · g general feedback · s send"),
+    "",
+  ] : [];
+  const annotationLines = state.annotationComposer
+    ? [
+        theme.accent(`${state.annotationComposer.kind.toUpperCase()} · ${sanitizeTerminalText(state.annotationComposer.label ?? "selected source row")}`),
+        ...sanitizeTerminalText(state.annotationComposer.message || "_").split("\n"),
+        theme.muted("ctrl-d save comment · esc cancel"),
+        "",
+      ]
+    : [];
+  const feedbackComposerLines = state.feedbackComposer
+    ? [
+        theme.accent("GENERAL FEEDBACK"),
+        ...sanitizeTerminalText(state.feedbackComposer.message || "_").split("\n"),
+        theme.muted("ctrl-d save draft · esc cancel"),
+        "",
+      ]
+    : [];
   const composerLines = state.reviewComposer
     ? [
         theme.accent(
@@ -2065,7 +3022,10 @@ function readerLines(
   const all = [
     ...(warningLines.length > 0 ? [...warningLines, ""] : []),
     ...content,
+    ...(feedbackLines.length === 0 ? [] : ["", ...feedbackLines]),
     ...(reviewLines.length > 0 ? ["", ...reviewLines] : []),
+    ...annotationLines,
+    ...feedbackComposerLines,
     ...composerLines,
   ];
   const headerLength = state.message ? 4 : 3;
@@ -2109,13 +3069,13 @@ function changeReviewReaderLines(
   const fileIndex = clamp(reader.changeFileIndex, 0, review.files.length - 1);
   const file = review.files[fileIndex]!;
   const hunkIndex = clamp(reader.changeHunkIndex, 0, Math.max(0, file.hunks.length - 1));
-  const hunk = file.hunks[hunkIndex];
+  const hunkLabel = `${file.hunks.length} ${file.hunks.length === 1 ? "hunk" : "hunks"}`;
   const header = [
     heading,
     spread(
       theme.muted(sanitizeTerminalText(meta)),
       theme.muted(
-        `${reader.changeLayout.toUpperCase()} · file ${fileIndex + 1}/${review.files.length} · hunk ${Math.min(hunkIndex + 1, file.hunks.length)}/${file.hunks.length}`,
+        `${reader.changeLayout.toUpperCase()} · file ${fileIndex + 1}/${review.files.length} · ${hunkLabel}`,
       ),
       width,
     ),
@@ -2125,6 +3085,32 @@ function changeReviewReaderLines(
   const warnings = [...reader.warnings, ...review.warnings];
   const showFiles = width >= 96;
   const diffWidth = showFiles ? width - 29 : width;
+  const inlineFeedback = allReviewFeedbackItems(state);
+  const renderedHunks = file.hunks.flatMap((hunk, index) => [
+    theme.muted(sanitizeTerminalText(hunk.header)),
+    "",
+    ...(reader.changeLayout === "side-by-side"
+      ? renderSideBySideHunk(
+          hunk,
+          diffWidth,
+          theme,
+          borders,
+          file.path,
+          index === hunkIndex ? reader.changeLineIndex : -1,
+          index === hunkIndex ? reader.changeRangeStartIndex : undefined,
+          inlineFeedback,
+        )
+      : renderUnifiedHunk(
+          hunk,
+          diffWidth,
+          theme,
+          file.path,
+          index === hunkIndex ? reader.changeLineIndex : -1,
+          index === hunkIndex ? reader.changeRangeStartIndex : undefined,
+          inlineFeedback,
+        )),
+    ...(index === file.hunks.length - 1 ? [] : [""]),
+  ]);
   const body: string[] = [
     ...(warnings.map((warning) => theme.accent(`warning: ${sanitizeTerminalText(warning)}`))),
     ...(warnings.length > 0 ? [""] : []),
@@ -2132,14 +3118,10 @@ function changeReviewReaderLines(
     ...(file.previousPath
       ? [theme.muted(`renamed from ${sanitizeTerminalText(file.previousPath)}`)]
       : []),
-    hunk ? theme.muted(sanitizeTerminalText(hunk.header)) : theme.muted("No text hunks."),
-    "",
-    ...(hunk
-      ? reader.changeLayout === "side-by-side"
-        ? renderSideBySideHunk(hunk, diffWidth, theme, borders, file.path)
-        : renderUnifiedHunk(hunk, diffWidth, theme, file.path)
-      : []),
-    ...reviewFeedbackLines(state, file, hunk, theme),
+    ...(renderedHunks.length > 0
+      ? renderedHunks
+      : [theme.muted("No text hunks."), ""]),
+    ...reviewFeedbackLines(state, file, theme),
   ];
   const available = Math.max(1, height - header.length);
   const maxScroll = Math.max(0, body.length - available);
@@ -2170,7 +3152,7 @@ function changeFileLines(
     const value = `${prefix} ${changeStatusSymbol(file.status)} ${sanitizeTerminalText(file.path)}`;
     lines.push(index === selectedIndex ? theme.styles.bold(value) : theme.muted(value));
   }
-  lines.push("", theme.muted("j / k file · p / n hunk"));
+  lines.push("", theme.muted("p / n file · j / k line"));
   return lines.map((line) => fitLine(line, width));
 }
 
@@ -2210,6 +3192,9 @@ function renderUnifiedHunk(
   width: number,
   theme: TuiTheme,
   path: string,
+  selectedIndex: number,
+  rangeStartIndex: number | undefined,
+  feedbackItems: readonly ReviewFeedbackItem[],
 ): string[] {
   const lines: string[] = [];
   for (let index = 0; index < hunk.lines.length; index += 1) {
@@ -2230,6 +3215,10 @@ function renderUnifiedHunk(
         ),
         width,
         theme,
+        isSelectedChangeLine(index, selectedIndex, rangeStartIndex),
+      ));
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, line, width, theme,
       ));
       lines.push(formatUnifiedLine(
         next,
@@ -2242,6 +3231,10 @@ function renderUnifiedHunk(
         ),
         width,
         theme,
+        isSelectedChangeLine(index + 1, selectedIndex, rangeStartIndex),
+      ));
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, next, width, theme,
       ));
       index += 1;
       continue;
@@ -2251,6 +3244,10 @@ function renderUnifiedHunk(
       terminalDiffText(path, sanitizeTerminalText(line.text), theme),
       width,
       theme,
+      isSelectedChangeLine(index, selectedIndex, rangeStartIndex),
+    ));
+    lines.push(...terminalInlineFeedbackLines(
+      feedbackItems, path, hunk.id, line, width, theme,
     ));
   }
   return lines;
@@ -2261,15 +3258,19 @@ function formatUnifiedLine(
   text: string,
   width: number,
   theme: TuiTheme,
+  selected: boolean,
 ): string {
   const prefix = `${displayLineNumber(line.oldLine)} ${displayLineNumber(line.newLine)} ${changeLineMarker(line.kind)} `;
   if (line.kind === "addition") {
-    return theme.additionLine(fitLine(`${prefix}${text}`, width));
+    const value = theme.additionLine(fitLine(`${prefix}${text}`, width));
+    return selected ? theme.styles.underline(value) : value;
   }
   if (line.kind === "deletion") {
-    return theme.deletionLine(fitLine(`${prefix}${text}`, width));
+    const value = theme.deletionLine(fitLine(`${prefix}${text}`, width));
+    return selected ? theme.styles.underline(value) : value;
   }
-  return theme.muted(`${prefix}${text}`);
+  const value = theme.muted(`${prefix}${text}`);
+  return selected ? theme.styles.underline(value) : value;
 }
 
 function renderSideBySideHunk(
@@ -2278,6 +3279,9 @@ function renderSideBySideHunk(
   theme: TuiTheme,
   borders: TuiBorders,
   path: string,
+  selectedIndex: number,
+  rangeStartIndex: number | undefined,
+  feedbackItems: readonly ReviewFeedbackItem[],
 ): string[] {
   const leftWidth = Math.max(12, Math.floor((width - 1) / 2));
   const rightWidth = Math.max(12, width - leftWidth - 1);
@@ -2324,11 +3328,37 @@ function renderSideBySideHunk(
       right = line;
       rightText = terminalDiffText(path, sanitizeTerminalText(line.text), theme);
     }
-    const leftValue = formatSideBySideCell(left, leftText, leftWidth, theme);
-    const rightValue = formatSideBySideCell(right, rightText, rightWidth, theme);
+    const leftValue = formatSideBySideCell(
+      left,
+      leftText,
+      leftWidth,
+      theme,
+      left !== undefined && isSelectedChangeLine(
+        hunk.lines.indexOf(left), selectedIndex, rangeStartIndex,
+      ),
+    );
+    const rightValue = formatSideBySideCell(
+      right,
+      rightText,
+      rightWidth,
+      theme,
+      right !== undefined && isSelectedChangeLine(
+        hunk.lines.indexOf(right), selectedIndex, rangeStartIndex,
+      ),
+    );
     lines.push(
       `${fitLine(leftValue, leftWidth)}${theme.line(borders.vertical)}${fitLine(rightValue, rightWidth)}`,
     );
+    if (left) {
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, left, width, theme,
+      ));
+    }
+    if (right && right !== left) {
+      lines.push(...terminalInlineFeedbackLines(
+        feedbackItems, path, hunk.id, right, width, theme,
+      ));
+    }
   }
   return lines;
 }
@@ -2338,6 +3368,7 @@ function formatSideBySideCell(
   text: string,
   width: number,
   theme: TuiTheme,
+  selected: boolean,
 ): string {
   if (!line) {
     return fitLine("", width);
@@ -2347,18 +3378,130 @@ function formatSideBySideCell(
     width,
   );
   if (line.kind === "addition") {
-    return theme.additionLine(value);
+    const styled = theme.additionLine(value);
+    return selected ? theme.styles.underline(styled) : styled;
   }
   if (line.kind === "deletion") {
-    return theme.deletionLine(value);
+    const styled = theme.deletionLine(value);
+    return selected ? theme.styles.underline(styled) : styled;
   }
-  return theme.muted(value);
+  const styled = theme.muted(value);
+  return selected ? theme.styles.underline(styled) : styled;
+}
+
+function isSelectedChangeLine(
+  index: number,
+  selectedIndex: number,
+  rangeStartIndex: number | undefined,
+): boolean {
+  return index >= Math.min(rangeStartIndex ?? selectedIndex, selectedIndex) &&
+    index <= Math.max(rangeStartIndex ?? selectedIndex, selectedIndex);
+}
+
+function changeLineAnchor(
+  line: ChangeReviewLine,
+): { line: number | null; side: "old" | "new" } {
+  return line.kind === "deletion"
+    ? { line: line.oldLine, side: "old" }
+    : { line: line.newLine, side: "new" };
+}
+
+function terminalInlineFeedbackLines(
+  items: readonly ReviewFeedbackItem[],
+  path: string,
+  hunkId: string,
+  line: ChangeReviewLine,
+  width: number,
+  theme: TuiTheme,
+): string[] {
+  const matches = [
+    ...(line.oldLine === null
+      ? []
+      : feedbackEndingAtLine(items, {
+          path, hunkId, line: line.oldLine, side: "old",
+        })),
+    ...(line.newLine === null
+      ? []
+      : feedbackEndingAtLine(items, {
+          path, hunkId, line: line.newLine, side: "new",
+        })),
+  ].filter(
+    (item, index, candidates) =>
+      candidates.findIndex((candidate) => candidate.id === item.id) === index,
+  );
+  const rendered: string[] = [];
+  for (const item of matches) {
+    const messageLines = sanitizeTerminalText(item.message).split("\n");
+    const first = messageLines.shift() ?? "";
+    rendered.push(theme.accent(fitLine(
+      `└─ COMMENT ${feedbackAnchorLabel(item)} · ${first}`,
+      width,
+    )));
+    for (const continuation of messageLines) {
+      rendered.push(theme.accent(fitLine(`   ${continuation}`, width)));
+    }
+  }
+  return rendered;
+}
+
+function allReviewFeedbackItems(state: TuiState): ReviewFeedbackItem[] {
+  const reader = state.reader;
+  if (!reader) return [];
+  const requests = state.reviewRequests.filter(
+    (request) => request.documentId === reader.document.id,
+  );
+  const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
+  const persisted = reader.feedbackHistory.length > 0
+    ? tuiStoredDiffFeedback(
+        reader.feedbackHistory.filter(
+          ({ documentRevision }) => documentRevision === reader.document.revision,
+        ),
+      )
+    : request?.response?.items ?? [];
+  return [...persisted, ...reader.feedbackItems];
+}
+
+function tuiStoredDiffFeedback(
+  submissions: readonly PublicFeedbackSubmission[],
+): ReviewFeedbackItem[] {
+  return submissions.flatMap((submission) => submission.comments.flatMap((comment) => {
+    const anchor = comment.anchor;
+    if (anchor.kind === "markdown-v1") return [];
+    return [{
+      id: comment.id.replace(/^comment-/, "feedback-"),
+      kind: comment.intent,
+      path: anchor.path,
+      ...(anchor.kind === "diff-file-v1"
+        ? {}
+        : {
+            hunkId: anchor.hunkId,
+            side: anchor.side,
+            line: anchor.line,
+            ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+          }),
+      message: comment.message,
+    }];
+  }));
+}
+
+function tuiStoredFeedbackAnchorLabel(
+  comment: PublicFeedbackSubmission["comments"][number],
+): string {
+  const anchor = comment.anchor;
+  if (anchor.kind === "markdown-v1") {
+    return anchor.start.line === anchor.end.line
+      ? `document line ${anchor.start.line}`
+      : `document lines ${anchor.start.line}-${anchor.end.line}`;
+  }
+  if (anchor.kind === "diff-file-v1") return anchor.path;
+  return anchor.endLine === undefined
+    ? `${anchor.path}:${anchor.line} (${anchor.side})`
+    : `${anchor.path}:${anchor.line}-${anchor.endLine} (${anchor.side})`;
 }
 
 function reviewFeedbackLines(
   state: TuiState,
   file: ChangeReviewFile,
-  hunk: ChangeReviewHunk | undefined,
   theme: TuiTheme,
 ): string[] {
   const reader = state.reader;
@@ -2369,14 +3512,34 @@ function reviewFeedbackLines(
     (request) => request.documentId === reader.document.id,
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
-  const persisted = request?.response?.items ?? [];
-  const items = [...persisted, ...reader.feedbackItems];
+  const persisted = reader.feedbackHistory.length > 0
+    ? tuiStoredDiffFeedback(
+        reader.feedbackHistory.filter(
+          ({ documentRevision }) => documentRevision === reader.document.revision,
+        ),
+      )
+    : request?.response?.items ?? [];
   const lines: string[] = [""];
-  if (items.length > 0) {
+  if (
+    persisted.length > 0 ||
+    reader.feedbackItems.length > 0 ||
+    reader.markdownFeedbackItems.length > 0 ||
+    reader.feedbackGeneralMessage !== ""
+  ) {
     lines.push(theme.accent(theme.styles.bold("FEEDBACK")));
-    for (const item of items) {
-      const anchor = item.hunkId ? `${item.path}#${item.hunkId}` : item.path;
+    for (const item of persisted) {
+      const anchor = feedbackAnchorLabel(item);
+      lines.push(`- ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
+    }
+    for (const item of reader.feedbackItems) {
+      const anchor = feedbackAnchorLabel(item);
       lines.push(`[ ] ${item.kind} · ${sanitizeTerminalText(item.message)} — ${sanitizeTerminalText(anchor)}`);
+    }
+    if (reader.feedbackGeneralMessage !== "") {
+      lines.push(`[ ] general · ${sanitizeTerminalText(reader.feedbackGeneralMessage)}`);
+    }
+    for (const item of reader.markdownFeedbackItems) {
+      lines.push(`[ ] ${item.intent} · ${sanitizeTerminalText(item.message)} — document text`);
     }
     lines.push("");
   }
@@ -2395,9 +3558,13 @@ function reviewFeedbackLines(
     );
   }
   if (state.annotationComposer) {
-    const anchor = state.annotationComposer.hunkId
-      ? `${state.annotationComposer.path}#${state.annotationComposer.hunkId}`
-      : state.annotationComposer.path;
+    const anchor = state.annotationComposer.label ??
+      (state.annotationComposer.path
+        ? feedbackAnchorLabel({
+            ...state.annotationComposer,
+            path: state.annotationComposer.path,
+          })
+        : "selected document text");
     lines.push(
       theme.accent(`${state.annotationComposer.kind.toUpperCase()} · ${sanitizeTerminalText(anchor)}`),
       ...sanitizeTerminalText(state.annotationComposer.message || "_").split("\n"),
@@ -2405,17 +3572,29 @@ function reviewFeedbackLines(
       "",
     );
   }
+  if (state.feedbackComposer) {
+    lines.push(
+      theme.accent("GENERAL FEEDBACK"),
+      ...sanitizeTerminalText(state.feedbackComposer.message || "_").split("\n"),
+      theme.muted("ctrl-d save draft · esc cancel"),
+      "",
+    );
+  }
   if (state.reviewComposer) {
     lines.push(
-      theme.accent(`RESPONSE · ${state.reviewComposer.outcome.replaceAll("_", " ")}`),
+      theme.accent(
+        state.reviewComposer.outcome === "changes_requested"
+          ? "GENERAL NOTE · REQUEST CHANGES"
+          : `RESPONSE · ${state.reviewComposer.outcome.replaceAll("_", " ")}`,
+      ),
       ...sanitizeTerminalText(state.reviewComposer.message || "_").split("\n"),
       theme.muted("ctrl-d submit · esc cancel"),
       "",
     );
   }
-  if (!state.annotationComposer && !state.reviewComposer && request?.status === "pending") {
+  if (!state.annotationComposer && !state.feedbackComposer && !state.reviewComposer) {
     lines.push(theme.muted(
-      `f feedback on ${hunk?.id ?? "current hunk"} · t todo for ${file.path} · z undo note`,
+      `j/k select line · v mark range · f line/range comment · t file comment for ${file.path} · g general feedback · s send · z undo`,
     ));
   }
   return lines;

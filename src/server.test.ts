@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -69,10 +69,13 @@ async function fixture(
     name: "Example",
     root: workspace,
     artifactRoots: [workspace],
+    repository: "github.com/riidii-md/eywizards",
+    repositoryName: "EyWizards",
   });
   const document = await catalog.registerDocument({
     workspaceId: "example",
     taskId: "DESK-4",
+    featureName: "Visible Planning",
     producer: "codex",
     kind: "plan",
     title: "Visible plan",
@@ -115,7 +118,17 @@ test("serves health publicly and protects catalog APIs", async () => {
     const health = await fetch(new URL("/api/v1/health", value.server.url));
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), {
-      data: { service: "mdmaid.desk", status: "ok", version: 1 },
+      data: {
+        service: "mdmaid.desk",
+        status: "ok",
+        version: 1,
+        capabilities: [
+          "spaces-v1",
+          "scoped-content-v1",
+          "workspace-reconciliation-v1",
+          "document-feedback-v1",
+        ],
+      },
     });
 
     const unauthorized = await fetch(
@@ -125,6 +138,250 @@ test("serves health publicly and protects catalog APIs", async () => {
     assert.deepEqual(await unauthorized.json(), {
       error: { code: "unauthorized", message: "Authentication required" },
     });
+    const unauthorizedFeedback = await fetch(
+      new URL("/api/v1/feedback/feedback-0123456789abcdef0123", value.server.url),
+    );
+    assert.equal(unauthorizedFeedback.status, 401);
+    const unauthorizedFeedbackRoute = await fetch(
+      new URL("/f/feedback-0123456789abcdef0123", value.server.url),
+    );
+    assert.equal(unauthorizedFeedbackRoute.status, 401);
+    const unauthorizedReconciliation = await fetch(
+      new URL(
+        "/api/v1/workspaces/example/reconcile",
+        value.server.url,
+      ),
+      { method: "POST" },
+    );
+    assert.equal(unauthorizedReconciliation.status, 401);
+    assert.deepEqual(await unauthorizedReconciliation.json(), {
+      error: { code: "unauthorized", message: "Authentication required" },
+    });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("stable feedback routes resolve existence and Space scope before serving the workspace", async () => {
+  const value = await fixture();
+  try {
+    const submission = await value.catalog.createFeedback({
+      id: "feedback-aaaaaaaaaaaaaaaaaaaa",
+      documentId: value.document.id,
+      documentRevision: value.document.revision,
+      generalMessage: "Route-scoped note.",
+      comments: [],
+    });
+    value.catalog.createSpace({
+      id: "empty",
+      name: "Empty",
+      matchers: [{ kind: "tag", value: "not-present" }],
+    });
+
+    assert.equal((await authorized(value, submission.route)).status, 200);
+    const bootstrap = await fetch(
+      new URL(`${submission.route}?token=${value.server.token}`, value.server.url),
+      { redirect: "manual" },
+    );
+    assert.equal(bootstrap.status, 303);
+    assert.equal(bootstrap.headers.get("location"), submission.route);
+    const unknown = await authorized(
+      value,
+      "/f/feedback-bbbbbbbbbbbbbbbbbbbb",
+    );
+    const outOfScope = await authorized(
+      value,
+      `${submission.route}?space=empty`,
+    );
+    assert.equal(unknown.status, 404);
+    assert.equal(outOfScope.status, 404);
+    assert.deepEqual(await unknown.json(), await outOfScope.json());
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("manages Spaces and exposes only sanitized repository inventory", async () => {
+  const value = await fixture();
+  try {
+    const created = await authorized(value, "/api/v1/spaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "client",
+        name: "Client",
+        matchers: [
+          { kind: "repository-namespace", value: "github.com/riidii-md" },
+          { kind: "tag", value: "architecture" },
+        ],
+      }),
+    });
+    assert.equal(created.status, 201);
+    assert.equal(created.headers.get("location"), "/api/v1/spaces/client");
+    assert.deepEqual(await created.json(), {
+      data: {
+        id: "client",
+        name: "Client",
+        matchers: [
+          { kind: "repository-namespace", value: "github.com/riidii-md" },
+          { kind: "tag", value: "architecture" },
+        ],
+      },
+    });
+
+    const renamed = await authorized(value, "/api/v1/spaces/client", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Work" }),
+    });
+    assert.equal(renamed.status, 200);
+    assert.equal(((await renamed.json()) as { data: { name: string } }).data.name, "Work");
+
+    const replaced = await authorized(value, "/api/v1/spaces/client/matchers", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        matchers: [{ kind: "repository", value: "github.com/riidii-md/eywizards" }],
+      }),
+    });
+    assert.equal(replaced.status, 200);
+
+    const listed = await authorized(value, "/api/v1/spaces");
+    assert.equal(listed.status, 200);
+    assert.equal(((await listed.json()) as { data: unknown[] }).data.length, 1);
+
+    const repositories = await authorized(value, "/api/v1/repositories");
+    assert.deepEqual(await repositories.json(), {
+      data: [{
+        key: "github.com/riidii-md/eywizards",
+        name: "EyWizards",
+        workspaceIds: ["example"],
+        kind: "remote",
+      }],
+    });
+    assert.doesNotMatch(JSON.stringify(await (await authorized(value, "/api/v1/repositories")).json()), new RegExp(value.root));
+
+    const invalid = await authorized(value, "/api/v1/spaces/client", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Bad", extra: true }),
+    });
+    assert.equal(invalid.status, 422);
+    assert.equal(((await invalid.json()) as { error: { code: string } }).error.code, "validation_error");
+
+    const removed = await authorized(value, "/api/v1/spaces/client", {
+      method: "DELETE",
+    });
+    assert.deepEqual(await removed.json(), { data: { id: "client" } });
+    const missing = await authorized(value, "/api/v1/spaces/client");
+    assert.equal(missing.status, 404);
+    assert.equal(((await missing.json()) as { error: { code: string } }).error.code, "space_not_found");
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("applies Space scope uniformly and contains out-of-scope resources", async () => {
+  const value = await fixture();
+  try {
+    value.catalog.createSpace({
+      id: "empty",
+      name: "Empty",
+      matchers: [{ kind: "tag", value: "not-present" }],
+    });
+    const review = await value.catalog.createReviewRequest({
+      documentId: value.document.id,
+      kind: "plan-decision",
+      requestMessage: "Review",
+    });
+    for (const path of [
+      "/api/v1/documents?space=empty",
+      "/api/v1/workspaces?space=empty",
+      "/api/v1/projects?space=empty",
+      "/api/v1/review-requests?space=empty",
+    ]) {
+      const response = await authorized(value, path);
+      assert.equal(response.status, 200, path);
+      assert.deepEqual(await response.json(), { data: [] }, path);
+    }
+    const sourceId = value.document.sourceLinks[0]?.id;
+    assert.ok(sourceId);
+    const reads = [
+      `/api/v1/documents/${value.document.id}?space=empty`,
+      `/api/v1/documents/${value.document.id}/render?target=web&space=empty`,
+      `/api/v1/documents/${value.document.id}/export?space=empty`,
+      `/d/${value.document.id}/source/${sourceId}?space=empty`,
+      `/api/v1/review-requests/${review.id}?space=empty`,
+    ];
+    for (const path of reads) {
+      const response = await authorized(value, path);
+      assert.equal(response.status, 404, path);
+    }
+    const opened = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/opened?space=empty`,
+      { method: "POST" },
+    );
+    assert.equal(opened.status, 404);
+    assert.equal(value.catalog.getDocument(value.document.id)?.status, "unread");
+
+    const unknown = await authorized(value, "/api/v1/documents?space=missing");
+    assert.equal(unknown.status, 404);
+    assert.equal(((await unknown.json()) as { error: { code: string } }).error.code, "space_not_found");
+    const duplicate = await authorized(value, "/api/v1/documents?space=empty&space=empty");
+    assert.equal(duplicate.status, 400);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("serves top-level content and Space controls with strict query state", async () => {
+  const value = await fixture();
+  try {
+    value.catalog.createSpace({
+      id: "work",
+      name: "Work",
+      matchers: [{ kind: "tag", value: "architecture" }],
+    });
+    const page = await authorized(
+      value,
+      "/?space=work&view=docs&actions=1",
+    );
+    assert.equal(page.status, 200);
+    const html = await page.text();
+    assert.match(html, /<a class="brand" href="\/">\s*<strong>mdmaid\.desk<\/strong>/);
+    assert.match(
+      html,
+      /id="project-select"[^>]*type="search"[^>]*role="combobox"[^>]*aria-controls="project-options"/,
+    );
+    assert.match(html, /id="project-options"[^>]*role="listbox"/);
+    assert.match(html, /id="project-select"[^>]*placeholder="Search projects…"/);
+    assert.match(html, /id="docs-filter"[^>]*aria-pressed="true"/);
+    assert.match(html, /id="change-reviews-filter"[^>]*aria-pressed="false"/);
+    assert.match(html, /id="space-select"/);
+    assert.match(html, /id="actions-filter"[^>]*aria-pressed="false"/);
+    assert.match(
+      html,
+      /id="pending-decisions"[^>]*role="status"[^>]*hidden[^>]*>[^<]*waiting for decision/,
+    );
+    assert.match(html, /id="live-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.ok(html.indexOf('id="pending-decisions"') < html.indexOf('id="live-status"'));
+    assert.ok(html.indexOf('id="project-select"') < html.indexOf('id="space-select"'));
+    assert.ok(html.indexOf('id="space-select"') < html.indexOf('id="docs-filter"'));
+    assert.match(
+      html,
+      /class="status-filters"[^>]*>[\s\S]*id="actions-filter"[\s\S]*data-status-filter="done"/,
+    );
+    assert.doesNotMatch(html, /class="actions-nav"/);
+
+    for (const path of [
+      "/?view=other",
+      "/?view=docs&view=docs",
+      "/?actions=0",
+      "/?space=work&space=work",
+    ]) {
+      assert.equal((await authorized(value, path)).status, 400, path);
+    }
   } finally {
     await closeFixture(value);
   }
@@ -145,6 +402,11 @@ test("lists public document metadata without leaking filesystem paths", async ()
     assert.equal(body.data[0]?.id, value.document.id);
     assert.equal(body.data[0]?.status, "unread");
     assert.equal(body.data[0]?.route, `/d/${value.document.id}`);
+    assert.equal(body.data[0]?.projectId, value.document.projectId);
+    assert.equal(
+      body.data[0]?.projectName,
+      "EyWizards / DESK-4 (Visible Planning)",
+    );
     assert.equal("path" in (body.data[0] ?? {}), false);
     assert.equal("sourceLinks" in (body.data[0] ?? {}), false);
     assert.equal("contentHash" in (body.data[0] ?? {}), false);
@@ -153,6 +415,29 @@ test("lists public document metadata without leaking filesystem paths", async ()
     const workspaces = await authorized(value, "/api/v1/workspaces");
     assert.equal(workspaces.status, 200);
     assert.doesNotMatch(await workspaces.text(), new RegExp(value.root));
+
+    const secondPath = join(value.workspace, "second.md");
+    await writeFile(secondPath, "# Second\n", "utf8");
+    await value.catalog.registerDocument({
+      workspaceId: "example",
+      taskId: "DESK-4",
+      featureName: "Different wording is ignored",
+      kind: "brief",
+      title: "Second",
+      path: secondPath,
+      attention: "none",
+    });
+    const projects = await authorized(value, "/api/v1/projects");
+    assert.deepEqual(await projects.json(), {
+      data: [
+        {
+          id: value.document.projectId,
+          name: "EyWizards / DESK-4 (Visible Planning)",
+          documentCount: 2,
+          route: `/p/${value.document.projectId}`,
+        },
+      ],
+    });
   } finally {
     await closeFixture(value);
   }
@@ -315,6 +600,9 @@ test("returns a bounded native diff model for change-review documents", async ()
       kind: "feedback",
       path: "src/auth.ts",
       hunkId: body.data.changeReview.files[0]?.hunks[0]?.id,
+      line: 1,
+      endLine: 2,
+      side: "new",
       message: "Use a constant-time comparison.",
     };
     const responded = await authorized(
@@ -324,16 +612,18 @@ test("returns a bounded native diff model for change-review documents", async ()
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          outcome: "changes_requested",
-          message: "Address the anchored feedback.",
+          outcome: "approved",
+          message: "Approved with a non-blocking comment.",
           items: [feedback],
         }),
       },
     );
     assert.equal(responded.status, 200);
     const responseBody = (await responded.json()) as {
-      data: { response: { items: unknown[] } };
+      data: { status: string; response: { outcome: string; items: unknown[] } };
     };
+    assert.equal(responseBody.data.status, "approved");
+    assert.equal(responseBody.data.response.outcome, "approved");
     assert.deepEqual(responseBody.data.response.items, [feedback]);
   } finally {
     await closeFixture(value);
@@ -424,7 +714,7 @@ test("serves authenticated local source links without exposing filesystem paths"
     const unauthorized = await fetch(new URL(route, value.server.url));
     assert.equal(unauthorized.status, 401);
 
-    const response = await authorized(value, `${route}#L2`);
+    const response = await authorized(value, `${route}?view=change-reviews&actions=1#L2`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type") ?? "", /text\/html/);
     const html = await response.text();
@@ -432,6 +722,11 @@ test("serves authenticated local source links without exposing filesystem paths"
     assert.match(html, /id="L2"/);
     assert.match(html, /&lt;script&gt;alert\(&#39;no&#39;\)&lt;\/script&gt;/);
     assert.match(html, new RegExp(`/d/${value.document.id}`));
+    assert.match(html, /<a class="brand" href="\/">/);
+    assert.match(
+      html,
+      new RegExp(`/d/${value.document.id}\\?view=change-reviews(?:&amp;|&)actions=1`),
+    );
     assert.doesNotMatch(html, new RegExp(value.root));
 
     const unknown = await authorized(
@@ -721,6 +1016,66 @@ test("shares reading lifecycle mutations through the API", async () => {
   }
 });
 
+test("archives, restores, and purges validated document batches", async () => {
+  const value = await fixture();
+  const secondPath = join(value.workspace, "second.md");
+  await writeFile(secondPath, "# Second\n", "utf8");
+  const second = await value.catalog.registerDocument({
+    workspaceId: "example",
+    kind: "review",
+    title: "Second",
+    path: secondPath,
+    attention: "none",
+  });
+  const ids = [value.document.id, second.id];
+  try {
+    const archived = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "archive", ids }),
+    });
+    assert.equal(archived.status, 200);
+    assert.deepEqual(
+      ((await archived.json()) as { data: { documents: Document[] } })
+        .data.documents.map(({ id }) => id),
+      ids,
+    );
+
+    const restored = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "restore", ids }),
+    });
+    assert.equal(restored.status, 200);
+    assert.equal(
+      ((await restored.json()) as { data: { documents: Document[] } })
+        .data.documents.every(({ archivedAt }) => archivedAt === null),
+      true,
+    );
+
+    const malformed = await authorized(value, "/api/v1/documents/bulk", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "purge", ids: [second.id, second.id] }),
+    });
+    assert.equal(malformed.status, 422);
+
+    const purged = await authorized(
+      value,
+      `/api/v1/documents/${value.document.id}/purge`,
+      { method: "POST" },
+    );
+    assert.equal(purged.status, 200);
+    assert.deepEqual(await purged.json(), {
+      data: { purgedId: value.document.id },
+    });
+    assert.equal(value.catalog.getDocument(value.document.id), undefined);
+    assert.match(await readFile(join(value.workspace, "plan.md"), "utf8"), /Visible plan/);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("creates and resolves authenticated review requests without exposing hashes", async () => {
   const value = await fixture();
   try {
@@ -912,6 +1267,74 @@ test("registers documents through validated producer-neutral input", async () =>
   }
 });
 
+test("returns an actionable Mermaid diagnostic to document producers", async () => {
+  const value = await fixture();
+  try {
+    const documentPath = join(value.workspace, "broken-diagram.md");
+    await writeFile(documentPath, [
+      "# Broken",
+      "```mermaid",
+      "stateDiagram-v2",
+      "  [*] -->",
+      "```",
+      "",
+      "```mermaid",
+      "flowchart LR",
+      "  Valid --> Diagram",
+      "```",
+      "",
+      "```mermaid",
+      "stateDiagram-v2",
+      "  Ready -->",
+      "```",
+    ].join("\n"), "utf8");
+
+    const response = await authorized(value, "/api/v1/documents", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: "example",
+        kind: "review",
+        title: "Broken",
+        path: documentPath,
+        attention: "review",
+      }),
+    });
+    assert.equal(response.status, 422);
+    const body = (await response.json()) as {
+      error: {
+        code: string;
+        message: string;
+        validation: {
+          kind: string;
+          valid: boolean;
+          diagramCount: number;
+          issues: Array<{ block: number; line: number; message: string }>;
+        };
+      };
+    };
+    assert.equal(body.error.code, "invalid_mermaid");
+    assert.match(body.error.message, /Mermaid diagram 1.*line 2.*parse error/is);
+    assert.equal(body.error.validation.kind, "mermaid");
+    assert.equal(body.error.validation.valid, false);
+    assert.equal(body.error.validation.diagramCount, 3);
+    assert.deepEqual(
+      body.error.validation.issues.map(({ block, line }) => ({ block, line })),
+      [
+        { block: 1, line: 2 },
+        { block: 3, line: 12 },
+      ],
+    );
+    assert.ok(
+      body.error.validation.issues.every(({ message }) =>
+        /parse error/i.test(message)
+      ),
+    );
+  } finally {
+    await closeFixture(value);
+  }
+});
+
 test("imports outside documents without leaking source or managed paths", async () => {
   const value = await fixture();
   try {
@@ -1018,6 +1441,45 @@ test("adds workspaces through validated producer-neutral input", async () => {
       },
     });
 
+    const conflict = await authorized(value, "/api/v1/workspaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        id: "task-derived",
+        name: "Task derived",
+        root: workspace,
+        artifactRoots: [workspace],
+      }),
+    });
+    assert.equal(conflict.status, 409);
+    assert.deepEqual(await conflict.json(), {
+      error: {
+        code: "workspace_conflict",
+        message:
+          "workspace root is already registered as created; reconcile it before using task-derived",
+      },
+    });
+
+    const invalidReconciliation = await authorized(
+      value,
+      "/api/v1/workspaces/created/reconcile",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetWorkspaceId: "task-derived",
+          apply: "yes",
+        }),
+      },
+    );
+    assert.equal(invalidReconciliation.status, 422);
+    assert.deepEqual(await invalidReconciliation.json(), {
+      error: {
+        code: "validation_error",
+        message: "Invalid workspace reconciliation",
+      },
+    });
+
     const invalid = await authorized(value, "/api/v1/workspaces", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1071,12 +1533,21 @@ test("bootstraps a browser cookie and serves secure workspace routes", async () 
     assert.match(pageContent, /id="change-review-viewer"/);
     assert.match(pageContent, /id="change-file-list"/);
     assert.match(pageContent, /id="change-layout"/);
+    assert.doesNotMatch(pageContent, /id="change-hunk-previous"/);
+    assert.doesNotMatch(pageContent, /id="change-hunk-next"/);
     assert.match(pageContent, /id="change-view-document"/);
+    assert.match(pageContent, /id="copy-link"/);
     assert.match(pageContent, /id="review-panel"/);
+    assert.match(pageContent, /id="review-feedback-section"/);
+    assert.match(pageContent, /id="review-feedback-message"/);
+    assert.match(pageContent, /id="feedback-panel"/);
+    assert.match(pageContent, /id="feedback-general-message"/);
+    assert.match(pageContent, /id="document-feedback-add-selection"/);
     assert.match(pageContent, /id="review-response"/);
     assert.match(pageContent, /id="review-approve"/);
     assert.match(pageContent, /id="review-changes"/);
     assert.match(pageContent, /id="review-reject"/);
+    assert.match(pageContent, /id="review-supersede"/);
     assert.ok(
       pageContent.indexOf('id="reader-content"') <
         pageContent.indexOf('id="review-panel"'),
@@ -1334,7 +1805,7 @@ test("serves the browser workspace and local visual assets", async () => {
 
     const page = await fetch(new URL("/", value.server.url), { headers });
     const html = await page.text();
-    assert.match(html, /data-testid="project-nav"/);
+    assert.match(html, /data-testid="project-select"/);
     assert.match(html, /data-testid="document-queue"/);
     assert.match(html, /aria-label="Group documents"/);
     assert.match(html, /data-grouping="project"[^>]*>projects<\/button>/);
@@ -1357,6 +1828,16 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.equal(workspacePage.status, 200);
     assert.match(await workspacePage.text(), /data-workspace-id="example"/);
 
+    const projectPage = await fetch(
+      new URL(`/p/${value.document.projectId}`, value.server.url),
+      { headers },
+    );
+    assert.equal(projectPage.status, 200);
+    assert.match(
+      await projectPage.text(),
+      new RegExp(`data-project-id="${value.document.projectId}"`),
+    );
+
     const css = await fetch(new URL("/assets/app.css", value.server.url), {
       headers,
     });
@@ -1366,11 +1847,12 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(cssText, /Departure Mono/);
     assert.match(
       cssText,
-      /\.reader\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*1600px;/,
+      /\.reader\s*\{[^}]*width:\s*100%;/,
     );
-    assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*1060px;/);
+    assert.doesNotMatch(cssText, /\.reader\s*\{[^}]*max-width:\s*\d/);
     assert.match(cssText, /\.reader-toc/);
     assert.match(cssText, /\.syntax-keyword/);
+    assert.match(cssText, /\.diff-line-feedback-marker/);
     assert.match(cssText, /--syntax-string:/);
     assert.match(cssText, /@media print/);
 
@@ -1386,6 +1868,13 @@ test("serves the browser workspace and local visual assets", async () => {
     const exportModule = await fetch(new URL("/assets/document-export.js", value.server.url), { headers });
     assert.equal(exportModule.status, 200);
     assert.match(exportModule.headers.get("content-type") ?? "", /javascript/);
+    assert.match(
+      appText,
+      /Line feedback: click \+ beside a line; Shift-click another same-side line for a range\./,
+    );
+    assert.match(appText, /mdmaid-desk-review-draft:/);
+    assert.match(appText, /update feedback/);
+    assert.match(appText, /requestDocumentPrint\(window\)/);
 
     const mermaid = await fetch(
       new URL("/assets/mermaid.min.js", value.server.url),

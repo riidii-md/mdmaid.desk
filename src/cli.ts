@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
-import { realpathSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { constants as fsConstants, realpathSync } from "node:fs";
+import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -10,13 +12,22 @@ import {
   type AddWorkspaceInput,
   Catalog,
   type DocumentKind,
+  type FeedbackPage,
+  type FeedbackSubmission,
   type ImportDocumentInput,
   type RegisterDocumentInput,
   type ReviewKind,
   type ReviewOutcome,
   type ReviewRequest,
+  type RepositoryInventoryItem,
+  type Space,
+  type SpaceMatcher,
 } from "./catalog.js";
-import { DeskApiClient, DeskApiError } from "./api-client.js";
+import {
+  DeskApiClient,
+  DeskApiError,
+  isPublicReviewRequest,
+} from "./api-client.js";
 import {
   connectToDaemon,
   connectToDaemonInfo,
@@ -38,11 +49,27 @@ import {
 } from "./server.js";
 import { readOrCreateAuthToken } from "./auth-state.js";
 import { readPackageVersion } from "./package-info.js";
+import {
+  DEFAULT_DESK_ORIGIN,
+  DEFAULT_DESK_PORT,
+  FALLBACK_DESK_PORT,
+} from "./service-config.js";
+import { ensureTraefikRoute as ensureDefaultTraefikRoute } from "./traefik-route.js";
 import { runTui as runTerminalWorkspace } from "./tui.js";
 import {
   installUserService as installLoginService,
   uninstallUserService as uninstallLoginService,
 } from "./user-service.js";
+import {
+  MermaidValidationError,
+  type MermaidValidationReport,
+  validateMermaidMarkdown,
+} from "./mermaid-validation.js";
+
+const MAX_VALIDATION_BYTES = 2 * 1024 * 1024;
+
+const RUNNING_PACKAGE_VERSION = readPackageVersion();
+const MAX_UPDATED_WAITER_OUTPUT_BYTES = 256 * 1024;
 
 const DOCUMENT_KINDS = new Set<DocumentKind>([
   "definition",
@@ -76,18 +103,24 @@ const REVIEW_OUTCOMES = new Set<ReviewOutcome>([
   "approved",
   "changes_requested",
   "rejected",
+  "superseded",
 ]);
 
 const registerUsage = `Usage:
   mdmaid-desk register <file.md> --workspace <id>
-      [--live] [--task <id>] [--producer <name>] [--kind <kind>]
+      [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>]
       [--title <title>] [--attention <state>] [--tag <tag> ...]
-      [--expect plan-decision] [--request-message <text>] [--wait] [--json]
+      [--expect plan-decision|change-decision]
+      [--request-message <text>] [--wait] [--json]
 
   register keeps the authorized Markdown source as a live reference.
   --live explicitly requests this default live-reference behavior.
   A running web service or daemon watches it and refreshes open Web and TUI
   readers after saved changes. Use import for a managed snapshot instead.
+
+  For an implementation approval, use --kind change-review with
+  --attention approval --expect change-decision.
 `;
 
 const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
@@ -95,15 +128,32 @@ const usage = `mdmaid-desk manages a local catalog of Markdown artifacts.
 Usage:
   mdmaid-desk --version
   mdmaid-desk workspace add <root> --id <id> [--name <name>]
+      [--repository <identity>] [--repository-name <name>]
       [--artifact-root <path> ...]
+  mdmaid-desk workspace reconcile <source-id> --into <target-id>
+      [--discard-archived-conflicts] [--apply] [--json]
   mdmaid-desk workspace list
+  mdmaid-desk space add <id> --name <name>
+      [--repository <key-or-name> ...] [--namespace <prefix> ...]
+      [--workspace <id> ...] [--tag <tag> ...] [--json]
+  mdmaid-desk space list [--json]
+  mdmaid-desk space show <id> [--json]
+  mdmaid-desk space rename <id> --name <name> [--json]
+  mdmaid-desk space matchers set <id>
+      [--repository <key-or-name> ...] [--namespace <prefix> ...]
+      [--workspace <id> ...] [--tag <tag> ...] [--json]
+  mdmaid-desk space delete <id> [--json]
+  mdmaid-desk repository list [--json]
+  mdmaid-desk validate <file.md> [--json]
   mdmaid-desk register <file.md> --workspace <id>
-      [--live] [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--live] [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision|change-decision] [--request-message <text>]
       [--wait] [--json]
   mdmaid-desk import <file.md> --workspace <id>
-      [--task <id>] [--producer <name>] [--kind <kind>] [--title <title>]
+      [--task <id>] [--feature-name <text>] [--producer <name>]
+      [--kind <kind>] [--title <title>]
       [--attention <state>] [--tag <tag> ...]
       [--expect plan-decision|change-decision] [--request-message <text>]
       [--wait] [--json]
@@ -111,8 +161,13 @@ Usage:
       [--kind plan-decision|change-decision] [--message <text>] [--json]
   mdmaid-desk review show <review-id> [--json]
   mdmaid-desk review wait <review-id> [--json]
-  mdmaid-desk review respond <review-id> --outcome <outcome>
+  mdmaid-desk review respond <review-id>
+      --outcome approved|changes_requested|rejected|superseded
       [--message <text>] [--json]
+  mdmaid-desk feedback show <feedback-id> [--space <id>] [--json]
+  mdmaid-desk feedback list --document <document-id>
+      [--revision <number>] [--cursor <cursor>] [--limit <number>]
+      [--space <id>] [--json]
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]
       [--public-url <http[s]://name.localhost[:port]>]
@@ -126,10 +181,21 @@ Usage:
 Document sources:
   register keeps an authorized source as a live reference; --live explicitly
   requests that default behavior. import creates a managed snapshot instead.
+
+Change reviews:
+  register <file.md> --workspace <id> --kind change-review
+      --attention approval --expect change-decision
 `;
 
 interface Writer {
   write(value: string): unknown;
+}
+
+interface WebConfiguration {
+  explicitPort: boolean;
+  explicitPublicUrl: boolean;
+  port: number;
+  publicUrl: string | undefined;
 }
 
 export interface RunOptions {
@@ -148,12 +214,21 @@ export interface RunOptions {
   startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
   runTui?: (client: DeskApiClient) => Promise<void>;
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
+  ensureTraefikRoute?: () => Promise<boolean>;
   signal?: AbortSignal;
   reviewPollIntervalMs?: number;
-  allowPortFallback?: boolean;
+  runningPackageVersion?: string;
+  readInstalledPackageVersion?: () => string;
+  resumeReviewWait?: (
+    id: string,
+    signal?: AbortSignal,
+  ) => Promise<ReviewRequest>;
+  updatedCliEntryPath?: string;
 }
 
 class UsageError extends Error {}
+
+class InstalledPackageVersionChanged extends Error {}
 
 const silentWriter: Writer = { write: () => undefined };
 
@@ -201,12 +276,10 @@ export async function run(
       statePath = firstOption(internal, "state-path") ?? statePath;
       const port = firstOption(internal, "port");
       const webArgs = port === undefined ? [] : ["--port", port];
+      const web = parseWebConfiguration(webArgs);
       const catalog = await Catalog.open(statePath);
       try {
-        return await runWeb(catalog, statePath, webArgs, silentWriter, {
-          ...options,
-          allowPortFallback: port === undefined,
-        });
+        return await runWeb(catalog, statePath, web, silentWriter, options);
       } finally {
         catalog.close();
       }
@@ -217,25 +290,43 @@ export async function run(
     if (args[0] === "daemon") {
       return await runDaemon(statePath, args.slice(1), stdout, options);
     }
+    if (args[0] === "validate") {
+      return await runValidate(args.slice(1), stdout);
+    }
     if (args[0] === "web") {
-      if (args.length === 1) {
-        const running = await (
-          options.connectDaemonInfo ?? connectToDaemonInfo
-        )(statePath);
-        if (running) {
-          stdout.write(`mdmaid.desk web: ${daemonWebUrl(running)}\n`);
-          return 0;
+      const web = parseWebConfiguration(args.slice(1));
+      const running = await (
+        options.connectDaemonInfo ?? connectToDaemonInfo
+      )(statePath);
+      if (running) {
+        if (
+          web.explicitPublicUrl ||
+          (web.explicitPort && web.port !== running.descriptor.port)
+        ) {
+          throw new Error(
+            `daemon is already running on port ${running.descriptor.port}`,
+          );
         }
+        stdout.write(`mdmaid.desk web: ${daemonWebUrl(running)}\n`);
+        return 0;
       }
       const catalog = await Catalog.open(statePath);
       try {
-        return await runWeb(catalog, statePath, args.slice(1), stdout, options);
+        return await runWeb(catalog, statePath, web, stdout, options);
       } finally {
         catalog.close();
       }
     }
     if (args[0] === "workspace" && args[1] === "add") {
       return await runWorkspaceAdd(statePath, args.slice(2), stdout, options);
+    }
+    if (args[0] === "workspace" && args[1] === "reconcile") {
+      return await runWorkspaceReconcile(
+        statePath,
+        args.slice(2),
+        stdout,
+        options,
+      );
     }
     if (args[0] === "register") {
       return await runRegister(statePath, args.slice(1), stdout, options);
@@ -245,6 +336,18 @@ export async function run(
     }
     if (args[0] === "review") {
       return await runReview(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "feedback") {
+      return await runFeedback(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "space") {
+      return await runSpace(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "repository") {
+      return await runRepository(statePath, args.slice(1), stdout, options);
+    }
+    if (args[0] === "list" && args.includes("--space")) {
+      return await runScopedList(statePath, args.slice(1), stdout, options);
     }
     const catalog = await Catalog.open(statePath);
     try {
@@ -262,8 +365,36 @@ export async function run(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    stderr.write(`error: ${message}\n`);
-    if (error instanceof UsageError) {
+    const validation = validationReportFromError(error);
+    if (
+      args.includes("--json") &&
+      (args[0] === "space" || args[0] === "repository" || args[0] === "feedback")
+    ) {
+      const code = error instanceof DeskApiError
+        ? error.code
+        : error instanceof UsageError
+        ? "validation_error"
+        : "operation_failed";
+      stderr.write(`${JSON.stringify({
+        schemaVersion: 1,
+        error: { code, message },
+      })}\n`);
+    } else if (args.includes("--json") && validation !== undefined) {
+      stderr.write(`${JSON.stringify({
+        schemaVersion: 1,
+        error: {
+          code: "invalid_mermaid",
+          message,
+          validation,
+        },
+      })}\n`);
+    } else {
+      stderr.write(`error: ${message}\n`);
+    }
+    if (
+      error instanceof UsageError ||
+      (error instanceof DeskApiError && error.status === 422)
+    ) {
       stderr.write(usage);
       return 2;
     }
@@ -271,52 +402,350 @@ export async function run(
   }
 }
 
-async function runWeb(
-  catalog: Catalog,
+async function runSpace(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (!action) {
+    throw new UsageError("space action is required");
+  }
+  const matcherSet = action === "matchers" && args[1] === "set";
+  const argumentOffset = matcherSet ? 2 : 1;
+  const parsed = parseArguments(args.slice(argumentOffset), new Set(["json"]));
+  const allowed = matcherSet || action === "add"
+    ? new Set(["name", "repository", "namespace", "workspace", "tag", "json"])
+    : action === "rename"
+    ? new Set(["name", "json"])
+    : new Set(["json"]);
+  rejectUnknownOptions(parsed, allowed);
+
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+  }
+  const catalog = client
+    ? undefined
+    : await Catalog.open(statePath);
+  try {
+    let result: Space | Space[] | { id: string };
+    if (action === "list") {
+      if (parsed.positionals.length > 0) {
+        throw new UsageError("space list accepts options only");
+      }
+      result = client ? await client.listSpaces() : catalog!.listSpaces();
+    } else {
+      const id = parsed.positionals[0];
+      if (!id || parsed.positionals.length > 1) {
+        throw new UsageError(`space ${matcherSet ? "matchers set" : action} requires one id`);
+      }
+      if (action === "show") {
+        result = client
+          ? await client.getSpace(id)
+          : requiredSpace(catalog!, id);
+      } else if (action === "add") {
+        const matchers = await matcherInputs(parsed, client, catalog);
+        const input = { id, name: requiredOption(parsed, "name"), matchers };
+        result = client
+          ? await client.createSpace(input)
+          : catalog!.createSpace(input);
+      } else if (action === "rename") {
+        const name = requiredOption(parsed, "name");
+        result = client
+          ? await client.renameSpace(id, name)
+          : catalog!.renameSpace(id, name);
+      } else if (matcherSet) {
+        const matchers = await matcherInputs(parsed, client, catalog);
+        result = client
+          ? await client.replaceSpaceMatchers(id, matchers)
+          : catalog!.replaceSpaceMatchers(id, { matchers });
+      } else if (action === "delete") {
+        result = client
+          ? await client.deleteSpace(id)
+          : catalog!.deleteSpace(id);
+      } else {
+        throw new UsageError(
+          "space action must be add, list, show, rename, matchers set, or delete",
+        );
+      }
+    }
+    writeManagementResult(stdout, result, hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog?.close();
+  }
+}
+
+async function runRepository(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  if (args[0] !== "list") {
+    throw new UsageError("repository action must be list");
+  }
+  const parsed = parseArguments(args.slice(1), new Set(["json"]));
+  rejectUnknownOptions(parsed, new Set(["json"]));
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("repository list accepts options only");
+  }
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1");
+    writeManagementResult(stdout, await client.listRepositories(), hasFlag(parsed, "json"));
+    return 0;
+  }
+  const catalog = await Catalog.open(statePath);
+  try {
+    writeManagementResult(stdout, catalog.listRepositories(), hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog.close();
+  }
+}
+
+async function runScopedList(
   statePath: string,
   args: string[],
   stdout: Writer,
   options: RunOptions,
 ): Promise<number> {
   const parsed = parseArguments(args);
+  rejectUnknownOptions(parsed, new Set(["workspace", "task", "space"]));
   if (parsed.positionals.length > 0) {
-    throw new UsageError("web accepts options only");
+    throw new UsageError("list accepts options only");
   }
-  rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
-  const configuredPublicUrl = parsePublicUrl(
-    firstOption(parsed, "public-url"),
-  );
-  const configuredPort = firstOption(parsed, "port");
-  const port = parsePort(
-    configuredPort ?? inferDirectHttpPort(configuredPublicUrl) ?? "43127",
-  );
-  const publicUrl =
-    configuredPublicUrl ??
-    (port === 0 ? undefined : `http://mdmaid.desk.localhost:${port}`);
-  if (publicUrl !== undefined) {
-    validateDirectHttpPort(publicUrl, port);
+  const spaceId = requiredOption(parsed, "space");
+  const workspace = firstOption(parsed, "workspace");
+  const task = firstOption(parsed, "task");
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) {
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+    const documents = (await client.listDocuments({ spaceId })).filter(
+      (document) => (!workspace || document.workspaceId === workspace) &&
+        (!task || document.taskId === task),
+    );
+    for (const document of documents) {
+      stdout.write([
+        document.id,
+        document.workspaceId,
+        document.taskId ?? "-",
+        document.kind,
+        document.attention,
+        document.title,
+        document.route,
+      ].join("\t") + "\n");
+    }
+    return 0;
   }
+  const catalog = await Catalog.open(statePath);
+  try {
+    return runList(catalog, args, stdout);
+  } finally {
+    catalog.close();
+  }
+}
+
+async function matcherInputs(
+  parsed: ParsedArguments,
+  client: DeskApiClient | undefined,
+  catalog: Catalog | undefined,
+): Promise<SpaceMatcher[]> {
+  const inventory = client
+    ? await client.listRepositories()
+    : catalog!.listRepositories();
+  const result: SpaceMatcher[] = [];
+  for (const candidate of parsed.options.get("repository") ?? []) {
+    const named = inventory.filter(({ name }) => name === candidate);
+    if (named.length > 1) {
+      throw new UsageError(
+        `repository name ${candidate} is ambiguous; use one of: ${named.map(({ key }) => key).join(", ")}`,
+      );
+    }
+    result.push({ kind: "repository", value: named[0]?.key ?? candidate });
+  }
+  for (const value of parsed.options.get("namespace") ?? []) {
+    result.push({ kind: "repository-namespace", value });
+  }
+  for (const workspaceId of parsed.options.get("workspace") ?? []) {
+    const repositories = inventory.filter(({ workspaceIds }) =>
+      workspaceIds.includes(workspaceId)
+    );
+    if (repositories.length !== 1) {
+      throw new UsageError(`unknown or ambiguous workspace ${workspaceId}`);
+    }
+    result.push({ kind: "repository", value: repositories[0]!.key });
+  }
+  for (const value of parsed.options.get("tag") ?? []) {
+    result.push({ kind: "tag", value });
+  }
+  if (result.length === 0) {
+    throw new UsageError(
+      "provide one or more --repository, --namespace, --workspace, or --tag patterns; ask the user which patterns belong to this Space",
+    );
+  }
+  return result;
+}
+
+function requiredSpace(catalog: Catalog, id: string): Space {
+  const space = catalog.getSpace(id);
+  if (!space) {
+    throw new Error(`unknown space ${id}`);
+  }
+  return space;
+}
+
+function writeManagementResult(
+  stdout: Writer,
+  result: Space | Space[] | RepositoryInventoryItem[] | { id: string },
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, data: result })}\n`);
+    return;
+  }
+  const values = Array.isArray(result) ? result : [result];
+  for (const value of values) {
+    if ("matchers" in value) {
+      stdout.write(`${value.id}\t${value.name}\t${value.matchers.map(({ kind, value: matcher }) => `${kind}:${matcher}`).join(",")}\n`);
+    } else if ("key" in value) {
+      stdout.write(`${value.key}\t${value.name}\t${value.workspaceIds.join(",")}\n`);
+    } else {
+      stdout.write(`${value.id}\n`);
+    }
+  }
+}
+
+async function runValidate(
+  args: string[],
+  stdout: Writer,
+): Promise<number> {
+  const parsed = parseArguments(args, new Set(["json"]));
+  rejectUnknownOptions(parsed, new Set(["json"]));
+  const path = parsed.positionals[0];
+  if (!path) {
+    throw new UsageError("validation path is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("validate accepts one document path");
+  }
+  const markdown = await readValidationTarget(path);
+  const validation = await validateMermaidMarkdown(markdown);
+  if (hasFlag(parsed, "json")) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, validation })}\n`);
+  } else if (validation.valid) {
+    stdout.write(
+      `valid: ${validation.diagramCount} Mermaid diagram${
+        validation.diagramCount === 1 ? "" : "s"
+      }\n`,
+    );
+  } else {
+    stdout.write(`${new MermaidValidationError(validation).message}\n`);
+  }
+  return validation.valid ? 0 : 1;
+}
+
+async function readValidationTarget(path: string): Promise<string> {
+  const requestedPath = resolve(path);
+  if (extname(requestedPath).toLowerCase() !== ".md") {
+    throw new Error("only Markdown files can be validated");
+  }
+  const requestedInfo = await lstat(requestedPath);
+  if (requestedInfo.isSymbolicLink()) {
+    throw new Error("validation path must not be a symlink");
+  }
+  // The explicit CLI path is the authorization boundary for this read. Resolve
+  // it before opening and refuse link traversal at the final component.
+  const canonicalPath = await realpath(requestedPath);
+  const handle = await open(
+    canonicalPath,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      throw new Error("validation target must be a regular file");
+    }
+    if (info.size > MAX_VALIDATION_BYTES) {
+      throw new Error(`document exceeds ${MAX_VALIDATION_BYTES} bytes`);
+    }
+    const content = await handle.readFile();
+    if (content.length > MAX_VALIDATION_BYTES) {
+      throw new Error(`document exceeds ${MAX_VALIDATION_BYTES} bytes`);
+    }
+    return content.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function validationReportFromError(
+  error: unknown,
+): MermaidValidationReport | undefined {
+  if (error instanceof MermaidValidationError) {
+    return error.report;
+  }
+  if (error instanceof DeskApiError) {
+    return error.validation;
+  }
+  return undefined;
+}
+
+async function runWeb(
+  catalog: Catalog,
+  statePath: string,
+  configuration: WebConfiguration,
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
   const token = await readOrCreateAuthToken(statePath);
   const startServer = options.startServer ?? startDeskServer;
+  let publicUrl = configuration.publicUrl;
   let server: RunningDeskServer;
   try {
     server = await startServer({
       catalog,
       host: "127.0.0.1",
-      port,
+      port: configuration.port,
       token,
       ...(publicUrl ? { publicUrl } : {}),
     });
   } catch (error) {
-    if (!options.allowPortFallback || !isAddressInUse(error)) {
+    if (!shouldTryFallback(error, configuration)) {
       throw error;
     }
     server = await startServer({
       catalog,
       host: "127.0.0.1",
-      port: 0,
+      port: FALLBACK_DESK_PORT,
       token,
+      publicUrl: DEFAULT_DESK_ORIGIN,
     });
+    let proxied: boolean;
+    try {
+      proxied = await (
+        options.ensureTraefikRoute ?? ensureDefaultTraefikRoute
+      )();
+    } catch (routeError) {
+      await server.close();
+      throw routeError;
+    }
+    if (proxied) {
+      publicUrl = DEFAULT_DESK_ORIGIN;
+    } else {
+      await server.close();
+      publicUrl = directPublicUrl(FALLBACK_DESK_PORT);
+      server = await startServer({
+        catalog,
+        host: "127.0.0.1",
+        port: FALLBACK_DESK_PORT,
+        token,
+        publicUrl,
+      });
+    }
   }
   const descriptor = descriptorForServer(server);
   const descriptorPath = daemonDescriptorPath(statePath);
@@ -336,6 +765,35 @@ async function runWeb(
     }
   }
   return 0;
+}
+
+function parseWebConfiguration(args: string[]): WebConfiguration {
+  const parsed = parseArguments(args);
+  if (parsed.positionals.length > 0) {
+    throw new UsageError("web accepts options only");
+  }
+  rejectUnknownOptions(parsed, new Set(["port", "public-url"]));
+  const configuredPublicUrl = parsePublicUrl(
+    firstOption(parsed, "public-url"),
+  );
+  const configuredPort = firstOption(parsed, "port");
+  const port = parsePort(
+    configuredPort ??
+      inferDirectHttpPort(configuredPublicUrl) ??
+      String(DEFAULT_DESK_PORT),
+  );
+  const publicUrl =
+    configuredPublicUrl ??
+    (port === 0 ? undefined : directPublicUrl(port));
+  if (publicUrl !== undefined) {
+    validateDirectHttpPort(publicUrl, port);
+  }
+  return {
+    explicitPort: configuredPort !== undefined,
+    explicitPublicUrl: configuredPublicUrl !== undefined,
+    port,
+    publicUrl,
+  };
 }
 
 async function runTerminal(
@@ -445,7 +903,29 @@ async function runDaemon(
 }
 
 function daemonWebUrl(connection: DaemonConnection): string {
-  return `http://mdmaid.desk.localhost:${connection.descriptor.port}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+  const publicUrl =
+    connection.descriptor.publicUrl ??
+    directPublicUrl(connection.descriptor.port);
+  return `${publicUrl}/?token=${encodeURIComponent(connection.descriptor.token)}`;
+}
+
+function shouldTryFallback(
+  error: unknown,
+  configuration: WebConfiguration,
+): boolean {
+  return (
+    !configuration.explicitPort &&
+    !configuration.explicitPublicUrl &&
+    error instanceof Error &&
+    "code" in error &&
+    (error.code === "EADDRINUSE" || error.code === "EACCES")
+  );
+}
+
+function directPublicUrl(port: number): string {
+  return port === DEFAULT_DESK_PORT
+    ? DEFAULT_DESK_ORIGIN
+    : `http://mdmaid.desk.localhost:${port}`;
 }
 
 function parsePort(value: string): number {
@@ -513,7 +993,7 @@ function runWorkspaceList(
     }
     return 0;
   }
-  throw new UsageError("workspace action must be add or list");
+  throw new UsageError("workspace action must be add, reconcile, or list");
 }
 
 async function runWorkspaceAdd(
@@ -533,13 +1013,26 @@ async function runWorkspaceAdd(
   const id = requiredOption(parsed, "id");
   const name = firstOption(parsed, "name") ?? id;
   const artifactRoots = parsed.options.get("artifact-root") ?? [root];
-  rejectUnknownOptions(parsed, new Set(["id", "name", "artifact-root"]));
+  const repository = firstOption(parsed, "repository");
+  const repositoryName = firstOption(parsed, "repository-name");
+  rejectUnknownOptions(
+    parsed,
+    new Set([
+      "id",
+      "name",
+      "artifact-root",
+      "repository",
+      "repository-name",
+    ]),
+  );
 
   const input: AddWorkspaceInput = {
     id,
     name,
     root,
     artifactRoots,
+    ...(repository === undefined ? {} : { repository }),
+    ...(repositoryName === undefined ? {} : { repositoryName }),
   };
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
   if (client) {
@@ -554,6 +1047,63 @@ async function runWorkspaceAdd(
   }
   stdout.write(`workspace ${id} added: ${root}\n`);
   return 0;
+}
+
+async function runWorkspaceReconcile(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(
+    args,
+    new Set(["discard-archived-conflicts", "apply", "json"]),
+  );
+  const sourceWorkspaceId = parsed.positionals[0];
+  if (!sourceWorkspaceId) {
+    throw new UsageError("source workspace id is required");
+  }
+  if (parsed.positionals.length > 1) {
+    throw new UsageError("workspace reconcile accepts one source workspace id");
+  }
+  rejectUnknownOptions(
+    parsed,
+    new Set(["into", "discard-archived-conflicts", "apply", "json"]),
+  );
+  const input = {
+    targetWorkspaceId: requiredOption(parsed, "into"),
+    discardArchivedConflicts: hasFlag(parsed, "discard-archived-conflicts"),
+    apply: hasFlag(parsed, "apply"),
+  };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  const reconciliation = client
+    ? await (async () => {
+        await client.requireCapabilities("workspace-reconciliation-v1");
+        return client.reconcileWorkspace(sourceWorkspaceId, input);
+      })()
+    : await (async () => {
+        const catalog = await Catalog.open(statePath);
+        try {
+          return catalog.reconcileWorkspace({ sourceWorkspaceId, ...input });
+        } finally {
+          catalog.close();
+        }
+      })();
+  if (hasFlag(parsed, "json")) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, data: reconciliation })}\n`);
+  } else {
+    stdout.write(
+      `${reconciliation.applied ? "reconciled" : "dry run"}: ` +
+        `${reconciliation.sourceWorkspaceId} -> ${reconciliation.targetWorkspaceId}; ` +
+        `${reconciliation.movedDocumentIds.length} moved, ` +
+        `${reconciliation.discardedDocumentIds.length} discarded, ` +
+        `${reconciliation.blockingConflicts.length} blocked\n`,
+    );
+    if (!reconciliation.applied) {
+      stdout.write("Run again with --apply to commit this reconciliation.\n");
+    }
+  }
+  return reconciliation.blockingConflicts.length === 0 ? 0 : 1;
 }
 
 async function runRegister(
@@ -575,6 +1125,7 @@ async function runRegister(
     new Set([
       "workspace",
       "task",
+      "feature-name",
       "producer",
       "kind",
       "title",
@@ -599,6 +1150,7 @@ async function runRegister(
   }
 
   const taskId = firstOption(parsed, "task");
+  const featureName = firstOption(parsed, "feature-name");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
   const review = parseReviewPublicationOptions(parsed);
@@ -607,6 +1159,7 @@ async function runRegister(
   const input: RegisterDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
+    ...(featureName ? { featureName } : {}),
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
@@ -615,7 +1168,13 @@ async function runRegister(
     ...(tags === undefined ? {} : { tags }),
   };
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let document: { id: string; revision: number; route?: string };
+  let document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  };
   let reviewRequest: ReviewRequest | undefined;
   if (client) {
     document = await client.registerDocument(input);
@@ -669,7 +1228,13 @@ async function runImport(
 ): Promise<number> {
   const { input, review } = parseImport(args);
   const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
-  let document: { id: string; revision: number; route?: string };
+  let document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  };
   let reviewRequest: ReviewRequest | undefined;
   if (client) {
     document = await client.importDocument(input);
@@ -732,6 +1297,7 @@ function parseImport(args: string[]): {
     new Set([
       "workspace",
       "task",
+      "feature-name",
       "producer",
       "kind",
       "title",
@@ -752,11 +1318,13 @@ function parseImport(args: string[]): {
     throw new UsageError(`unknown attention state ${attention}`);
   }
   const taskId = firstOption(parsed, "task");
+  const featureName = firstOption(parsed, "feature-name");
   const producer = firstOption(parsed, "producer");
   const tags = parsed.options.get("tag");
   const input: ImportDocumentInput = {
     workspaceId: requiredOption(parsed, "workspace"),
     ...(taskId ? { taskId } : {}),
+    ...(featureName ? { featureName } : {}),
     ...(producer ? { producer } : {}),
     kind,
     title: firstOption(parsed, "title") ?? basename(path, ".md"),
@@ -804,7 +1372,13 @@ function writePublicationResult(
   stdout: Writer,
   action: "registered" | "imported",
   path: string,
-  document: { id: string; revision: number; route?: string },
+  document: {
+    id: string;
+    revision: number;
+    route?: string;
+    projectId?: string;
+    projectName?: string;
+  },
   reviewRequest: ReviewRequest | undefined,
   json: boolean,
 ): void {
@@ -816,6 +1390,15 @@ function writePublicationResult(
           id: document.id,
           revision: document.revision,
           route: document.route ?? `/d/${document.id}`,
+          ...(document.projectId === undefined
+            ? {}
+            : {
+                project: {
+                  id: document.projectId,
+                  name: document.projectName,
+                  route: `/p/${document.projectId}`,
+                },
+              }),
         },
         ...(reviewRequest === undefined ? {} : { reviewRequest }),
       })}\n`,
@@ -823,6 +1406,9 @@ function writePublicationResult(
     return;
   }
   stdout.write(`${action} ${document.id}: ${path}\n`);
+  if (document.projectName) {
+    stdout.write(`project ${document.projectName}\n`);
+  }
   if (reviewRequest) {
     stdout.write(
       `review ${reviewRequest.id}: ${reviewRequest.status}${
@@ -919,6 +1505,103 @@ async function runReview(
   return 0;
 }
 
+async function runFeedback(
+  statePath: string,
+  args: string[],
+  stdout: Writer,
+  options: RunOptions,
+): Promise<number> {
+  const action = args[0];
+  if (action !== "show" && action !== "list") {
+    throw new UsageError("feedback action must be show or list");
+  }
+  const parsed = parseArguments(args.slice(1), new Set(["json"]));
+  const scope = firstOption(parsed, "space") === undefined
+    ? {}
+    : { spaceId: firstOption(parsed, "space")! };
+  const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
+  if (client) await client.requireCapabilities("document-feedback-v1");
+  const catalog = client ? undefined : await Catalog.open(statePath);
+  try {
+    if (action === "show") {
+      rejectUnknownOptions(parsed, new Set(["space", "json"]));
+      const id = parsed.positionals[0];
+      if (!id || parsed.positionals.length !== 1) {
+        throw new UsageError("feedback show requires one feedback id");
+      }
+      const feedback = client
+        ? await client.getFeedback(id, scope)
+        : catalog!.getFeedback(id, scope);
+      if (!feedback) throw new Error(`unknown feedback ${id}`);
+      writeFeedbackResult(stdout, feedback, hasFlag(parsed, "json"));
+      return 0;
+    }
+
+    rejectUnknownOptions(
+      parsed,
+      new Set(["document", "revision", "cursor", "limit", "space", "json"]),
+    );
+    if (parsed.positionals.length > 0) {
+      throw new UsageError("feedback list accepts options only");
+    }
+    const documentId = requiredOption(parsed, "document");
+    const documentRevision = optionalPositiveInteger(parsed, "revision");
+    const limit = optionalPositiveInteger(parsed, "limit");
+    if (limit !== undefined && limit > 100) {
+      throw new UsageError("--limit must be at most 100");
+    }
+    const cursor = firstOption(parsed, "cursor");
+    const page = client
+      ? await client.listFeedback({
+          documentId,
+          ...(documentRevision === undefined ? {} : { documentRevision }),
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(limit === undefined ? {} : { limit }),
+        }, scope)
+      : catalog!.listFeedback({
+          documentId,
+          ...(documentRevision === undefined ? {} : { documentRevision }),
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(limit === undefined ? {} : { limit }),
+        }, scope);
+    writeFeedbackPage(stdout, page, hasFlag(parsed, "json"));
+    return 0;
+  } finally {
+    catalog?.close();
+  }
+}
+
+function writeFeedbackResult(
+  stdout: Writer,
+  feedback: FeedbackSubmission,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, feedback })}\n`);
+    return;
+  }
+  stdout.write(
+    `${feedback.id}\t${feedback.documentId}@${feedback.documentRevision}\t${feedback.route}\n`,
+  );
+}
+
+function writeFeedbackPage(
+  stdout: Writer,
+  page: FeedbackPage,
+  json: boolean,
+): void {
+  if (json) {
+    stdout.write(`${JSON.stringify({ schemaVersion: 1, page })}\n`);
+    return;
+  }
+  for (const feedback of page.items) {
+    writeFeedbackResult(stdout, feedback, false);
+  }
+  if (page.nextCursor !== undefined) {
+    stdout.write(`next\t${page.nextCursor}\n`);
+  }
+}
+
 function writeReviewResult(
   stdout: Writer,
   request: ReviewRequest,
@@ -964,13 +1647,32 @@ async function waitForReviewRequest(
   options: RunOptions,
 ): Promise<ReviewRequest> {
   const interval = options.reviewPollIntervalMs ?? 1_000;
+  const resumeWithUpdatedCli = async (): Promise<ReviewRequest> =>
+    await (options.resumeReviewWait ?? ((reviewId, signal) =>
+      resumeReviewWaitWithUpdatedCli(
+        reviewId,
+        signal,
+        options.updatedCliEntryPath,
+      )))(id, options.signal);
   while (true) {
     throwIfAborted(options.signal);
+    if (installedPackageVersionChanged(options)) {
+      return await resumeWithUpdatedCli();
+    }
     const client = await (options.connectDaemon ?? connectToDaemon)(statePath);
     if (client) {
       try {
-        return await waitForReviewEvent(client, id, options.signal);
+        return await waitForReviewEvent(
+          client,
+          id,
+          options.signal,
+          interval,
+          () => installedPackageVersionChanged(options),
+        );
       } catch (error) {
+        if (error instanceof InstalledPackageVersionChanged) {
+          return await resumeWithUpdatedCli();
+        }
         if (options.signal?.aborted) {
           throw new Error("review wait cancelled");
         }
@@ -1007,6 +1709,8 @@ async function waitForReviewEvent(
   client: DeskApiClient,
   id: string,
   signal?: AbortSignal,
+  updateCheckIntervalMs = 1_000,
+  packageVersionChanged: () => boolean = () => false,
 ): Promise<ReviewRequest> {
   const current = await client.getReviewRequest(id);
   if (current.status !== "pending") {
@@ -1016,11 +1720,17 @@ async function waitForReviewEvent(
   return await new Promise<ReviewRequest>((resolvePromise, reject) => {
     let settled = false;
     let checking = false;
+    const updateTimer = setInterval(() => {
+      if (packageVersionChanged()) {
+        finish(() => reject(new InstalledPackageVersionChanged()));
+      }
+    }, updateCheckIntervalMs);
     const finish = (operation: () => void): void => {
       if (settled) {
         return;
       }
       settled = true;
+      clearInterval(updateTimer);
       controller.abort();
       signal?.removeEventListener("abort", onAbort);
       operation();
@@ -1052,14 +1762,7 @@ async function waitForReviewEvent(
     signal?.addEventListener("abort", onAbort, { once: true });
     void client
       .subscribeCatalog(
-        (event) => {
-          if (
-            event.reviewRequestId === id ||
-            event.documentId === current.documentId
-          ) {
-            check();
-          }
-        },
+        check,
         { signal: controller.signal, onReady: check },
       )
       .then(() => {
@@ -1069,6 +1772,101 @@ async function waitForReviewEvent(
       })
       .catch((error: unknown) => finish(() => reject(error)));
   });
+}
+
+function installedPackageVersionChanged(options: RunOptions): boolean {
+  try {
+    const runningVersion = options.runningPackageVersion ??
+      RUNNING_PACKAGE_VERSION;
+    const installedVersion = (
+      options.readInstalledPackageVersion ?? readPackageVersion
+    )();
+    return installedVersion !== runningVersion;
+  } catch {
+    // Package replacement is not necessarily atomic. Keep the existing wait
+    // alive until the new installation exposes valid package metadata.
+    return false;
+  }
+}
+
+function resumeReviewWaitWithUpdatedCli(
+  id: string,
+  signal?: AbortSignal,
+  updatedCliEntryPath?: string,
+): Promise<ReviewRequest> {
+  const entryPath = updatedCliEntryPath ?? process.argv[1];
+  if (!entryPath) {
+    throw new Error("cannot locate the CLI entrypoint for waiter update");
+  }
+  return new Promise<ReviewRequest>((resolvePromise, reject) => {
+    execFile(
+      process.execPath,
+      [entryPath, "review", "wait", id, "--json"],
+      {
+        encoding: "utf8",
+        env: process.env,
+        maxBuffer: MAX_UPDATED_WAITER_OUTPUT_BYTES,
+        signal,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          if (signal?.aborted) {
+            reject(new Error("review wait cancelled"));
+            return;
+          }
+          const detail = stderr.trim();
+          reject(
+            new Error(
+              detail === ""
+                ? `updated review waiter failed: ${error.message}`
+                : `updated review waiter failed: ${detail}`,
+            ),
+          );
+          return;
+        }
+        try {
+          resolvePromise(parseUpdatedReviewWaitOutput(stdout, id));
+        } catch (parseError) {
+          reject(parseError);
+        }
+      },
+    );
+  });
+}
+
+function parseUpdatedReviewWaitOutput(
+  output: string,
+  expectedId: string,
+): ReviewRequest {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    throw new Error("updated review waiter returned invalid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("updated review waiter returned an invalid response");
+  }
+  const envelope = parsed as Record<string, unknown>;
+  const request = envelope.reviewRequest;
+  if (
+    typeof envelope.schemaVersion !== "number" ||
+    !Number.isSafeInteger(envelope.schemaVersion) ||
+    envelope.schemaVersion < 1 ||
+    typeof request !== "object" ||
+    request === null ||
+    Array.isArray(request)
+  ) {
+    throw new Error("updated review waiter returned an invalid response");
+  }
+  if (
+    !isPublicReviewRequest(request) ||
+    request.id !== expectedId ||
+    request.status === "pending"
+  ) {
+    throw new Error("updated review waiter returned an invalid review request");
+  }
+  return structuredClone(request);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -1121,11 +1919,15 @@ function runList(
   if (parsed.positionals.length > 0) {
     throw new UsageError("list accepts options only");
   }
-  rejectUnknownOptions(parsed, new Set(["workspace", "task"]));
+  rejectUnknownOptions(parsed, new Set(["workspace", "task", "space"]));
   const workspace = firstOption(parsed, "workspace");
   const task = firstOption(parsed, "task");
+  const space = firstOption(parsed, "space");
 
-  const documents = catalog.listDocuments().filter((document) => {
+  const documents = catalog.listDocuments(
+    {},
+    space === undefined ? {} : { spaceId: space },
+  ).filter((document) => {
     if (workspace && document.workspaceId !== workspace) {
       return false;
     }
@@ -1218,18 +2020,14 @@ function rejectUnknownOptions(
     if (!allowed.has(name)) {
       throw new UsageError(`unknown option --${name}`);
     }
-    if (name !== "artifact-root" && name !== "tag" && values.length > 1) {
+    if (
+      !["artifact-root", "tag", "repository", "namespace", "workspace"]
+        .includes(name) &&
+      values.length > 1
+    ) {
       throw new UsageError(`option --${name} may be used only once`);
     }
   }
-}
-
-function isAddressInUse(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "EADDRINUSE"
-  );
 }
 
 function defaultStatePath(): string {

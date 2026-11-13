@@ -41,7 +41,9 @@ export function userServiceDefinition(
     "__daemon-serve",
     "--state-path",
     resolve(options.statePath),
-    ...(options.port === undefined ? [] : ["--port", String(options.port)]),
+    ...(options.port === undefined
+      ? []
+      : ["--port", String(options.port)]),
   ];
   if (options.platform === "darwin") {
     const logPath = join(dirname(resolve(options.statePath)), "daemon.log");

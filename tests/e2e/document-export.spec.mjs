@@ -33,7 +33,8 @@ const test = base.extend({
     ].join("\n"));
     const catalog = await Catalog.open(join(root, "catalog.sqlite3"), { legacyStatePath: false });
     await catalog.addWorkspace({ id: "test", name: "Test", root: workspace, artifactRoots: [workspace] });
-    const document = await catalog.registerDocument({ workspaceId: "test", path, kind: "change-review", title, attention: "review" });
+    catalog.createSpace({ id: "export-test", name: "Export test", matchers: [{ kind: "tag", value: "export-test" }] });
+    const document = await catalog.registerDocument({ workspaceId: "test", path, kind: "change-review", title, attention: "review", tags: ["export-test"] });
     const server = await startDeskServer({ catalog });
     try {
       await use({ server, document, picture, path });
@@ -196,4 +197,14 @@ test("embeds SVG image elements and rejects remote pictures without leaving a pa
   expect(result.embedded).toBe(true);
   expect(result.error).toContain("Cannot export this picture");
   await expect(page.locator(".document-export")).toHaveCount(0);
+});
+
+test("exports pictures through the selected Space", async ({ page, desk }) => {
+  await page.goto(`${desk.server.url}/d/${desk.document.id}?space=export-test&token=${desk.server.token}`);
+  await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
+  const downloading = page.waitForEvent("download");
+  await page.getByRole("button", { name: "download HTML" }).click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe("Sharing report Проба.html");
+  await expect(page.locator("#export-status")).toHaveText("HTML downloaded.");
 });

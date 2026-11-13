@@ -1,13 +1,22 @@
 import type {
   Attention,
   DocumentKind,
+  FeedbackSubmission,
   ReadingStatus,
   ReviewKind,
   ReviewFeedbackItem,
   ReviewOutcome,
   ReviewRequest,
   ReviewStatus,
+  RepositoryInventoryItem,
+  Space,
+  SpaceMatcher,
 } from "./domain.js";
+import type { MarkdownSourceMapV1 } from "mdmaid";
+import type {
+  CreateFeedbackInput,
+  FeedbackPage,
+} from "./catalog.js";
 import type { ChangeReviewDiff } from "./change-review.js";
 
 export type {
@@ -20,10 +29,15 @@ export type {
   ReviewStatus,
 };
 export type { ChangeReviewDiff } from "./change-review.js";
+export type PublicSpaceMatcher = SpaceMatcher;
+export type PublicSpace = Space;
+export type PublicRepository = RepositoryInventoryItem;
 
 export interface PublicDocument {
   id: string;
   workspaceId: string;
+  projectId?: string;
+  projectName?: string;
   taskId?: string;
   producer?: string;
   kind: DocumentKind;
@@ -55,16 +69,48 @@ export interface PublicWorkspace {
   route: string;
 }
 
+export interface PublicProject {
+  id: string;
+  name: string;
+  documentCount: number;
+  route: string;
+}
+
 export interface WorkspaceRegistration {
   id: string;
   name: string;
   root: string;
   artifactRoots: string[];
+  repository?: string;
+  repositoryName?: string;
+}
+
+export interface WorkspaceReconciliationRequest {
+  targetWorkspaceId: string;
+  discardArchivedConflicts?: boolean;
+  apply: boolean;
+}
+
+export interface PublicWorkspaceReconciliationConflict {
+  sourceDocumentId: string;
+  targetDocumentId: string;
+  reason: "path-conflict" | "review-history";
+}
+
+export interface PublicWorkspaceReconciliation {
+  sourceWorkspaceId: string;
+  targetWorkspaceId: string;
+  applied: boolean;
+  movedDocumentIds: string[];
+  discardedDocumentIds: string[];
+  blockingConflicts: PublicWorkspaceReconciliationConflict[];
+  reviewRequestCount: number;
 }
 
 export interface DocumentRegistration {
   workspaceId: string;
   taskId?: string;
+  featureName?: string;
   producer?: string;
   kind: DocumentKind;
   title: string;
@@ -76,6 +122,9 @@ export interface DocumentRegistration {
 export type DocumentImport = DocumentRegistration;
 
 export type PublicReviewRequest = ReviewRequest;
+export type PublicFeedbackSubmission = FeedbackSubmission;
+export type FeedbackSubmissionRegistration = CreateFeedbackInput;
+export type PublicFeedbackPage = FeedbackPage;
 
 export interface ReviewRequestRegistration {
   documentId: string;
@@ -88,12 +137,14 @@ export interface ReviewRequestResponse {
   outcome: ReviewOutcome;
   message: string;
   items?: ReviewFeedbackItem[];
+  feedback?: FeedbackSubmissionRegistration;
 }
 
 export interface HealthData {
   service: "mdmaid.desk";
   status: "ok";
   version: number;
+  capabilities?: string[];
 }
 
 export type RenderTarget = "web" | "terminal";
@@ -107,6 +158,8 @@ export interface WebRender {
   document: PublicDocument;
   target: "web";
   content: string;
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 
@@ -116,6 +169,8 @@ export interface TerminalRender {
   content: string;
   backend: string;
   warnings: string[];
+  sourceWitness: string;
+  sourceMap: MarkdownSourceMapV1;
   changeReview?: ChangeReviewDiff;
 }
 
@@ -129,3 +184,15 @@ export type DocumentAction =
   | "restore"
   | "missing"
   | "present";
+
+export type BulkDocumentAction = "archive" | "restore" | "purge";
+
+export type BulkDocumentResult =
+  | {
+      action: "archive" | "restore";
+      documents: PublicDocument[];
+    }
+  | {
+      action: "purge";
+      purgedIds: string[];
+    };

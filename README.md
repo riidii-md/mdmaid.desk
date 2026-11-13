@@ -32,17 +32,19 @@ The repository contains the first usable shared-service vertical slice:
 - Server-Sent Event refreshes for both clients;
 - explicit revision-bound human review requests with durable request/response
   text and conditional web/TUI actions;
+- durable feedback on every document, including general notes, selected
+  Markdown text, and native diff file/line/range comments;
 - first-class change-review documents with a dedicated terminal Changes space
   and revision-bound implementation decisions;
 - atomic, user-only daemon discovery state so the TUI reuses a running service;
-- memorable `http://mdmaid.desk.localhost:43127/` browser origin;
+- memorable `http://mdmaid.desk.localhost/` browser origin;
 - daemon-first CLI writes with daemonless SQLite fallback;
 - explicit start, status, stop, login-service install, and uninstall lifecycle;
-- selectable ports with automatic available-port fallback;
-- `workspace`, `register`, `import`, `review`, `list`, `web`, `tui`, and `daemon`
-  commands.
+- stable port-80 default with explicit alternate ports for isolated testing;
+- `workspace`, `validate`, `register`, `import`, `review`, `feedback`, `list`,
+  `web`, `tui`, and `daemon` commands.
 
-Stdin import, comments, and editing remain planned milestones. Document
+Stdin import and editing remain planned milestones. Document
 registration works without a daemon, but automatically
 uses its authenticated API when one is running. `web` reuses a daemon or runs
 the service in the foreground; `tui` attaches to it when present and uses a
@@ -60,6 +62,7 @@ session-scoped embedded loopback service otherwise.
 - local CLI and API access;
 - attention metadata;
 - explicit local human-review requests and their durable responses;
+- document feedback with stable IDs, routes, API reads, and CLI reads;
 - presentation security boundaries.
 
 It does not own:
@@ -123,8 +126,31 @@ Register a workspace:
 ```bash
 node dist/cli.js workspace add /path/to/repository \
   --id example \
-  --name "Example"
+  --name "Example worktree" \
+  --repository github.com/example/example \
+  --repository-name "Example"
 ```
+
+A canonical repository/worktree root can belong to only one workspace ID.
+Ticket and task identifiers belong in document/project metadata and must not be
+used as workspace IDs. If an older catalog contains two IDs for one root,
+inspect a dry-run reconciliation before applying it:
+
+```bash
+mdmaid-desk workspace reconcile task-derived-id \
+  --into stable-repository-id \
+  --json
+
+mdmaid-desk workspace reconcile task-derived-id \
+  --into stable-repository-id \
+  --apply
+```
+
+The operation preserves non-conflicting document and review IDs. Path
+conflicts block the repair. An archived conflicting document may be discarded
+only with `--discard-archived-conflicts`; review history is never discarded.
+The command uses the live daemon when available, so its dry run and mutation
+observe the same catalog authority.
 
 Register a document:
 
@@ -133,11 +159,29 @@ node dist/cli.js register /path/to/repository/docs/plan.md \
   --workspace example \
   --live \
   --task PROJECT-123 \
+  --feature-name "Durable Project Naming" \
   --producer codex \
   --kind plan \
   --attention approval \
   --tag architecture
 ```
+
+`--repository` and `--task` form the stable logical project identity.
+The producing AI supplies only the concise `--feature-name`; mdmaid.desk stores
+the first accepted value and assembles the visible label as
+`Repository / PROJECT-123 (Durable Project Naming)`. Documents from multiple
+workspaces with the same repository/task identity appear under that one
+project. Branch names are not used as display names.
+
+Preflight every Mermaid fence without changing the catalog:
+
+```bash
+mdmaid-desk validate /path/to/repository/docs/plan.md --json
+```
+
+The command exits `0` when every diagram parses and `1` when any diagram is
+invalid. Its versioned JSON report includes the total diagram count and every
+issue with its block number, Markdown start line, and parser diagnostic.
 
 Registration remains passive even when attention is `approval`. To ask for a
 human decision and keep the current agent command waiting, declare the review
@@ -154,11 +198,12 @@ mdmaid-desk register /path/to/repository/docs/plan.md \
   --json
 ```
 
-The web and TUI show Approve, Request changes, and Reject only while that exact
-document revision has a pending request. The response JSON includes both the
-producer's request message and the human's response text. `changes_requested`
-requires explanatory text. Updating document content makes the old request
-stale; opening, reading, or marking the document done never approves it.
+The web and TUI show Approve, Request changes, Reject, and Mark superseded only
+while that exact document revision has a pending request. The response JSON
+includes both the producer's request message and the human's response text.
+`changes_requested` requires explanatory text. Updating document content makes
+the old request stale; opening, reading, or marking the document done never
+approves it.
 
 Review operations are also composable:
 
@@ -171,6 +216,17 @@ mdmaid-desk review wait review-0123456789abcdefabcd --json
 mdmaid-desk review respond review-0123456789abcdefabcd \
   --outcome changes_requested \
   --message "Add a restore verification step."
+```
+
+Feedback does not require a review request and never changes decision state.
+Agents can retrieve a submission by stable ID or enumerate a document revision:
+
+```bash
+mdmaid-desk feedback show feedback-0123456789abcdefabcd --json
+mdmaid-desk feedback list \
+  --document doc-0123456789abcdefabcd \
+  --revision 3 \
+  --json
 ```
 
 Import a durable copy when the original file may disappear (for example, an
@@ -195,11 +251,11 @@ file does not remove the imported copy.
 Every registered-source render re-authorizes the real path and reconciles its
 content hash, revision, reading state, review state, and local-link mappings.
 When a foreground web service or daemon is running, mdmaid.desk also watches
-the parent directories of active registered sources. A committed source
-change, disappearance, or restoration publishes a document-scoped event: an
-open matching Web or TUI reader rerenders automatically, while unrelated
-readers only refresh queue metadata. The interfaces label registered documents
-as `live source` and imports as `snapshot`.
+the parent directories of active registered sources. Every committed catalog
+change publishes one metadata-free invalidation; Web, TUI, and waiting CLI
+clients then reread authoritative state for their selected Space. The
+interfaces label registered documents as `live source` and imports as
+`snapshot`.
 
 Without a running service, registration and rendering still work and a manual
 render reconciles current source state. Automatic push refresh is
@@ -227,20 +283,42 @@ node dist/cli.js list --workspace example
 node dist/cli.js list --task PROJECT-123
 ```
 
+Create persistent Spaces that classify current and future documents from one
+or more repository, repository-namespace, workspace, or tag patterns:
+
+```bash
+mdmaid-desk space add work --name "Work" \
+  --namespace github.com/example \
+  --tag work
+mdmaid-desk space add home --name "Home" --workspace personal
+mdmaid-desk space list
+mdmaid-desk repository list
+mdmaid-desk list --space work
+```
+
+An agent creating a Space must ask which patterns belong to it when none were
+provided. Matchers use OR semantics and membership is derived from current
+repository identity and tags, so later matching documents appear automatically.
+Use `space matchers set`, `space rename`, and `space delete` to manage the
+definition. Space-aware commands refuse a healthy older daemon and ask for a
+restart after upgrade instead of bypassing it with direct catalog access.
+
 Run the browser workspace as a foreground local service:
 
 ```bash
 node dist/cli.js web
 ```
 
-The command binds only to loopback on the stable port `43127` and prints an
+The command binds only to loopback on the standard HTTP port `80` and prints an
 authenticated URL such as:
 
 ```text
-http://mdmaid.desk.localhost:43127/?token=...
+http://mdmaid.desk.localhost/?token=...
 ```
 
-No proxy, certificate, DNS, or `/etc/hosts` setup is required. After the first
+No manual proxy, certificate, DNS, or `/etc/hosts` setup is required. If
+Traefik already owns port 80 on macOS, mdmaid.desk can add its route
+automatically. After the first
 authenticated open, the browser redirects to the clean URL, which can be
 bookmarked. The service publishes a user-only `daemon.json` for local clients
 and keeps its persistent random authentication token in a user-only
@@ -249,7 +327,12 @@ names are scoped to that token, allowing independent mdmaid.desk daemons on
 different ports to remain signed in at the same time. Stop the foreground
 service with `Ctrl-C`.
 
-Use `--port` to select another loopback port. An advanced `--public-url` option
+Project, Space, and content type are global filters. Open the Project control
+and type any part of a project name to narrow its choices with a
+case-insensitive substring match, then select the project normally.
+
+Use `--port` to select another loopback port for intentional isolated testing.
+An advanced `--public-url` option
 accepts HTTP or HTTPS `.localhost` origins; a direct HTTP origin must use the
 same port as the service.
 
@@ -264,13 +347,22 @@ mdmaid-desk web
 mdmaid-desk daemon stop
 ```
 
-The default port is `43127`. If it is occupied, an unpinned daemon selects an
-available loopback port; `daemon start` and `daemon status` print the actual
-port and authenticated web URL. Pin one when desired:
+The default attempt is port `80`. If it is unavailable and a compatible
+Docker-backed Traefik owns it on macOS, mdmaid.desk registers a route there,
+serves on private port `43127`, and keeps the portless browser URL. Otherwise
+it serves directly on `43127` and reports the URL with that port. No random
+port is selected. A default `web`, `tui`, `daemon start`, or CLI mutation
+attaches to the healthy daemon recorded in the user-only descriptor. Select a
+different port only when deliberately running an isolated instance:
 
 ```bash
 mdmaid-desk daemon start --port 43210
 ```
+
+If a healthy daemon already exists, the same-port `web` command reuses it and
+a conflicting port is rejected. Stop the shared daemon before starting an
+isolated instance against the same state directory. An explicit `--port`
+requires that exact port; it does not trigger the automatic fallbacks.
 
 To start mdmaid.desk automatically at login, explicitly install its user
 service (LaunchAgent on macOS, systemd user service on Linux):
@@ -281,6 +373,11 @@ mdmaid-desk daemon install
 mdmaid-desk daemon uninstall
 ```
 
+Agents and scripts should use the ordinary CLI commands without starting their
+own server. When the installed service is healthy, the CLI reuses it; document
+registration still falls back to a bounded direct catalog transaction when no
+daemon is running.
+
 Registration never installs or permanently starts the daemon.
 
 Run the terminal workspace:
@@ -290,15 +387,23 @@ node dist/cli.js tui
 ```
 
 The TUI reuses the running web daemon when available, so both clients share
-catalog events and reading state. Keys are shown in its footer; the main flow
+catalog invalidations and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
 The queue starts grouped by project; press `g` to cycle through project, tag,
-and one ordered-list view.
+and one ordered-list view. Press `x` to cycle All and named Spaces.
 Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for
 Approve, Request changes, or Reject. The response composer uses `Enter` for a
 newline, `Ctrl-D` to submit, and `Esc` to cancel.
 
-Press `c` from the terminal queue to enter the dedicated Change Reviews space.
+Feedback remains available whether or not a decision is pending. In a document
+reader, use `[`/`]` to choose a source row, `f` to comment on it, `g` for a
+general note, and `s` to submit. Native diffs use `f` for a line/range and `t`
+for a file comment. The browser exposes the same operations through text
+selection and visible `+` controls.
+
+Press `c` from the terminal queue to switch between Docs and Change reviews.
+This content mode is independent from the Actions filter, so “Waiting for you”
+can narrow either mode.
 Producers publish an implementation review and its mandatory decision with:
 
 ```bash
@@ -312,13 +417,20 @@ mdmaid-desk register .agent-runs/change-reviews/current/review.md \
 
 The decision is bound to the registered document revision and content hash.
 Changing the review artifact makes the pending request stale.
+If a separate newer review replaces an unreviewed request, mark the old request
+`superseded`; this wakes a waiting producer without approving, requesting
+changes, or rejecting the obsolete version.
 
 For a native terminal diff, include one or more standard Git patches in fenced
 `diff` blocks. The reader opens in Diff mode when it finds a valid patch and
-provides file (`[`/`]` or arrow keys), hunk (`p`/`n`), unified/side-by-side
-(`m`), and Markdown/diff (`d`) navigation. Changed spans inside paired removed
-and added lines are emphasized. Binary and mode-only files remain visible even
-when they have no text hunk.
+provides file (`p`/`n`, with `[`/`]` aliases), line (`j`/`k`),
+unified/side-by-side (`m`), and Markdown/diff (`d`) navigation. Line navigation
+continues across hunk boundaries, so every displayed line can receive feedback.
+Changed spans inside paired removed and added lines are emphasized. Binary and
+mode-only files remain visible even when they have no text hunk.
+
+The browser and TUI show the complete diff for the selected file in one
+continuous view. The file list controls which changed file is shown.
 
 The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
@@ -339,14 +451,28 @@ data is limited to 32 MiB per export. Heading links and external links remain
 usable; links to local source viewers are omitted from the offline copy.
 Exporting does not mark a document read or submit a review decision.
 
-Use `f` to attach feedback to the current hunk, `t` to add a file todo, and `z`
-to undo the most recent unsent note. Notes become durable structured response
-items when Request Changes is submitted; `review wait --json` returns their
-file paths, stable hunk IDs, kinds, and messages. Open notes prevent accidental
-Approve or Reject decisions. The review surface is intentionally read-only:
+Use `f` to attach feedback to the selected line, or press `v`, move with `j`/`k`,
+and press `f` to comment on a same-side range. Use `t` to add file feedback and
+`z` to undo the most recent unsent note. In the browser, click a visible `+` or
+Shift-click another same-side line to select a range. Anchored comments appear
+inline beside the related diff and in the feedback summary. They become durable
+structured feedback when sent directly. If a decision is pending, the same
+draft can be stored atomically with that decision. Browser drafts survive
+reload and can be edited or removed before submission. Feedback has its own
+stable `/f/:id` route and can be fetched through the API or `feedback` CLI.
+The review surface is intentionally read-only:
 staging, reverting, or editing would invalidate the frozen snapshot being
 approved. Change Reviews with no native diff or with parser safety warnings
 cannot be approved; the human can still Request Changes or Reject them.
+
+Registration, import, and live-reference reconciliation validate every
+Mermaid fence with Mermaid's parser. A bad diagram rejects the update with its
+block number, Markdown start line, and parser diagnostic. API errors include
+the same complete report under `error.validation`; `register --json` and
+`import --json` preserve it so a producer can patch every reported block before
+retrying. Browser rendering is also isolated per diagram so a runtime failure
+remains visible without hiding the document or its stable
+`/d/<document-id>` URL.
 
 The default state directory is:
 
@@ -358,6 +484,11 @@ ${XDG_STATE_HOME:-~/.local/state}/mdmaid.desk/
   daemon.json  # present while a foreground or background service is running
   daemon.log
 ```
+
+The Spaces release upgrades existing catalogs from schema 8 to schema 9.
+Before the first upgraded start, follow the verified backup and downgrade
+procedure in [docs/RELEASING.md](docs/RELEASING.md#schema-9-backup-and-downgrade-recovery).
+In-place downgrade is not supported.
 
 ## Target Interaction
 
@@ -383,6 +514,7 @@ Document registration and presentation never imply workflow approval.
 
 - [Architecture and roadmap](docs/ARCHITECTURE.md)
 - [Human review requests](docs/REVIEW_REQUESTS.md)
+- [Document feedback](docs/DOCUMENT_FEEDBACK.md)
 - [Releasing and distribution](docs/RELEASING.md)
 - [Security policy](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
