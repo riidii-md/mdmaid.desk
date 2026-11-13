@@ -35,6 +35,10 @@ Both the filesystem boundary and browser boundary are security-sensitive.
   HSTS;
 - forwarding headers are not part of the trust boundary;
 - rendered HTML is sanitized and served with a restrictive CSP.
+- exported HTML embeds validated local pictures, rendered diagrams, styles, and
+  its font; its own CSP disables scripts and network subresources;
+- exports use authenticated media reads with the same path authorization and
+  size limits, and never fetch arbitrary remote images.
 
 ## Required Before Daemon Release
 

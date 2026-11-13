@@ -78,7 +78,7 @@ the document remains in scope. Web refresh preserves the nearest available
 heading and reruns Mermaid without adding a history entry or marking the
 revision opened again.
 
-Linked text files and validated SVG media are re-read and re-authorized on each
+Linked text files and validated image media are re-read and re-authorized on each
 request but are not watched. Without this service, opening or rendering a
 registered document still reconciles its current source; there is simply no
 automatic push event.
@@ -101,7 +101,7 @@ In-place downgrade is unsupported; recovery requires that backup.
 - browser mutations authenticated by cookie must send the exact public origin;
 - forwarding headers are not trusted or used for authentication;
 - browser cookies are token-scoped and marked `HttpOnly` and `SameSite=Strict`;
-- registered workspace-local SVGs are served only through authenticated opaque
+- registered workspace-local pictures are served only through authenticated opaque
   media routes with repeated realpath checks and a script-denying sandbox CSP;
 - the persistent random `auth-token` and transient `daemon.json` descriptor use
   mode `0600` in the mode-`0700` state directory;

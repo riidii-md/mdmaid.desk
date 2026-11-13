@@ -21,6 +21,7 @@ import {
   type ContentScope,
   type CreateSpaceInput,
   type Document,
+  type DocumentMedia,
   type DocumentFilters,
   DocumentSourceLinkNotFoundError,
   DocumentSourceMissingError,
@@ -64,6 +65,7 @@ const LEGACY_SESSION_COOKIE = SESSION_COOKIE_PREFIX;
 const SESSION_MAX_AGE_SECONDS = 365 * 24 * 60 * 60;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 const WEB_CLIENT_PATH = fileURLToPath(new URL("./web-client.js", import.meta.url));
+const DOCUMENT_EXPORT_PATH = fileURLToPath(new URL("./document-export.js", import.meta.url));
 const MDMAID_ENTRY = fileURLToPath(import.meta.resolve("mdmaid"));
 const MDMAID_ROOT = resolve(dirname(MDMAID_ENTRY), "../..");
 const MDMAID_REQUIRE = createRequire(MDMAID_ENTRY);
@@ -84,6 +86,7 @@ export interface DeskServerOptions {
 
 export interface DeskServerDependencies {
   readWebClient?: (() => Promise<Buffer>) | undefined;
+  readDocumentExport?: (() => Promise<Buffer>) | undefined;
   startLiveSources?: (
     catalog: Catalog,
     options: LiveSourceCoordinatorOptions,
@@ -173,7 +176,10 @@ export async function startDeskServer(
     throw new Error("server token must contain at least 8 characters");
   }
   const sessionCookie = browserSessionCookieName(token);
-  const webClient = await (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))();
+  const [webClient, documentExport] = await Promise.all([
+    (dependencies.readWebClient ?? (() => readFile(WEB_CLIENT_PATH)))(),
+    (dependencies.readDocumentExport ?? (() => readFile(DOCUMENT_EXPORT_PATH)))(),
+  ]);
 
   const events = new EventHub();
   const unsubscribeInvalidation = options.catalog.subscribeInvalidation(() => {
@@ -191,6 +197,7 @@ export async function startDeskServer(
       publicOrigin,
       securePublicOrigin,
       webClient,
+      documentExport,
       liveSources,
     ).catch((error: unknown) => {
       if (response.headersSent) {
@@ -257,6 +264,7 @@ async function handleRequest(
   publicOrigin: string | undefined,
   securePublicOrigin: boolean,
   webClient: Buffer,
+  documentExport: Buffer,
   liveSources: LiveSourceCoordinator | undefined,
 ): Promise<void> {
   applySecurityHeaders(response, securePublicOrigin);
@@ -391,7 +399,7 @@ async function handleRequest(
   }
 
   if (request.method === "GET" && url.pathname.startsWith("/assets/")) {
-    await serveAsset(response, url.pathname, webClient);
+    await serveAsset(response, url.pathname, webClient, documentExport);
     return;
   }
 
@@ -813,6 +821,31 @@ async function handleRequest(
   const renderMatch = url.pathname.match(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/render$/,
   );
+  const exportMatch = url.pathname.match(
+    /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/export$/,
+  );
+  if (request.method === "GET" && exportMatch) {
+    const scope = parseWorkspaceQueryState(url.searchParams, catalog);
+    const querySuffix = workspaceQuerySuffix(url.searchParams, scope);
+    const id = exportMatch[1] ?? "";
+    const { content } = await readDocument(catalog, id, scope);
+    // Export every patch, including files outside the reader's selected-file view.
+    const renderedMarkdown = await renderMarkdownWithSourceMap(content, { sanitize: false });
+    const document = catalog.getDocument(id, scope);
+    if (!document) {
+      throw new HttpError(404, "not_found", "Document not found");
+    }
+    const rendered = sanitizeRenderedHtml(
+      renderedMarkdown.html,
+      document,
+      catalog.resolveDocumentSourceTargets(document.id, scope),
+      querySuffix,
+    );
+    sendJson(response, 200, {
+      data: { document: publicDocument(document), content: rendered },
+    });
+    return;
+  }
   if (request.method === "GET" && renderMatch) {
     const scope = parseWorkspaceQueryState(url.searchParams, catalog);
     const querySuffix = workspaceQuerySuffix(url.searchParams, scope);
@@ -1722,6 +1755,7 @@ async function serveAsset(
   response: ServerResponse,
   pathname: string,
   webClient: Buffer,
+  documentExport: Buffer,
 ): Promise<void> {
   if (pathname === "/assets/app.css") {
     sendAsset(response, "text/css; charset=utf-8", WEB_STYLES);
@@ -1729,6 +1763,10 @@ async function serveAsset(
   }
   if (pathname === "/assets/app.js") {
     sendAsset(response, "text/javascript; charset=utf-8", webClient);
+    return;
+  }
+  if (pathname === "/assets/document-export.js") {
+    sendAsset(response, "text/javascript; charset=utf-8", documentExport);
     return;
   }
   if (pathname === "/assets/mermaid.min.js") {
@@ -1763,7 +1801,7 @@ function sendAsset(
 
 function sendDocumentMedia(
   response: ServerResponse,
-  contentType: "image/svg+xml",
+  contentType: DocumentMedia["contentType"],
   body: Buffer,
 ): void {
   response.statusCode = 200;
@@ -1892,11 +1930,14 @@ function workspaceHtml(pathname: string): string {
               <button id="mark-unread" class="action" type="button">○ unread</button>
               <button id="copy-link" class="action" type="button">copy link</button>
               <button id="print" class="action" type="button">print</button>
+              <button id="export-pdf" class="action" type="button" title="Choose Save as PDF in the print dialog">save PDF</button>
+              <button id="export-html" class="action" type="button">download HTML</button>
               <button id="archive" class="action" type="button">archive</button>
               <button id="restore" class="action" type="button" hidden>restore</button>
               <button id="purge" class="action danger" type="button">purge</button>
             </div>
           </div>
+          <p id="export-status" class="export-status" role="status" aria-live="polite"></p>
           <header class="reader-heading">
             <span id="reader-eyebrow" class="eyebrow">document</span>
             <h1 id="reader-title">Document</h1>

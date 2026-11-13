@@ -309,6 +309,7 @@ test("applies Space scope uniformly and contains out-of-scope resources", async 
     const reads = [
       `/api/v1/documents/${value.document.id}?space=empty`,
       `/api/v1/documents/${value.document.id}/render?target=web&space=empty`,
+      `/api/v1/documents/${value.document.id}/export?space=empty`,
       `/d/${value.document.id}/source/${sourceId}?space=empty`,
       `/api/v1/review-requests/${review.id}?space=empty`,
     ];
@@ -814,7 +815,7 @@ test("renders and serves authenticated workspace-local SVG media", async () => {
   }
 });
 
-test("refuses non-SVG files through document media routes", async () => {
+test("refuses non-image files through document media routes", async () => {
   const value = await fixture();
   const sourceLink = value.document.sourceLinks[0]!;
   try {
@@ -829,6 +830,72 @@ test("refuses non-SVG files through document media routes", async () => {
         message: "Linked source is unavailable",
       },
     });
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("serves authorized raster pictures and rejects mismatched image contents", async () => {
+  const value = await fixture();
+  try {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+    const cases = [
+      { name: "picture.png", type: "image/png", data: png },
+      { name: "picture.jpg", type: "image/jpeg", data: Buffer.from([0xff, 0xd8, 0xff, 0xe0]) },
+      { name: "picture.gif", type: "image/gif", data: Buffer.from("GIF89a") },
+      { name: "picture.webp", type: "image/webp", data: Buffer.from("RIFF0000WEBP") },
+      { name: "invalid.png", type: undefined, data: Buffer.from("<html>not a picture</html>") },
+    ];
+    for (const item of cases) {
+      await writeFile(join(value.workspace, item.name), item.data);
+    }
+    const path = join(value.workspace, "pictures.md");
+    await writeFile(path, cases.map(({ name }) => `![picture](${name})`).join("\n"));
+    const document = await value.catalog.registerDocument({ workspaceId: "example", path, kind: "other", title: "Pictures", attention: "none" });
+    for (const item of cases) {
+      const source = document.sourceLinks.find(({ href }) => href === item.name)!;
+      const response = await authorized(value, `/d/${document.id}/media/${source.id}`);
+      assert.equal(response.status, item.type ? 200 : 410);
+      if (item.type) {
+        assert.equal(response.headers.get("content-type"), item.type);
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), item.data);
+      }
+    }
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("exports the complete sanitized document without changing reading or review state", async () => {
+  const value = await fixture();
+  try {
+    const path = join(value.workspace, "export.md");
+    await writeFile(path, [
+      "# Whole document", "", '<script>alert("no")</script>', "",
+      "```mermaid", "graph LR", "A --> B", "```", "",
+      ...["first.ts", "second.ts"].flatMap((name) => [
+        "```diff", `diff --git a/${name} b/${name}`, `--- a/${name}`, `+++ b/${name}`,
+        "@@ -1 +1 @@", "-old", "+new", "```", "",
+      ]),
+    ].join("\n"));
+    const document = await value.catalog.registerDocument({ workspaceId: "example", path, kind: "change-review", title: "Whole document", attention: "review" });
+    const review = await value.catalog.createReviewRequest({ documentId: document.id, kind: "change-decision", requestMessage: "Review the complete change." });
+    const route = `/api/v1/documents/${document.id}/export`;
+    assert.equal((await fetch(new URL(route, value.server.url))).status, 401);
+    const response = await authorized(value, route);
+    assert.equal(response.status, 200);
+    const body = await response.json() as { data: { document: Record<string, unknown>; content: string } };
+    assert.match(body.data.content, /Whole document/);
+    assert.match(body.data.content, /first\.ts/);
+    assert.match(body.data.content, /second\.ts/);
+    assert.match(body.data.content, /class="mermaid"/);
+    assert.doesNotMatch(body.data.content, /<script|alert\("no"\)/);
+    assert.equal("path" in body.data.document, false);
+    assert.equal(value.catalog.getDocument(document.id)?.status, "unread");
+    assert.equal(value.catalog.getReviewRequest(review.id)?.status, "pending");
+    await rm(path);
+    assert.equal((await authorized(value, route)).status, 410);
+    assert.equal((await authorized(value, "/api/v1/documents/doc-00000000000000000000/export")).status, 404);
   } finally {
     await closeFixture(value);
   }
@@ -1748,6 +1815,9 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(html, /data-testid="reader-toc"/);
     assert.match(html, /data-testid="queue-error"/);
     assert.match(html, /id="print"[^>]*>print<\/button>/);
+    assert.match(html, /id="export-pdf"[^>]*>save PDF<\/button>/);
+    assert.match(html, /id="export-html"[^>]*>download HTML<\/button>/);
+    assert.match(html, /id="export-status"[^>]*role="status"/);
     assert.match(html, /\/assets\/app\.css/);
     assert.match(html, /\/assets\/app\.js/);
     assert.match(html, /\/assets\/mermaid\.min\.js/);
@@ -1793,6 +1863,11 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.match(app.headers.get("content-type") ?? "", /javascript/);
     const appText = await app.text();
     assert.match(appText, /mdmaid\.desk web client/);
+    assert.match(appText, /document-export\.js/);
+
+    const exportModule = await fetch(new URL("/assets/document-export.js", value.server.url), { headers });
+    assert.equal(exportModule.status, 200);
+    assert.match(exportModule.headers.get("content-type") ?? "", /javascript/);
     assert.match(
       appText,
       /Line feedback: click \+ beside a line; Shift-click another same-side line for a range\./,
@@ -1820,16 +1895,21 @@ test("serves the browser workspace and local visual assets", async () => {
   }
 });
 
-test("pins the web client asset for the lifetime of a running server", async () => {
+test("pins browser modules for the lifetime of a running server", async () => {
   let clientScript = "/* client build one */";
+  let exportScript = "/* export build one */";
   const value = await fixture({}, {
     readWebClient: async () => Buffer.from(clientScript),
+    readDocumentExport: async () => Buffer.from(exportScript),
   });
   try {
     clientScript = "/* client build two */";
+    exportScript = "/* export build two */";
     const response = await authorized(value, "/assets/app.js");
     assert.equal(response.status, 200);
     assert.equal(await response.text(), "/* client build one */");
+    const exportResponse = await authorized(value, "/assets/document-export.js");
+    assert.equal(await exportResponse.text(), "/* export build one */");
   } finally {
     await closeFixture(value);
   }

@@ -270,7 +270,7 @@ export interface DocumentSource {
 
 export interface DocumentMedia {
   content: Buffer;
-  contentType: "image/svg+xml";
+  contentType: "image/svg+xml" | "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   document: Document;
   name: string;
 }
@@ -1369,12 +1369,7 @@ export class Catalog {
       workspace,
       this.#maxDocumentBytes,
     );
-    if (extname(media.path).toLowerCase() !== ".svg") {
-      throw new LinkedSourceUnavailableError(
-        "linked document media must be an SVG file",
-      );
-    }
-    assertSvgDocument(media.content);
+    const contentType = documentMediaType(media.path, media.content);
     const current = this.#storage.getDocument(documentId, resolvedScope);
     const currentSourceLink = current?.sourceLinks.find(
       ({ id }) => id === sourceLinkId,
@@ -1384,7 +1379,7 @@ export class Catalog {
     }
     return {
       content: media.content,
-      contentType: "image/svg+xml",
+      contentType,
       document: presentDocument(current),
       name: basename(media.path),
     };
@@ -3228,6 +3223,27 @@ async function inspectLinkedSource(
       error instanceof Error ? error.message : undefined,
     );
   }
+}
+
+function documentMediaType(path: string, content: Buffer): DocumentMedia["contentType"] {
+  const extension = extname(path).toLowerCase();
+  if (extension === ".svg") {
+    assertSvgDocument(content);
+    return "image/svg+xml";
+  }
+  if (extension === ".png" && content.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return "image/png";
+  }
+  if ((extension === ".jpg" || extension === ".jpeg") && content.subarray(0, 3).equals(Buffer.from([255, 216, 255]))) {
+    return "image/jpeg";
+  }
+  if (extension === ".gif" && /^GIF8[79]a$/.test(content.subarray(0, 6).toString("ascii"))) {
+    return "image/gif";
+  }
+  if (extension === ".webp" && content.subarray(0, 4).toString("ascii") === "RIFF" && content.subarray(8, 12).toString("ascii") === "WEBP") {
+    return "image/webp";
+  }
+  throw new LinkedSourceUnavailableError("linked document media must contain a supported image");
 }
 
 function assertSvgDocument(content: Buffer): void {

@@ -833,6 +833,18 @@ button.diff-line-number.selected-range {
 .action:disabled { cursor: not-allowed; opacity: .4; }
 .mermaid { overflow-x: auto; padding: 20px 0; text-align: center; }
 
+.export-status { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.export-status:empty { display: none; }
+.document-export {
+  position: absolute;
+  left: -100000px;
+  top: 0;
+  width: 1000px;
+  padding: 32px;
+}
+.export-page { background: var(--bg); }
+.export-page .document-export { position: static; width: 100%; max-width: 1200px; margin: 0 auto; }
+
 .source-page .topbar .action { color: var(--ink); text-decoration: none; }
 .source-page .topbar .action:hover { color: var(--surface); }
 .source-viewer {
@@ -891,7 +903,15 @@ button.diff-line-number.selected-range {
   }
   body { min-height: auto; background: #fff; color: #000; }
   .topbar, .sidebar, .reader-toolbar, #queue-panel, .review-panel,
-  .change-view-switcher, .change-review-toolbar, .change-file-sidebar { display: none !important; }
+  .change-view-switcher, .change-review-toolbar, .change-file-sidebar, .export-status { display: none !important; }
+  .printing-export > .workspace { display: none !important; }
+  .document-export, .export-page .document-export {
+    position: static;
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
   .workspace { display: block; min-height: auto; }
   .main { padding: 0; }
   .reader { width: 100%; max-width: none; margin: 0; }
@@ -909,6 +929,10 @@ button.diff-line-number.selected-range {
   .change-review-workspace { display: block; min-height: auto; }
   .change-diff-stage { padding: 0; }
   .reader-content a { color: #000; }
+  .reader-content pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
+  .reader-content table { display: table; width: 100%; table-layout: fixed; }
+  .reader-content th, .reader-content td { overflow-wrap: anywhere; }
+  .reader-content h1, .reader-content h2, .reader-content h3 { break-after: avoid; }
   .reader-content .mermaid, .reader-content pre, .reader-content table,
   .reader-content img, .reader-content svg {
     break-inside: avoid;

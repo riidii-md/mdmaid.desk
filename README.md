@@ -436,6 +436,21 @@ The browser and terminal diffs also apply local, path-aware syntax colors to
 common source formats. Patch text remains inert text; syntax highlighting does
 not inject it as HTML or fetch a remote grammar.
 
+The browser reader has **print**, **save PDF**, and **download HTML** actions.
+For PDF, choose **Save as PDF** in the browser print dialog. Print and PDF use
+the document title and a paper layout without workspace or decision controls.
+All three actions include the complete document, including every patch in a
+change review, and wait for pictures and Mermaid diagrams to finish rendering.
+
+HTML downloads use the document title as a portable filename and contain the
+styles, font, rendered diagrams, and pictures in one file. They can be shared
+and read offline with JavaScript disabled. Workspace-local PNG, JPEG, GIF,
+WebP, and SVG pictures and base64 images are supported. Unavailable pictures
+stop the export with an error; remote images are not fetched. Embedded picture
+data is limited to 32 MiB per export. Heading links and external links remain
+usable; links to local source viewers are omitted from the offline copy.
+Exporting does not mark a document read or submit a review decision.
+
 Use `f` to attach feedback to the selected line, or press `v`, move with `j`/`k`,
 and press `f` to comment on a same-side range. Use `t` to add file feedback and
 `z` to undo the most recent unsent note. In the browser, click a visible `+` or

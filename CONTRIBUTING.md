@@ -23,3 +23,14 @@ npm run check
 npm run check
 git diff --check
 ```
+
+Browser export checks use an explicit development dependency and an isolated
+temporary catalog:
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+They verify offline HTML with JavaScript disabled, embedded images and diagrams,
+complete change reviews, print/PDF layout, and export failure recovery.
