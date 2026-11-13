@@ -114,11 +114,12 @@ not expose absolute paths. External HTTP(S) and mail links bypass this mapping
 unchanged. Linked sources are live references; managed import snapshots only
 the Markdown document, not its linked repository files.
 
-Registered local SVG images use the same opaque source identities under
-`/d/:document/media/:source`. Rendering rewrites only a Markdown image whose
+Registered local SVG, PNG, JPEG, GIF, and WebP images use the same opaque source
+identities under `/d/:document/media/:source`. Rendering rewrites only a Markdown image whose
 source exactly matches a registered workspace-local link. Media reads repeat
-the containment, symlink, regular-file, and size checks, require a complete
-UTF-8 `.svg` document, and return it with `nosniff`, same-origin resource policy,
+the containment, symlink, regular-file, and size checks, require a matching
+raster signature or a complete UTF-8 `.svg` document, and return it with
+`nosniff`, same-origin resource policy,
 and a media-specific sandbox content security policy that denies scripts and
 external subresources. The main document CSP continues to reject arbitrary
 local file and remote media access.

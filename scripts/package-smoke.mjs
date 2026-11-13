@@ -65,6 +65,8 @@ function verifyArchive(result) {
     "package.json",
     "dist/cli.js",
     "dist/server.js",
+    "dist/web-client.js",
+    "dist/document-export.js",
     "dist/tui.js",
   ]) {
     if (!paths.has(required)) {

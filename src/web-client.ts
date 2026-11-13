@@ -1,5 +1,13 @@
 /* mdmaid.desk web client */
 
+import {
+  downloadDocumentHtml,
+  prepareDocumentExport,
+  printDocumentExport,
+  type ExportDocument,
+  type PreparedDocumentExport,
+} from "./document-export.js";
+
 import type {
   ChangeReviewDiff,
   PublicDocument,
@@ -795,6 +803,9 @@ async function boot(): Promise<void> {
   const markRead = element("mark-read") as HTMLButtonElement;
   const markUnread = element("mark-unread") as HTMLButtonElement;
   const print = element("print") as HTMLButtonElement;
+  const exportPdf = element("export-pdf") as HTMLButtonElement;
+  const exportHtml = element("export-html") as HTMLButtonElement;
+  const exportStatus = element("export-status");
   const empty = element("queue-empty");
   const search = element("search") as HTMLInputElement;
   const live = element("live-status");
@@ -812,6 +823,53 @@ async function boot(): Promise<void> {
   let changeReviewView: "diff" | "document" = "diff";
   let renderSequence = 0;
   let catalogRefresh = Promise.resolve();
+  let readerReady = false;
+  let exportBusy = false;
+
+  function updateExportAvailability(): void {
+    const selected = state.documents.find(({ id }) => id === state.selectedId);
+    for (const button of [print, exportPdf, exportHtml]) {
+      button.disabled = exportBusy || !readerReady || !selected || isSourceMissing(selected);
+    }
+  }
+
+  async function exportSelectedDocument(format: "html" | "pdf" | "print"): Promise<void> {
+    const id = state.selectedId;
+    if (!id || !readerReady || exportBusy) return;
+    const sequence = renderSequence;
+    const isCurrent = (): boolean => state.selectedId === id && renderSequence === sequence;
+    let prepared: PreparedDocumentExport | undefined;
+    exportBusy = true;
+    updateExportAvailability();
+    exportStatus.textContent = "Preparing document and pictures…";
+    try {
+      const rendered = await api<ExportDocument>(`/api/v1/documents/${id}/export`);
+      if (!isCurrent()) return;
+      prepared = await prepareDocumentExport(
+        rendered,
+        document.documentElement.dataset.theme === "dark" ? "dark" : "light",
+      );
+      if (!isCurrent()) return;
+      if (format === "html") {
+        downloadDocumentHtml(prepared);
+        exportStatus.textContent = "HTML downloaded.";
+      } else {
+        exportStatus.textContent = format === "pdf"
+          ? "Choose Save as PDF as the destination in the print dialog."
+          : "Print dialog open.";
+        await printDocumentExport(prepared, () => requestDocumentPrint(window));
+        if (isCurrent()) exportStatus.textContent = "Print dialog closed.";
+      }
+    } catch (error) {
+      if (isCurrent()) {
+        exportStatus.textContent = error instanceof Error ? error.message : "Could not export document. Try again.";
+      }
+    } finally {
+      prepared?.dispose();
+      exportBusy = false;
+      updateExportAvailability();
+    }
+  }
 
   async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await fetch(path, {
@@ -1320,6 +1378,9 @@ async function boot(): Promise<void> {
     },
   ): Promise<void> {
     const sequence = ++renderSequence;
+    readerReady = false;
+    updateExportAvailability();
+    exportStatus.textContent = "";
     const selected = state.documents.find((item) => item.id === id);
     renderReaderMetadata(selected);
     renderReviewPanel(id);
@@ -1371,6 +1432,8 @@ async function boot(): Promise<void> {
           ?.scrollIntoView({ block: "start" });
       }
       renderedRevision = rendered.document.revision;
+      readerReady = true;
+      updateExportAvailability();
       if (!options.markOpened) {
         return;
       }
@@ -1544,7 +1607,8 @@ async function boot(): Promise<void> {
     readerContent.classList.toggle("source-missing", missing);
     markRead.disabled = missing;
     markUnread.disabled = missing;
-    print.disabled = missing;
+    if (missing) readerReady = false;
+    updateExportAvailability();
     if (missing) {
       readerToc.setAttribute("hidden", "");
       readerTocList.replaceChildren();
@@ -1553,6 +1617,8 @@ async function boot(): Promise<void> {
 
   function closeReader(pushHistory = true): void {
     renderSequence += 1;
+    readerReady = false;
+    updateExportAvailability();
     renderedRevision = undefined;
     renderedChangeReview = undefined;
     state.selectedId = undefined;
@@ -1656,7 +1722,9 @@ async function boot(): Promise<void> {
   element("reader-back").addEventListener("click", () => closeReader());
   markRead.addEventListener("click", () => void act("read"));
   markUnread.addEventListener("click", () => void act("unread"));
-  print.addEventListener("click", () => requestDocumentPrint(window));
+  print.addEventListener("click", () => void exportSelectedDocument("print"));
+  exportPdf.addEventListener("click", () => void exportSelectedDocument("pdf"));
+  exportHtml.addEventListener("click", () => void exportSelectedDocument("html"));
   element("archive").addEventListener("click", () => void act("archive"));
   reviewApprove.addEventListener("click", () =>
     void respondToReview("approved"),
