@@ -76,7 +76,7 @@ test("names tabs after the open document across navigation and archive", async (
     await expect(page.locator("#queue-panel")).toBeVisible();
     await expect(page).toHaveTitle("mdmaid.desk");
   } finally {
-    await page.close();
+    await page.context().close();
     await value.close();
   }
 });
@@ -99,7 +99,7 @@ test("keeps direct-link tab titles current after catalog updates", async ({ page
     await expect(page.locator("#reader-title")).toHaveText(title);
     await expect(page.locator('link[rel="icon"]')).toHaveAttribute("href", "/assets/favicon.svg");
   } finally {
-    await page.close();
+    await page.context().close();
     await value.close();
   }
 });
