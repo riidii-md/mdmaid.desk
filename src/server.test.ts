@@ -1807,6 +1807,8 @@ test("serves the browser workspace and local visual assets", async () => {
 
     const page = await fetch(new URL("/", value.server.url), { headers });
     const html = await page.text();
+    assert.match(html, /<title>mdmaid\.desk<\/title>/);
+    assert.match(html, /<link rel="icon" href="\/assets\/favicon\.svg"/);
     assert.match(html, /data-testid="project-select"/);
     assert.match(html, /data-testid="document-queue"/);
     assert.match(html, /aria-label="Group documents"/);
@@ -1828,7 +1830,9 @@ test("serves the browser workspace and local visual assets", async () => {
       headers,
     });
     assert.equal(workspacePage.status, 200);
-    assert.match(await workspacePage.text(), /data-workspace-id="example"/);
+    const workspaceHtml = await workspacePage.text();
+    assert.match(workspaceHtml, /data-workspace-id="example"/);
+    assert.match(workspaceHtml, /<title>mdmaid\.desk<\/title>/);
 
     const projectPage = await fetch(
       new URL(`/p/${value.document.projectId}`, value.server.url),
@@ -1892,6 +1896,64 @@ test("serves the browser workspace and local visual assets", async () => {
     assert.equal(font.status, 200);
     assert.equal(font.headers.get("content-type"), "font/woff2");
     assert.ok((await font.arrayBuffer()).byteLength > 1_000);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("names document tabs by their catalog title and keeps the service favicon", async () => {
+  const value = await fixture();
+  try {
+    const response = await authorized(value, `/d/${value.document.id}`);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /<title>Visible plan<\/title>/);
+    assert.match(html, /<link rel="icon" href="\/assets\/favicon\.svg"/);
+
+    const favicon = await authorized(value, "/assets/favicon.svg");
+    assert.equal(favicon.status, 200);
+    assert.match(favicon.headers.get("content-type") ?? "", /image\/svg\+xml/);
+    assert.match(await favicon.text(), /<svg\b/);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("keeps document tab titles within the selected Space", async () => {
+  const value = await fixture();
+  try {
+    value.catalog.createSpace({
+      id: "other",
+      name: "Other",
+      matchers: [{ kind: "tag", value: "other" }],
+    });
+    const response = await authorized(value, `/d/${value.document.id}?space=other`);
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /<title>mdmaid\.desk<\/title>/);
+  } finally {
+    await closeFixture(value);
+  }
+});
+
+test("escapes document tab titles and falls back for unknown documents", async () => {
+  const value = await fixture();
+  try {
+    await value.catalog.registerDocument({
+      workspaceId: "example",
+      kind: "plan",
+      title: '</title><script>alert("tab")</script> & notes',
+      path: join(value.workspace, "plan.md"),
+      attention: "review",
+    });
+    const response = await authorized(value, `/d/${value.document.id}`);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /<title>&lt;\/title&gt;&lt;script&gt;alert\(&quot;tab&quot;\)&lt;\/script&gt; &amp; notes<\/title>/);
+    assert.doesNotMatch(html, /<script>alert\("tab"\)<\/script>/);
+
+    const unknown = await authorized(value, "/d/doc-00000000000000000000");
+    assert.equal(unknown.status, 200);
+    assert.match(await unknown.text(), /<title>mdmaid\.desk<\/title>/);
   } finally {
     await closeFixture(value);
   }

@@ -2338,7 +2338,13 @@ async function boot(): Promise<void> {
     if (readerToolbar) observer.observe(readerToolbar);
   }
 
+  function renderBrowserTitle(): void {
+    document.title = state.documents.find(({ id }) => id === state.selectedId)
+      ?.title ?? "mdmaid.desk";
+  }
+
   function render(): void {
+    renderBrowserTitle();
     const preview = Boolean(previewFor(state.selectedId));
     document.body.classList.toggle("live-preview", preview);
     previewNotice.hidden = !preview && !previewEnded;
@@ -3665,6 +3671,7 @@ async function boot(): Promise<void> {
     updateExportAvailability();
     exportStatus.textContent = "";
     const selected = state.documents.find((item) => item.id === id);
+    renderBrowserTitle();
     renderReaderMetadata(selected);
     renderReviewPanel(id);
     if (!options.markOpened && selected && isSourceMissing(selected)) {
@@ -4061,6 +4068,7 @@ async function boot(): Promise<void> {
     feedbackPanel.setAttribute("hidden", "");
     reviewPanel.setAttribute("hidden", "");
     state.selectedId = undefined;
+    renderBrowserTitle();
     reader.setAttribute("hidden", "");
     readerToc.setAttribute("hidden", "");
     readerTocList.replaceChildren();
