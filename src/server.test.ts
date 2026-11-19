@@ -127,6 +127,8 @@ test("serves health publicly and protects catalog APIs", async () => {
           "scoped-content-v1",
           "workspace-reconciliation-v1",
           "document-feedback-v1",
+          "live-buffer-previews-v1",
+          "preview-scroll-v1",
         ],
       },
     });

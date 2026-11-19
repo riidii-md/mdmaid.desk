@@ -32,6 +32,7 @@ import {
   renderTui,
   runTui,
   shouldRefreshTuiReader,
+  scrollTuiReaderToProgress,
 } from "./tui.js";
 
 const documents: PublicDocument[] = [
@@ -1410,3 +1411,18 @@ async function eventually(predicate: () => boolean): Promise<void> {
   }
   assert.fail("condition was not reached");
 }
+
+
+test("source scroll progress reaches the top and bottom of the rendered document", () => {
+  const reader = applyTuiReader(createTuiState(documents, workspaces), documents[0]!,
+    Array.from({ length: 100 }, (_, i) => "Document row " + String(i + 1).padStart(3, "0")).join("\n"),
+    "markdown", []);
+  const middle = scrollTuiReaderToProgress(reader, 0.5, 30);
+  assert.ok(middle.scroll > 0);
+  const bottom = scrollTuiReaderToProgress(reader, 1, 30);
+  assert.match(renderTui(bottom, 100, 30), /Document row 100/);
+  assert.doesNotMatch(renderTui(bottom, 100, 30), /Document row 001/);
+  const top = scrollTuiReaderToProgress(bottom, 0, 30);
+  assert.match(renderTui(top, 100, 30), /Document row 001/);
+  assert.equal(scrollTuiReaderToProgress(reader, 1, 500).scroll, 0);
+});

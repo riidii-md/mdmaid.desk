@@ -1720,6 +1720,17 @@ async function boot(): Promise<void> {
   let contentsPreference: boolean | undefined;
   const readerTitle = element("reader-title");
   const readerMeta = element("reader-meta");
+  const initialPreviewDocument = location.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/)?.[1];
+  let initialPreviewId = new URLSearchParams(location.search).get("preview");
+  const previewFor = (id: string | undefined): string | undefined =>
+    id === initialPreviewDocument && initialPreviewId && /^preview-[a-f0-9]{32}$/.test(initialPreviewId)
+      ? initialPreviewId : undefined;
+  let previewEnded = false;
+  const previewNotice = document.createElement("p");
+  previewNotice.id = "live-preview-notice";
+  previewNotice.textContent = "Unsaved editor preview";
+  previewNotice.hidden = true;
+  readerMeta.after(previewNotice);
   const feedbackPanel = element("feedback-panel");
   const feedbackGeneralMessage = element("feedback-general-message") as HTMLTextAreaElement;
   const feedbackError = element("feedback-error");
@@ -1874,11 +1885,16 @@ async function boot(): Promise<void> {
   }
 
   function currentRoute(route = location.pathname): string {
-    return workspaceRouteWithState(route, {
+    const result = workspaceRouteWithState(route, {
       selectedSpace: state.selectedSpace,
       contentMode: state.filters.contentMode ?? "docs",
       actionsOnly: state.filters.actionsOnly === true,
     });
+    const url = new URL(result, location.origin);
+    const id = url.pathname.match(/^\/d\/(doc-[a-f0-9]{20})$/)?.[1];
+    const preview = previewFor(id);
+    if (preview) url.searchParams.set("preview", preview);
+    return url.pathname + url.search + url.hash;
   }
 
   function currentProjectRoute(): string {
@@ -1907,6 +1923,9 @@ async function boot(): Promise<void> {
     init: RequestInit = {},
     scoped = true,
   ): Promise<T> {
+    if (previewFor(state.selectedId) && init.method && init.method !== "GET") {
+      throw new Error("Save and reopen the source before submitting feedback or changing document state");
+    }
     const response = await fetch(scoped ? scopedPath(path) : path, {
       ...init,
       headers: {
@@ -2320,6 +2339,9 @@ async function boot(): Promise<void> {
   }
 
   function render(): void {
+    const preview = Boolean(previewFor(state.selectedId));
+    document.body.classList.toggle("live-preview", preview);
+    previewNotice.hidden = !preview && !previewEnded;
     renderReaderLayout();
     renderProjects();
     renderStatusCounts();
@@ -3659,7 +3681,7 @@ async function boot(): Promise<void> {
     let documentRendered = false;
     try {
       const rendered = await api<RenderedDocument>(
-        `/api/v1/documents/${id}/render?target=web`,
+        `/api/v1/documents/${id}/render?target=web${previewFor(id) ? "&preview=" + previewFor(id) : ""}`,
       );
       if (sequence !== renderSequence || state.selectedId !== id) {
         return;
@@ -3746,7 +3768,7 @@ async function boot(): Promise<void> {
       readerReady = true;
       updateExportAvailability();
       void loadFeedbackHistory(id);
-      if (!options.markOpened) {
+      if (!options.markOpened || previewFor(id)) {
         return;
       }
       const updated = await api<WebDocument>(
@@ -3759,6 +3781,17 @@ async function boot(): Promise<void> {
       replaceDocument(updated);
     } catch (error) {
       if (sequence !== renderSequence || state.selectedId !== id) {
+        return;
+      }
+      if (error instanceof WebApiError && error.code === "preview_closed" && previewFor(id)) {
+        initialPreviewId = null;
+        previewEnded = true;
+        previewNotice.textContent = "Editor preview ended; showing saved source.";
+        const url = new URL(location.href);
+        url.searchParams.delete("preview");
+        history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+        render();
+        await renderSelectedDocument(id, { ...options, markOpened: false, pushHistory: false });
         return;
       }
       if (error instanceof WebApiError && error.code === "source_missing") {
@@ -4619,6 +4652,9 @@ async function boot(): Promise<void> {
   };
   events.addEventListener("ready", refreshCatalog);
   events.addEventListener("catalog-invalidated", refreshCatalog);
+  events.addEventListener("preview-invalidated", () => {
+    if (previewFor(state.selectedId)) refreshCatalog();
+  });
   events.addEventListener("error", () => {
     setLiveStatus("reconnecting", true);
   });

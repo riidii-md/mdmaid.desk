@@ -155,6 +155,7 @@ export interface TerminalRenderPreferences {
 }
 
 export interface WebRender {
+  preview?: import("./preview-sessions.js").PreviewInfo;
   document: PublicDocument;
   target: "web";
   content: string;
@@ -164,6 +165,7 @@ export interface WebRender {
 }
 
 export interface TerminalRender {
+  preview?: import("./preview-sessions.js").PreviewInfo;
   document: PublicDocument;
   target: "terminal";
   content: string;

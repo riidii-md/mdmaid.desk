@@ -533,3 +533,44 @@ CLI:         mdmaid-desk
 
 A future `mdmaid desk ...` umbrella command may delegate to this package, but
 the repositories and release cycles remain separate.
+
+## Editor buffer previews
+
+Clients can stream unsaved Markdown over one authenticated daemon connection
+without changing the original source or its persisted document revision:
+
+```sh
+mdmaid-desk preview --document doc-0123456789abcdefabcd
+# stdin: {"version":1,"content":"# Unsaved text\n"} followed by a newline
+```
+
+The command emits versioned JSON receipts with a temporary preview ID and a
+document route carrying `?preview=<id>`. Subsequent newline-delimited snapshots
+must increase the buffer version. Web readers at that route refresh while the
+stream is open; ordinary readers continue to render the saved source. Content
+is kept in memory (2 MiB per preview, 32 concurrent previews), and stream EOF,
+disconnection, or server shutdown releases it. Invalid or stale producer input
+cannot overwrite a newer snapshot. Preview feedback/review actions are disabled;
+saved content and review history remain authoritative.
+
+With a `preview-scroll-v1` service, the same stream also accepts
+`{"version":1,"scroll":0.5}` to move a terminal reader to 50% of its scrollable
+document. Scroll-only updates use the current buffer version; newer versions
+must include content. Content and scroll can share one update. Receipts include
+`viewport: { progress, revision }`, and authenticated
+`GET /api/v1/documents/<id>/preview/<preview-id>` reads this metadata without
+rendering the document. Viewport changes emit `preview-scrolled` events and do
+not change saved revisions or content witnesses. Web readers ignore these
+scroll events. Terminal navigation never writes back to the producer.
+
+Open a specific document directly in the terminal client:
+
+```sh
+mdmaid-desk tui --document doc-0123456789abcdefabcd
+mdmaid-desk tui --document doc-0123456789abcdefabcd --preview preview-0123456789abcdef0123456789abcdef
+```
+
+These are generic CLI/API capabilities; editor buffers, layouts, keymaps, and
+return-to-source behavior belong to the editor integration. The authenticated
+stream endpoint is `POST /api/v1/documents/<id>/preview` with
+`application/x-ndjson`; render requests accept `preview=<id>`.

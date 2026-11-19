@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import type { Readable } from "node:stream";
+import { pipePreview } from "./preview-client.js";
+import type { TuiIo } from "./tui.js";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -171,7 +174,8 @@ Usage:
   mdmaid-desk list [--workspace <id>] [--task <id>]
   mdmaid-desk web [--port <port>]
       [--public-url <http[s]://name.localhost[:port]>]
-  mdmaid-desk tui
+  mdmaid-desk tui [--document <id>] [--preview <id>]
+  mdmaid-desk preview --document <id>  # NDJSON buffer updates on stdin
   mdmaid-desk daemon start [--port <port>]
   mdmaid-desk daemon status
   mdmaid-desk daemon stop
@@ -212,7 +216,8 @@ export interface RunOptions {
   installUserService?: (statePath: string, port?: number) => Promise<unknown>;
   uninstallUserService?: (statePath: string) => Promise<unknown>;
   startServer?: (options: DeskServerOptions) => Promise<RunningDeskServer>;
-  runTui?: (client: DeskApiClient) => Promise<void>;
+  runTui?: (client: DeskApiClient, io?: TuiIo) => Promise<void>;
+  input?: Readable;
   waitForShutdown?: (server: RunningDeskServer) => Promise<void>;
   ensureTraefikRoute?: () => Promise<boolean>;
   signal?: AbortSignal;
@@ -283,6 +288,9 @@ export async function run(
       } finally {
         catalog.close();
       }
+    }
+    if (args[0] === "preview") {
+      return await runPreview(statePath, args.slice(1), stdout, options);
     }
     if (args[0] === "tui") {
       return await runTerminal(statePath, args.slice(1), options);
@@ -796,17 +804,41 @@ function parseWebConfiguration(args: string[]): WebConfiguration {
   };
 }
 
+async function runPreview(
+  statePath: string, args: string[], stdout: Writer, options: RunOptions,
+): Promise<number> {
+  const parsed = parseArguments(args);
+  rejectUnknownOptions(parsed, new Set(["document"]));
+  const documentId = requiredOption(parsed, "document");
+  if (parsed.positionals.length || !/^doc-[a-f0-9]{20}$/.test(documentId)) {
+    throw new UsageError("preview requires --document <document-id>");
+  }
+  const connection = await (options.connectDaemonInfo ?? connectToDaemonInfo)(statePath);
+  if (!connection) throw new Error("Start the shared mdmaid-desk daemon before opening an editor preview");
+  await connection.client.requireCapabilities("live-buffer-previews-v1");
+  await pipePreview(connection.url, connection.descriptor.token, documentId, options.input ?? process.stdin,
+    (preview) => stdout.write(JSON.stringify({ schemaVersion: 1, preview }) + "\n"), options.signal);
+  return 0;
+}
+
 async function runTerminal(
   statePath: string,
   args: string[],
   options: RunOptions,
 ): Promise<number> {
-  if (args.length > 0) {
-    throw new UsageError("tui accepts no arguments");
+  const parsed = parseArguments(args);
+  rejectUnknownOptions(parsed, new Set(["document", "preview"]));
+  if (parsed.positionals.length) throw new UsageError("tui accepts options only");
+  const documentId = firstOption(parsed, "document");
+  const previewId = firstOption(parsed, "preview");
+  if (documentId && !/^doc-[a-f0-9]{20}$/.test(documentId)) throw new UsageError("Invalid document ID");
+  if (previewId && (!documentId || !/^preview-[a-f0-9]{32}$/.test(previewId))) {
+    throw new UsageError("--preview requires --document and a valid preview ID");
   }
+  const io: TuiIo = { ...(documentId ? { documentId } : {}), ...(previewId ? { previewId } : {}) };
   const running = await (options.connectDaemon ?? connectToDaemon)(statePath);
   if (running) {
-    await (options.runTui ?? runTerminalWorkspace)(running);
+    await (options.runTui ?? runTerminalWorkspace)(running, io);
     return 0;
   }
   const catalog = await Catalog.open(statePath);
@@ -815,7 +847,7 @@ async function runTerminal(
     const server = await startServer({ catalog, host: "127.0.0.1", port: 0 });
     try {
       const client = new DeskApiClient(server.url, server.token);
-      await (options.runTui ?? runTerminalWorkspace)(client);
+      await (options.runTui ?? runTerminalWorkspace)(client, io);
     } finally {
       await server.close();
     }
