@@ -33,6 +33,7 @@ import type {
   WorkspaceRegistration,
   WorkspaceReconciliationRequest,
 } from "./api-types.js";
+import { isPreviewInfo, type PreviewInfo } from "./preview-sessions.js";
 import { isChangeReviewDiff } from "./change-review.js";
 import type { MermaidValidationReport } from "./mermaid-validation.js";
 
@@ -73,6 +74,8 @@ export interface CatalogEvent {
 }
 
 export interface CatalogSubscriptionOptions {
+  includePreviews?: boolean;
+  onPreviewScroll?: () => void;
   signal?: AbortSignal;
   onReady?: () => void;
 }
@@ -415,12 +418,27 @@ export class DeskApiClient {
     return value;
   }
 
+  async getPreview(documentId: string, previewId: string, scope: ContentScope = {}): Promise<PreviewInfo> {
+    assertDocumentId(documentId);
+    if (!/^preview-[a-f0-9]{32}$/.test(previewId)) throw new Error("Invalid preview ID");
+    const query = new URLSearchParams();
+    addScope(query, scope);
+    const value = await this.#request(
+      `/api/v1/documents/${documentId}/preview/${previewId}${query.size ? "?" + query : ""}`,
+    );
+    if (!isPreviewInfo(value) || value.documentId !== documentId || value.id !== previewId) {
+      throw new Error("Daemon returned invalid preview metadata");
+    }
+    return value;
+  }
+
   async renderDocument(
     id: string,
     target: "terminal",
     width?: number,
     preferences?: TerminalRenderPreferences,
     scope?: ContentScope,
+    previewId?: string,
   ): Promise<TerminalRender>;
   async renderDocument(
     id: string,
@@ -428,6 +446,7 @@ export class DeskApiClient {
     width?: number,
     preferences?: undefined,
     scope?: ContentScope,
+    previewId?: string,
   ): Promise<WebRender>;
   async renderDocument(
     id: string,
@@ -435,12 +454,14 @@ export class DeskApiClient {
     width = 100,
     preferences: TerminalRenderPreferences = {},
     scope: ContentScope = {},
+    previewId?: string,
   ): Promise<TerminalRender | WebRender> {
     assertDocumentId(id);
     if (!Number.isSafeInteger(width) || width < 20 || width > 1_000) {
       throw new Error("render width must be an integer between 20 and 1000");
     }
     const query = new URLSearchParams({ target });
+    if (previewId) query.set("preview", previewId);
     if (target === "terminal") {
       query.set("width", String(width));
       if (preferences.color !== undefined) {
@@ -587,7 +608,7 @@ export class DeskApiClient {
         while (boundary >= 0) {
           const block = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-          dispatchEventBlock(block, listener, options.onReady);
+          dispatchEventBlock(block, listener, options.onReady, options.includePreviews, options.onPreviewScroll);
           boundary = buffer.indexOf("\n\n");
         }
       }
@@ -882,6 +903,7 @@ function isWebRender(value: unknown): value is WebRender {
     typeof value.sourceWitness === "string" &&
     /^witness-[a-f0-9]{64}$/.test(value.sourceWitness) &&
     isMarkdownSourceMap(value.sourceMap) &&
+    (value.preview === undefined || isPreviewInfo(value.preview)) &&
     (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
@@ -898,6 +920,7 @@ function isTerminalRender(value: unknown): value is TerminalRender {
     typeof value.sourceWitness === "string" &&
     /^witness-[a-f0-9]{64}$/.test(value.sourceWitness) &&
     isMarkdownSourceMap(value.sourceMap) &&
+    (value.preview === undefined || isPreviewInfo(value.preview)) &&
     (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );
@@ -1028,6 +1051,8 @@ function dispatchEventBlock(
   block: string,
   listener: (event: CatalogEvent) => void,
   onReady: (() => void) | undefined,
+  includePreviews = false,
+  onPreviewScroll?: () => void,
 ): void {
   let type = "message";
   const data: string[] = [];
@@ -1042,7 +1067,8 @@ function dispatchEventBlock(
     onReady?.();
     return;
   }
-  if (type !== "catalog-invalidated") {
+  const viewportEvent = includePreviews && type === "preview-scrolled" && onPreviewScroll !== undefined;
+  if (type !== "catalog-invalidated" && !(includePreviews && type === "preview-invalidated") && !viewportEvent) {
     return;
   }
   let value: unknown;
@@ -1054,7 +1080,8 @@ function dispatchEventBlock(
   if (!isRecord(value) || Object.keys(value).length !== 0) {
     throw new Error("Daemon returned an invalid catalog event");
   }
-  listener({});
+  if (viewportEvent) onPreviewScroll!();
+  else listener({});
 }
 
 function optionalString(value: unknown): boolean {

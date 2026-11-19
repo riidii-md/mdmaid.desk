@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { PreviewError, PreviewSessions, servePreview } from "./preview-sessions.js";
 import { readFile } from "node:fs/promises";
 import {
   createServer,
@@ -182,6 +183,10 @@ export async function startDeskServer(
   ]);
 
   const events = new EventHub();
+  const previews = new PreviewSessions(
+    () => events.publish("preview-invalidated", {}),
+    () => events.publish("preview-scrolled", {}),
+  );
   const unsubscribeInvalidation = options.catalog.subscribeInvalidation(() => {
     events.publish("catalog-invalidated", {});
   });
@@ -199,13 +204,16 @@ export async function startDeskServer(
       webClient,
       documentExport,
       liveSources,
+      previews,
     ).catch((error: unknown) => {
       if (response.headersSent) {
         response.destroy();
         return;
       }
       const normalized =
-        error instanceof HttpError
+        error instanceof PreviewError
+          ? new HttpError(error.status, error.code, error.message)
+          : error instanceof HttpError
           ? error
           : new HttpError(500, "internal_error", "Internal server error");
       sendJson(response, normalized.status, {
@@ -246,6 +254,7 @@ export async function startDeskServer(
     url,
     webUrl: `${publicOrigin ?? url}/?token=${encodeURIComponent(token)}`,
     close: async () => {
+      previews.close();
       unsubscribeInvalidation();
       await liveSources?.close();
       events.close();
@@ -266,6 +275,7 @@ async function handleRequest(
   webClient: Buffer,
   documentExport: Buffer,
   liveSources: LiveSourceCoordinator | undefined,
+  previews: PreviewSessions,
 ): Promise<void> {
   applySecurityHeaders(response, securePublicOrigin);
   const baseUrl =
@@ -286,6 +296,8 @@ async function handleRequest(
           "scoped-content-v1",
           "workspace-reconciliation-v1",
           "document-feedback-v1",
+          "live-buffer-previews-v1",
+          "preview-scroll-v1",
         ],
       },
     });
@@ -818,6 +830,29 @@ async function handleRequest(
     return;
   }
 
+  const previewInfoMatch = url.pathname.match(
+    /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/preview\/(preview-[a-f0-9]{32})$/,
+  );
+  if (request.method === "GET" && previewInfoMatch) {
+    const scope = parseContentScope(url.searchParams, catalog);
+    const id = previewInfoMatch[1] ?? "";
+    if (!catalog.getDocument(id, scope)) throw new HttpError(404, "not_found", "Document not found");
+    sendJson(response, 200, { data: previews.get(previewInfoMatch[2] ?? "", id).info });
+    return;
+  }
+
+  const previewMatch = url.pathname.match(/^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/preview$/);
+  if (request.method === "POST" && previewMatch) {
+    const id = previewMatch[1] ?? "";
+    const scope = parseContentScope(url.searchParams, catalog);
+    const { document } = await readDocument(catalog, id, scope);
+    if (document.storage !== "reference") {
+      throw new HttpError(422, "invalid_preview", "Editor previews require a live source document");
+    }
+    await servePreview(request, response, id, previews);
+    return;
+  }
+
   const renderMatch = url.pathname.match(
     /^\/api\/v1\/documents\/(doc-[a-f0-9]{20})\/render$/,
   );
@@ -854,7 +889,14 @@ async function handleRequest(
     if (target !== "web" && target !== "terminal") {
       throw new HttpError(400, "invalid_target", "Unknown render target");
     }
-    const { content, document } = await readDocument(catalog, id, scope);
+    const source = await readDocument(catalog, id, scope);
+    const previewId = url.searchParams.get("preview");
+    const preview = previewId ? previews.get(previewId, id) : undefined;
+    const content = preview?.content ?? source.content;
+    const document = source.document;
+    const sourceWitness = preview
+      ? "witness-" + createHash("sha256").update(JSON.stringify({ id: preview.info.id, version: preview.info.version, content: preview.content })).digest("hex")
+      : catalog.feedbackSourceWitness(document.id, scope);
     const changeReview = document.kind === "change-review"
       ? parseChangeReviewDiffs(content)
       : undefined;
@@ -881,7 +923,8 @@ async function handleRequest(
           document: publicDocument(current),
           target,
           content: rendered,
-          sourceWitness: catalog.feedbackSourceWitness(current.id, scope),
+          sourceWitness,
+          ...(preview ? { preview: preview.info } : {}),
           sourceMap: renderedMarkdown.sourceMap,
           ...(changeReview === undefined ? {} : { changeReview }),
         },
@@ -915,7 +958,8 @@ async function handleRequest(
         content: sanitizeTerminalText(rendered.output, { preserveSgr: true }),
         backend: rendered.backend,
         warnings: rendered.warnings.map((warning) => sanitizeTerminalText(warning)),
-        sourceWitness: catalog.feedbackSourceWitness(current.id, scope),
+        sourceWitness,
+          ...(preview ? { preview: preview.info } : {}),
         sourceMap: rendered.sourceMap,
         ...(changeReview === undefined ? {} : { changeReview }),
       },

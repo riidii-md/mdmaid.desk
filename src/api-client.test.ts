@@ -136,6 +136,8 @@ test("uses the versioned daemon API for terminal client operations", async () =>
         "scoped-content-v1",
         "workspace-reconciliation-v1",
         "document-feedback-v1",
+        "live-buffer-previews-v1",
+        "preview-scroll-v1",
       ],
     });
     assert.deepEqual(await client.listSpaces(), []);

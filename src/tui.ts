@@ -1,4 +1,5 @@
 import type { ReadStream, WriteStream } from "node:tty";
+import type { PreviewInfo } from "./preview-sessions.js";
 import { randomUUID } from "node:crypto";
 
 import { Chalk, type ChalkInstance } from "chalk";
@@ -73,6 +74,7 @@ interface TuiReader {
   feedbackHistory: PublicFeedbackSubmission[];
   sourceWitness?: string;
   sourceLineIndex: number;
+  livePreview?: boolean;
   sourceMap?: MarkdownSourceMapV1;
 }
 
@@ -157,6 +159,8 @@ export interface TuiTransition {
 }
 
 export interface TuiIo {
+  documentId?: string;
+  previewId?: string;
   color?: boolean;
   env?: NodeJS.ProcessEnv;
   input?: ReadStream;
@@ -438,6 +442,10 @@ export function handleTuiKey(state: TuiState, key: string): TuiTransition {
   if (key === "ctrl-c") {
     return { state, effects: [{ type: "quit" }] };
   }
+  if (state.mode === "reader" && state.reader?.livePreview &&
+      !["q", "ctrl-c", "b", "escape", "j", "k", "up", "down", "pageup", "pagedown", "ctrl-d", "ctrl-u", "home", "end"].includes(key)) {
+    return { state, effects: [] };
+  }
   if (state.confirmation) {
     if (key === "y") {
       return {
@@ -550,6 +558,8 @@ export function renderTui(
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
   const footer = state.confirmation
     ? `${theme.accent(theme.styles.bold("CONFIRM"))} ${theme.ink(confirmationMessage(state.confirmation))}  ${theme.accent("y")} yes  ${theme.accent("n")} no`
+    : state.reader?.livePreview
+    ? renderShortcutBar([["j/k", "scroll"], ["b", "queue"], ["q", "return to editor"]], theme)
     : state.annotationComposer
     ? renderShortcutBar(
         [["enter", "newline"], ["ctrl-d", "save note"], ["esc", "cancel"]],
@@ -617,7 +627,7 @@ export async function runTui(
     (io.color ?? Boolean(output.isTTY && env.TERM !== "dumb"));
   const unicode = io.unicode ?? env.TERM !== "dumb";
   if (typeof client.requireCapabilities === "function") {
-    await client.requireCapabilities("spaces-v1", "scoped-content-v1");
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1", ...(io.previewId ? ["live-buffer-previews-v1"] : []));
   }
   const [initialDocuments, initialWorkspaces, initialReviewRequests, spaces] =
     await Promise.all([
@@ -642,6 +652,11 @@ export async function runTui(
   let resizeTimer: NodeJS.Timeout | undefined;
   let renderedWidth = readerRenderWidth(output.columns ?? 100);
   let renderedRevision: number | undefined;
+  let latestPreview: PreviewInfo | undefined;
+  let renderedPreviewVersion: number | undefined;
+  let appliedViewportRevision = -1;
+  let scrollRefreshRequested = false;
+  let scrollRefreshRunning = false;
   let inputBuffer = "";
   let previousFrame: string[] | undefined;
   const currentScope = (): { spaceId?: string } =>
@@ -660,7 +675,35 @@ export async function runTui(
     context.generation === state.scopeGeneration &&
     context.scope.spaceId === state.selectedSpace;
 
+  const previewFor = (id: string): string | undefined => id === io.documentId ? io.previewId : undefined;
+  const rememberPreview = (info: PreviewInfo | undefined): void => {
+    if (!info || info.id !== io.previewId || info.documentId !== io.documentId) return;
+    if (!latestPreview || info.version > latestPreview.version ||
+        (info.version === latestPreview.version && (info.viewport?.revision ?? -1) >= (latestPreview.viewport?.revision ?? -1))) {
+      latestPreview = info;
+    }
+  };
+  const rememberRenderedPreview = (info: PreviewInfo | undefined, previousViewportRevision: number): void => {
+    renderedPreviewVersion = info?.version;
+    rememberPreview(info);
+    // A scroll event received during rendering must survive restoring the old view.
+    if (appliedViewportRevision !== previousViewportRevision) appliedViewportRevision = -1;
+  };
+  const applyPreviewViewport = (): void => {
+    const viewport = latestPreview?.viewport;
+    if (!state.reader || state.reader.document.id !== io.documentId ||
+        !viewport || latestPreview!.version !== renderedPreviewVersion || viewport.revision <= appliedViewportRevision) return;
+    state = scrollTuiReaderToProgress(state, viewport.progress, output.rows ?? 30);
+    appliedViewportRevision = viewport.revision;
+  };
   const draw = (): void => {
+    if (state.reader && previewFor(state.reader.document.id)) {
+      state.reader.livePreview = true;
+      state.reader.changeView = "document";
+      delete state.reader.sourceMap;
+      delete state.reader.sourceWitness;
+    }
+    applyPreviewViewport();
     const width = output.columns ?? 100;
     const height = output.rows ?? 30;
     const frame = renderTui(state, width, height, { color, unicode });
@@ -740,6 +783,7 @@ export async function runTui(
           readerRenderWidth(output.columns ?? 100),
           { color, unicode },
           scope,
+          previewFor(effect.documentId),
         );
         if (!scopeContextMatches(context)) {
           return;
@@ -756,8 +800,10 @@ export async function runTui(
           rendered.sourceMap,
           rendered.sourceWitness,
         );
+        appliedViewportRevision = -1;
+        rememberRenderedPreview(rendered.preview, -1);
         draw();
-        await client.act(effect.documentId, "opened", scope);
+        if (!previewFor(effect.documentId)) await client.act(effect.documentId, "opened", scope);
         if (!scopeContextMatches(context)) {
           return;
         }
@@ -947,12 +993,14 @@ export async function runTui(
       const context = scopeContext();
       processing = processing.then(async () => {
         try {
+          const viewportBeforeRender = appliedViewportRevision;
           const rendered = await client.renderDocument(
             documentId,
             "terminal",
             nextWidth,
             { color, unicode },
             context.scope,
+            previewFor(documentId),
           );
           if (!scopeContextMatches(context)) {
             return;
@@ -970,6 +1018,7 @@ export async function runTui(
             rendered.sourceMap,
           );
           state = { ...state, scroll };
+          rememberRenderedPreview(rendered.preview, viewportBeforeRender);
           draw();
         } catch (error) {
           if (!scopeContextMatches(context)) {
@@ -989,6 +1038,13 @@ export async function runTui(
   if (input.isTTY) {
     input.setRawMode(true);
   }
+  if (io.documentId) {
+    if (!initialDocuments.some(({ id }) => id === io.documentId)) {
+      cleanup();
+      throw new Error("Requested document is not available");
+    }
+    await execute({ type: "open", documentId: io.documentId }, scopeContext());
+  }
   input.resume();
   input.on("data", onData);
   process.on("SIGWINCH", onResize);
@@ -1003,6 +1059,7 @@ export async function runTui(
           const readerDocumentId = state.reader?.document.id;
           const refreshReader = readerDocumentId !== undefined;
           const scroll = state.scroll;
+          const viewportBeforeRender = appliedViewportRevision;
           const [documents, workspaces, reviewRequests, spaces] = await Promise.all([
             client.listDocuments(context.scope, documentFilters()),
             client.listWorkspaces(context.scope),
@@ -1035,6 +1092,7 @@ export async function runTui(
                 width,
                 { color, unicode },
                 context.scope,
+                previewFor(readerDocumentId),
               );
               if (!scopeContextMatches(context)) {
                 return;
@@ -1068,6 +1126,7 @@ export async function runTui(
                 { ...state, scroll },
                 output.rows ?? 30,
               );
+              rememberRenderedPreview(rendered.preview, viewportBeforeRender);
             }
           }
           draw();
@@ -1097,6 +1156,28 @@ export async function runTui(
           }
         });
   };
+  const schedulePreviewScroll = (): void => {
+    if (!io.documentId || !io.previewId || finished) return;
+    scrollRefreshRequested = true;
+    if (scrollRefreshRunning) return;
+    scrollRefreshRunning = true;
+    void (async () => {
+      try {
+        while (scrollRefreshRequested && !finished) {
+          scrollRefreshRequested = false;
+          const context = scopeContext();
+          try {
+            const info = await client.getPreview(io.documentId!, io.previewId!, context.scope);
+            if (finished || !scopeContextMatches(context)) continue;
+            rememberPreview(info);
+            draw();
+          } catch {
+            // Reconnect or the content refresh handles an ended preview.
+          }
+        }
+      } finally { scrollRefreshRunning = false; }
+    })();
+  };
   const waitForReconnect = (): Promise<void> =>
     new Promise((resolve) => {
       const onAbort = (): void => {
@@ -1114,6 +1195,8 @@ export async function runTui(
       try {
         await client.subscribeCatalog(scheduleCatalogRefresh, {
           signal: eventController.signal,
+          includePreviews: Boolean(io.previewId),
+          onPreviewScroll: schedulePreviewScroll,
           onReady: scheduleCatalogRefresh,
         });
       } catch (error) {
@@ -2123,6 +2206,12 @@ function confirmationMessage(confirmation: TuiConfirmation): string {
     : `Purge ${count} documents forever? This cannot be undone.`;
 }
 
+export function scrollTuiReaderToProgress(state: TuiState, progress: number, terminalHeight: number): TuiState {
+  if (!state.reader || !Number.isFinite(progress)) return state;
+  const maximum = clampReaderScroll({ ...state, scroll: Number.MAX_SAFE_INTEGER }, terminalHeight).scroll;
+  return { ...state, scroll: Math.round(clamp(progress, 0, 1) * maximum) };
+}
+
 function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
   if (!state.reader) {
     return state;
@@ -2913,7 +3002,7 @@ function readerLines(
     document.workspaceId,
     document.taskId,
     document.kind,
-    documentStorageLabel(document.storage),
+    state.reader.livePreview ? "unsaved preview" : documentStorageLabel(document.storage),
     state.reader.backend,
   ].filter((value): value is string => Boolean(value)).join(" · ");
   const heading = spread(
@@ -2942,7 +3031,7 @@ function readerLines(
   const content = sanitizeTerminalText(state.reader.content, {
     preserveSgr: theme.color,
   }).split("\n");
-  const requests = state.reviewRequests.filter(
+  const requests = state.reader?.livePreview ? [] : state.reviewRequests.filter(
     (request) => request.documentId === document.id,
   );
   const review =
@@ -3447,7 +3536,7 @@ function terminalInlineFeedbackLines(
 function allReviewFeedbackItems(state: TuiState): ReviewFeedbackItem[] {
   const reader = state.reader;
   if (!reader) return [];
-  const requests = state.reviewRequests.filter(
+  const requests = state.reader?.livePreview ? [] : state.reviewRequests.filter(
     (request) => request.documentId === reader.document.id,
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];
@@ -3508,7 +3597,7 @@ function reviewFeedbackLines(
   if (!reader) {
     return [];
   }
-  const requests = state.reviewRequests.filter(
+  const requests = state.reader?.livePreview ? [] : state.reviewRequests.filter(
     (request) => request.documentId === reader.document.id,
   );
   const request = pendingReviewForDocument(requests, reader.document.id) ?? requests[0];

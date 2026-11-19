@@ -994,4 +994,11 @@ button.diff-line-number.selected-range {
   .source-viewer { padding: 18px 12px 36px; }
   .source-code { font-size: 12px; }
 }
+
+.live-preview #feedback-panel, .live-preview #review-panel,
+.live-preview #document-feedback-add-selection, .live-preview #archive,
+.live-preview #restore, .live-preview #purge, .live-preview #mark-read,
+.live-preview #mark-unread, .live-preview #export-print, .live-preview #export-pdf,
+.live-preview #export-html { display: none !important; }
+#live-preview-notice { color: var(--accent); }
 `;
