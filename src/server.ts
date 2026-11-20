@@ -400,8 +400,14 @@ async function handleRequest(
       /^\/w\/[a-z0-9][a-z0-9-]{0,63}$/.test(url.pathname) ||
       /^\/p\/project-[a-f0-9]{20}$/.test(url.pathname))
   ) {
-    parseWorkspaceQueryState(url.searchParams, catalog);
-    sendHtml(response, 200, workspaceHtml(url.pathname));
+    const scope = parseWorkspaceQueryState(url.searchParams, catalog);
+    const documentId = url.pathname.startsWith("/d/")
+      ? url.pathname.slice(3)
+      : undefined;
+    const title = documentId === undefined
+      ? undefined
+      : catalog.getDocument(documentId, scope)?.title;
+    sendHtml(response, 200, workspaceHtml(url.pathname, title));
     return;
   }
 
@@ -1859,7 +1865,7 @@ function sendDocumentMedia(
   response.end(body);
 }
 
-function workspaceHtml(pathname: string): string {
+function workspaceHtml(pathname: string, title = "mdmaid.desk"): string {
   const documentId = pathname.startsWith("/d/") ? pathname.slice(3) : "";
   const feedbackId = pathname.startsWith("/f/") ? pathname.slice(3) : "";
   const workspaceId = pathname.startsWith("/w/") ? pathname.slice(3) : "";
@@ -1869,7 +1875,7 @@ function workspaceHtml(pathname: string): string {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>mdmaid.desk</title>
+    <title>${escapeHtml(title)}</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="preload" href="/assets/departure-mono.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="/assets/app.css">

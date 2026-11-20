@@ -71,6 +71,7 @@ test("shows the complete selected-file diff without hunk navigation", async ({ p
       "return secureFallback;",
     );
   } finally {
+    await page.context().close();
     await server.close();
     catalog.close();
     await rm(root, { recursive: true, force: true });

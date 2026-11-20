@@ -102,6 +102,7 @@ test("confirms archive and purge while supporting bulk restore", async ({ page }
     await access(value.first.path);
     await access(value.second.path);
   } finally {
+    await page.context().close();
     await value.close();
   }
 });

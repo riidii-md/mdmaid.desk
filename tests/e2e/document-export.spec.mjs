@@ -9,7 +9,7 @@ import { startDeskServer } from "../../dist/server.js";
 
 const title = "Sharing / report: Проба";
 const test = base.extend({
-  desk: async ({}, use) => {
+  desk: async ({ context }, use) => {
     const root = await mkdtemp(join(tmpdir(), "mdmaid-export-e2e-"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
@@ -39,6 +39,9 @@ const test = base.extend({
     try {
       await use({ server, document, picture, path });
     } finally {
+      // Release the browser's live stream and keep-alive sockets before closing
+      // the server; otherwise Node 22 can wait indefinitely during teardown.
+      await context.close();
       await server.close();
       catalog.close();
       await rm(root, { recursive: true, force: true });

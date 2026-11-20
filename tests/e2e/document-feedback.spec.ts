@@ -251,7 +251,7 @@ for (const width of [1280, 390]) {
       );
       await expect(page.locator("#feedback-history")).toContainText("Define this phrase, please.");
     } finally {
-      await page.close();
+      await page.context().close();
       await server.close();
       catalog.close();
       await rm(root, { recursive: true, force: true });
