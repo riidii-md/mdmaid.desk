@@ -83,6 +83,12 @@ request but are not watched. Without this service, opening or rendering a
 registered document still reconciles its current source; there is simply no
 automatic push event.
 
+Tabs in the same browser share one live-update connection so that opening many
+documents leaves connections available for loading pages and reading sources.
+Another tab takes over when the tab holding the connection closes or freezes.
+Returning to a tab also refreshes its catalog. Browsers that cannot coordinate
+tabs use periodic short requests while the tab is visible.
+
 The Spaces release upgrades the catalog to schema 9. Before the first upgraded
 start, stop the daemon and create the verified schema-8 backup described in
 [Releasing and distribution](./RELEASING.md#schema-9-backup-and-downgrade-recovery).

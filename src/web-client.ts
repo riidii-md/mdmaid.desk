@@ -1654,6 +1654,100 @@ function hasOnlyKeys(
   return Object.keys(value).every((key) => allowed.has(key));
 }
 
+const WEB_LIVE_EVENTS = [
+  "open", "error", "ready", "catalog-invalidated", "preview-invalidated",
+] as const;
+type WebLiveEvent = typeof WEB_LIVE_EVENTS[number];
+
+function startWebLiveEvents(receive: (type: WebLiveEvent) => void): void {
+  const name = "mdmaid-desk-live-events-v1";
+  let stop: (() => void) | undefined;
+
+  function start(): void {
+    if (stop) return;
+    const controller = new AbortController();
+    let channel: BroadcastChannel | undefined;
+    let source: EventSource | undefined;
+    let release: (() => void) | undefined;
+    let timer: number | undefined;
+    let stopped = false;
+    stop = () => {
+      stopped = true;
+      controller.abort();
+      source?.close();
+      channel?.close();
+      release?.();
+      window.clearInterval(timer);
+      stop = undefined;
+    };
+
+    // Refreshes are short requests. Never fall back to a stream per tab when
+    // browser coordination is unavailable or disallowed by privacy settings.
+    const poll = (): void => {
+      if (stopped || timer !== undefined) return;
+      source?.close();
+      release?.();
+      channel?.close();
+      channel = undefined;
+      receive("open");
+      timer = window.setInterval(() => {
+        if (document.visibilityState !== "hidden") receive("ready");
+      }, 2000);
+    };
+    receive("ready");
+    try {
+      if (!navigator.locks || typeof BroadcastChannel === "undefined" ||
+          typeof EventSource === "undefined") {
+        poll();
+        return;
+      }
+      channel = new BroadcastChannel(name);
+      const send = (type: WebLiveEvent): void => {
+        if (stopped) return;
+        receive(type);
+        channel?.postMessage(type);
+      };
+      channel.addEventListener("message", ({ data }: MessageEvent<unknown>) => {
+        if (stopped) return;
+        if (data === "hello") {
+          if (source) send(source.readyState === EventSource.OPEN ? "open" : "error");
+        } else if (WEB_LIVE_EVENTS.some((type) => type === data)) {
+          receive(data as WebLiveEvent);
+        }
+      });
+      channel.postMessage("hello");
+      // The browser releases this exclusive origin-scoped lock if its owner
+      // closes or crashes, letting another tab take over without a heartbeat.
+      void navigator.locks.request(name, { signal: controller.signal }, () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+          if (stopped) {
+            resolve();
+            return;
+          }
+          source = new EventSource("/api/v1/events");
+          for (const type of WEB_LIVE_EVENTS) {
+            source.addEventListener(type, () => send(type));
+          }
+        })
+      ).catch(() => {
+        if (!stopped) poll();
+      });
+    } catch {
+      poll();
+    }
+  }
+
+  window.addEventListener("pagehide", () => stop?.());
+  window.addEventListener("pageshow", start);
+  document.addEventListener("freeze", () => stop?.());
+  document.addEventListener("resume", start);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") receive("ready");
+  });
+  start();
+}
+
 async function boot(): Promise<void> {
   const initialQuery = workspaceQueryState(location.search);
   const state: WebState = {
@@ -4639,10 +4733,6 @@ async function boot(): Promise<void> {
 
   await load();
 
-  const events = new EventSource("/api/v1/events");
-  events.addEventListener("open", () => {
-    setLiveStatus("connected");
-  });
   const refreshCatalog = (): void => {
     catalogRefresh = catalogRefresh
       .then(async () => {
@@ -4658,13 +4748,14 @@ async function boot(): Promise<void> {
       })
       .catch(failClosedLoad);
   };
-  events.addEventListener("ready", refreshCatalog);
-  events.addEventListener("catalog-invalidated", refreshCatalog);
-  events.addEventListener("preview-invalidated", () => {
-    if (previewFor(state.selectedId)) refreshCatalog();
-  });
-  events.addEventListener("error", () => {
-    setLiveStatus("reconnecting", true);
+  startWebLiveEvents((type) => {
+    if (type === "open") {
+      setLiveStatus("connected");
+    } else if (type === "error") {
+      setLiveStatus("reconnecting", true);
+    } else if (type !== "preview-invalidated" || previewFor(state.selectedId)) {
+      refreshCatalog();
+    }
   });
 }
 
