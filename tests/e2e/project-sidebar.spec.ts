@@ -118,6 +118,7 @@ test("global project filter leaves the reader and survives history and reload", 
     await expect(page.getByRole("button", { name: "Open Doc A" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Open Shared project doc" })).toHaveCount(0);
   } finally {
+    await page.context().close();
     await value.close();
   }
 });
@@ -167,6 +168,7 @@ test("late missing-source refresh cannot reopen the reader after a project click
     await expect(page).toHaveURL(new RegExp(`${value.server.url}/(?:\\?view=docs)?$`));
     await expect(page.locator("#document-reader")).toBeHidden();
   } finally {
+    await page.context().close();
     await value.close();
   }
 });
