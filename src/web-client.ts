@@ -1919,6 +1919,7 @@ async function boot(): Promise<void> {
   let catalogRefresh = Promise.resolve();
   let readerReady = false;
   let exportBusy = false;
+  let refreshAfterExport = false;
 
   function updateExportAvailability(): void {
     const selected = state.documents.find(({ id }) => id === state.selectedId);
@@ -1962,6 +1963,10 @@ async function boot(): Promise<void> {
       prepared?.dispose();
       exportBusy = false;
       updateExportAvailability();
+      if (refreshAfterExport) {
+        refreshAfterExport = false;
+        refreshCatalog();
+      }
     }
   }
   let projectPickerOpen = false;
@@ -4736,8 +4741,16 @@ async function boot(): Promise<void> {
   const refreshCatalog = (): void => {
     catalogRefresh = catalogRefresh
       .then(async () => {
+        if (exportBusy) {
+          refreshAfterExport = true;
+          return;
+        }
         const selectedId = state.selectedId;
         await load(false, false);
+        if (exportBusy) {
+          refreshAfterExport = true;
+          return;
+        }
         if (
           selectedId &&
           state.selectedId === selectedId &&

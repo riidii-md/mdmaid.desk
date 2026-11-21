@@ -13,7 +13,7 @@ const test = base.extend({
     const root = await mkdtemp(join(tmpdir(), "mdmaid-export-e2e-"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
-    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP438DwHwAGgAJ/EEwb4QAAAABJRU5ErkJggg==", "base64");
     const picture = join(workspace, "picture.png");
     await writeFile(picture, png);
     await writeFile(join(workspace, "picture.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80"><rect width="200" height="80" fill="orange"/><text x="10" y="40">Local SVG</text></svg>');
@@ -117,6 +117,48 @@ test("print and Save as PDF prepare the full document and restore the reader aft
     await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
   }
   expect(printed).toBe(2);
+});
+
+test("finishes an HTML download when a live refresh arrives during preparation", async ({ page, context, desk }) => {
+  await context.addInitScript(() => {
+    window.catalogEvents = 0;
+    const NativeEventSource = window.EventSource;
+    window.EventSource = class extends NativeEventSource {
+      constructor(...args) {
+        super(...args);
+        this.addEventListener("catalog-invalidated", () => window.catalogEvents++);
+      }
+    };
+  });
+  await openDocument(page, desk);
+  await expect(page.locator("#live-status")).toHaveText(/connected/);
+  let releaseMedia;
+  const mediaGate = new Promise((resolve) => { releaseMedia = resolve; });
+  let mediaRequested;
+  const requested = new Promise((resolve) => { mediaRequested = resolve; });
+  await page.route("**/media/**", async (route) => {
+    mediaRequested();
+    await mediaGate;
+    await route.continue();
+  });
+  const downloading = page.waitForEvent("download", { timeout: 10000 });
+  await page.getByRole("button", { name: "download HTML" }).click();
+  await requested;
+  const before = await page.evaluate(() => window.catalogEvents);
+  await writeFile(desk.path, `${await readFile(desk.path, "utf8")}\n\nSource updated.\n`);
+  const updated = await page.request.post(`${desk.server.url}/api/v1/documents`, {
+    headers: { authorization: `Bearer ${desk.server.token}` },
+    data: {
+      workspaceId: "test", path: desk.path, kind: "change-review", title,
+      attention: "review", tags: ["export-test"],
+    },
+  });
+  expect(updated.ok()).toBe(true);
+  await expect.poll(() => page.evaluate(() => window.catalogEvents)).toBeGreaterThan(before);
+  releaseMedia();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe("Sharing report Проба.html");
+  await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
 });
 
 test("reports a missing picture without downloading or printing an incomplete document", async ({ page, desk }) => {
