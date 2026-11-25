@@ -99,7 +99,7 @@ async function fixture() {
     documentPath: join(workspace, "document.md"),
     source,
     async close(page: Page) {
-      await page.close();
+      await page.context().close();
       await server.close();
       catalog.close();
       await rm(root, { recursive: true, force: true });

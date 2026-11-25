@@ -49,6 +49,7 @@ test("whole-document Web preview updates before save and returns to saved source
   } finally {
     input.end();
     await streaming;
+    await context.close();
     await server.close();
     catalog.close();
     await rm(root, { recursive: true, force: true });

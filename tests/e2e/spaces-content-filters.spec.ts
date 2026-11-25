@@ -170,6 +170,7 @@ test("switches global Spaces across Docs, Change reviews, and Actions", async ({
     await expect(page).not.toHaveURL(/space=/);
     await expect(page.getByRole("button", { name: "Open Work implementation" })).toBeVisible();
   } finally {
+    await page.context().close();
     await server.close();
     catalog.close();
     await rm(root, { recursive: true, force: true });
