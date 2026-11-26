@@ -14,6 +14,7 @@ import {
   documentStorageLabel,
   type BulkDocumentAction,
   type FeedbackSubmissionRegistration,
+  isTerminalBlocks,
   type DocumentAction,
   type PublicDocument,
   type PublicFeedbackSubmission,
@@ -23,6 +24,7 @@ import {
   type ReadingStatus,
   type ReviewOutcome,
   type ReviewFeedbackItem,
+  type TerminalBlock,
 } from "./api-types.js";
 import type { MarkdownSourceMapV1 } from "mdmaid";
 import { sanitizeTerminalText } from "./terminal-text.js";
@@ -61,6 +63,8 @@ interface TuiReader {
   content: string;
   document: PublicDocument;
   warnings: string[];
+  wide: boolean;
+  layout: ReaderLayout;
   changeReview?: ChangeReviewDiff;
   changeView: "document" | "diff";
   changeLayout: "unified" | "side-by-side";
@@ -76,6 +80,19 @@ interface TuiReader {
   sourceLineIndex: number;
   livePreview?: boolean;
   sourceMap?: MarkdownSourceMapV1;
+}
+
+interface ReaderLine {
+  styled: string;
+  plain: string;
+  blockWidth: number;
+  wide: boolean;
+}
+
+interface ReaderLayout {
+  lines: ReaderLine[];
+  maxWidth: number;
+  maxWideWidth: number;
 }
 
 interface TuiReviewComposer {
@@ -130,12 +147,15 @@ export interface TuiState {
   workspaceFilter?: string | undefined;
   workspaces: PublicWorkspace[];
   scroll: number;
+  horizontalScroll: number;
+  readerDrag?: { x: number; y: number; horizontal: boolean } | undefined;
   message?: string | undefined;
 }
 
 export type TuiEffect =
   | { type: "open"; documentId: string }
   | { type: "reload" }
+  | { type: "rerender"; documentId: string }
   | { type: "action"; documentId: string; action: DocumentAction }
   | {
       type: "bulk-action";
@@ -174,7 +194,7 @@ export interface TuiRenderOptions {
 }
 
 export interface TuiMouseEvent {
-  button: "left" | "wheel-down" | "wheel-up";
+  button: "left" | "left-drag" | "left-up" | "wheel-down" | "wheel-up" | "wheel-left" | "wheel-right";
   x: number;
   y: number;
 }
@@ -205,6 +225,7 @@ export function createTuiState(
     visibleDocuments: [],
     workspaces: visibleWorkspaces,
     scroll: 0,
+    horizontalScroll: 0,
   };
   return applyFilters(state);
 }
@@ -218,6 +239,7 @@ export function applyTuiReader(
   changeReview?: ChangeReviewDiff,
   sourceMap?: MarkdownSourceMapV1,
   sourceWitness?: string,
+  blocks?: TerminalBlock[],
 ): TuiState {
   return {
     ...state,
@@ -227,6 +249,8 @@ export function applyTuiReader(
       content,
       document,
       warnings,
+      wide: false,
+      layout: prepareReaderLayout(content, blocks),
       ...(changeReview === undefined ? {} : { changeReview }),
       ...(sourceMap === undefined ? {} : { sourceMap }),
       ...(sourceWitness === undefined ? {} : { sourceWitness }),
@@ -245,6 +269,8 @@ export function applyTuiReader(
     annotationComposer: undefined,
     feedbackComposer: undefined,
     scroll: 0,
+    horizontalScroll: 0,
+    readerDrag: undefined,
     searching: false,
     message: undefined,
   };
@@ -277,6 +303,7 @@ export function refreshTuiReader(
   changeReview?: ChangeReviewDiff,
   sourceMap?: MarkdownSourceMapV1,
   sourceWitness?: string,
+  blocks?: TerminalBlock[],
 ): TuiState {
   const previous = state.reader;
   const next = applyTuiReader(
@@ -288,6 +315,7 @@ export function refreshTuiReader(
     changeReview,
     sourceMap,
     sourceWitness,
+    blocks,
   );
   if (
     !previous ||
@@ -304,6 +332,7 @@ export function refreshTuiReader(
     ...next,
     reader: {
       ...next.reader,
+      wide: previous.wide,
       changeView: previous.changeView === "diff" && fileCount === 0
         ? "document"
         : previous.changeView,
@@ -330,6 +359,7 @@ export function refreshTuiReader(
         Math.max(0, (sourceMap?.logicalLines.length ?? 1) - 1),
       ),
     },
+    horizontalScroll: state.horizontalScroll,
   };
 }
 
@@ -439,11 +469,12 @@ export function replaceTuiDocuments(
 }
 
 export function handleTuiKey(state: TuiState, key: string): TuiTransition {
+  if (state.readerDrag) state = { ...state, readerDrag: undefined };
   if (key === "ctrl-c") {
     return { state, effects: [{ type: "quit" }] };
   }
   if (state.mode === "reader" && state.reader?.livePreview &&
-      !["q", "ctrl-c", "b", "escape", "j", "k", "up", "down", "pageup", "pagedown", "ctrl-d", "ctrl-u", "home", "end"].includes(key)) {
+      !["q", "ctrl-c", "b", "escape", "j", "k", "up", "down", "pageup", "pagedown", "ctrl-d", "ctrl-u", "home", "end", "h", "l", "left", "right", "0", "w"].includes(key)) {
     return { state, effects: [] };
   }
   if (state.confirmation) {
@@ -492,6 +523,10 @@ export function handleTuiMouse(
   width: number,
   height: number,
 ): TuiTransition {
+  if (event.button === "left-up") {
+    return { state: state.readerDrag ? { ...state, readerDrag: undefined } : state, effects: [] };
+  }
+  if (state.confirmation) return { state, effects: [] };
   if (
     !Number.isSafeInteger(event.x) ||
     !Number.isSafeInteger(event.y) ||
@@ -500,12 +535,38 @@ export function handleTuiMouse(
   ) {
     return { state, effects: [] };
   }
+  const safeWidth = terminalWidth(width);
+  const safeHeight = clamp(Math.floor(height), 8, 500);
+  if (event.button === "left-drag") {
+    const drag = state.readerDrag;
+    if (!drag || state.mode !== "reader" || state.reviewComposer || state.feedbackComposer || state.annotationComposer) {
+      return { state, effects: [] };
+    }
+    const x = clamp(event.x, 1, safeWidth);
+    const y = clamp(event.y, 1, safeHeight);
+    return {
+      state: clampReaderScroll({ ...state,
+        scroll: Math.max(0, state.scroll + drag.y - y),
+        horizontalScroll: Math.max(0, state.horizontalScroll + (drag.horizontal ? drag.x - x : 0)),
+        readerDrag: { ...drag, x, y },
+      }, height, width),
+      effects: [],
+    };
+  }
+  if (event.x > safeWidth || event.y > safeHeight) return { state, effects: [] };
+  if (event.button === "wheel-left" || event.button === "wheel-right") {
+    return state.mode === "reader" ? {
+      state: clampReaderScroll({ ...state, readerDrag: undefined,
+        horizontalScroll: Math.max(0, state.horizontalScroll + (event.button === "wheel-right" ? 8 : -8)),
+      }, height, width), effects: [],
+    } : { state, effects: [] };
+  }
   if (event.button === "wheel-down") {
     return state.mode === "reader"
       ? {
           state: clampReaderScroll(
-            { ...state, scroll: state.scroll + 3 },
-            height,
+            { ...state, readerDrag: undefined, scroll: state.scroll + 3 },
+            height, width,
           ),
           effects: [],
         }
@@ -515,21 +576,28 @@ export function handleTuiMouse(
     return state.mode === "reader"
       ? {
           state: clampReaderScroll(
-            { ...state, scroll: Math.max(0, state.scroll - 3) },
-            height,
+            { ...state, readerDrag: undefined, scroll: Math.max(0, state.scroll - 3) },
+            height, width,
           ),
           effects: [],
         }
       : moveQueueSelection(state, -3);
   }
 
-  const safeWidth = clamp(Math.floor(width), 40, 1_000);
-  const safeHeight = clamp(Math.floor(height), 8, 500);
+  if (state.readerDrag) state = { ...state, readerDrag: undefined };
   if (event.y === safeHeight - 1) {
-    const key = footerKeyAt(state, event.x);
+    const key = footerKeyAt(state, event.x, safeWidth - 2);
     return key ? handleTuiKey(state, key) : { state, effects: [] };
   }
   if (state.mode === "reader") {
+    const contentY = 7 + (state.message ? 1 : 0);
+    if (state.reader && !state.reviewComposer && !state.feedbackComposer && !state.annotationComposer &&
+        event.x > 1 && event.x < safeWidth && event.y >= contentY && event.y <= safeHeight - 3) {
+      const before = documentReaderExtras(state, createTuiTheme(false)).before.length;
+      const line = state.reader.layout.lines[state.scroll + event.y - contentY - before];
+      const horizontal = Boolean(line && (line.wide || state.reader.wide) && line.blockWidth > safeWidth - 2);
+      return { state: { ...state, readerDrag: { x: event.x, y: event.y, horizontal } }, effects: [] };
+    }
     return { state, effects: [] };
   }
   return handleQueueMouse(state, event, safeWidth, safeHeight);
@@ -541,7 +609,7 @@ export function renderTui(
   height: number,
   options: TuiRenderOptions = {},
 ): string {
-  const safeWidth = clamp(Math.floor(width), 40, 1_000);
+  const safeWidth = terminalWidth(width);
   const safeHeight = clamp(Math.floor(height), 8, 500);
   const innerWidth = safeWidth - 2;
   const borders = createBorders(options.unicode !== false);
@@ -558,52 +626,9 @@ export function renderTui(
   const title = renderWorkspaceTitle(state, innerWidth, theme, options.unicode !== false);
   const footer = state.confirmation
     ? `${theme.accent(theme.styles.bold("CONFIRM"))} ${theme.ink(confirmationMessage(state.confirmation))}  ${theme.accent("y")} yes  ${theme.accent("n")} no`
-    : state.reader?.livePreview
-    ? renderShortcutBar([["j/k", "scroll"], ["b", "queue"], ["q", "return to editor"]], theme)
-    : state.annotationComposer
-    ? renderShortcutBar(
-        [["enter", "newline"], ["ctrl-d", "save note"], ["esc", "cancel"]],
-        theme,
-      )
-    : state.feedbackComposer
-    ? renderShortcutBar(
-        [["enter", "newline"], ["ctrl-d", "save general feedback"], ["esc", "cancel"]],
-        theme,
-      )
-    : state.reviewComposer
-    ? renderShortcutBar(
-        [["enter", "newline"], ["ctrl-d", "submit"], ["esc", "cancel"]],
-        theme,
-      )
-    : state.mode === "reader"
-      ? renderShortcutBar(
-          state.reader?.document.missingAt
-            ? [["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
-            : state.reader?.changeView === "diff"
-              ? pendingReviewForDocument(
-                    state.reviewRequests,
-                    state.reader.document.id,
-                  )
-                ? [["p/n", "file"], ["j/k", "line"], ["v", "range"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["y/c/x/o", "decide"], ["b", "queue"]]
-                : [["p/n", "file"], ["j/k", "line"], ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"], ["g", "general"], ["s", "send"], ["z", "undo"], ["b", "queue"]]
-            : pendingReviewForDocument(
-                  state.reviewRequests,
-                  state.reader?.document.id ?? "",
-                )
-              ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["b", "queue"]]
-              : state.contentMode === "archive"
-                ? [["j/k", "scroll"], ["u", "restore"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
-                : [["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"]],
-          theme,
-        )
     : state.searching
       ? `${theme.accent("SEARCH")} ${theme.ink(`${sanitizeTerminalText(state.search)}_`)}  ${theme.muted("enter apply  esc clear")}`
-      : renderShortcutBar(
-          state.contentMode === "archive"
-            ? [["j/k", "move"], ["space", "select"], ["A", "select all"], ["u", "restore"], ["X", "purge"], ["v", "documents"], ["q", "quit"]]
-            : [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["X", "purge"], ["space", "select"], ["A", "all"], ["c", "content"], ["v", "archive"], ["p", "project"], ["x", "space"], ["/", "search"], ["q", "quit"]],
-          theme,
-        );
+      : renderShortcutBar(tuiShortcuts(state, innerWidth), theme);
   const bodyHeight = safeHeight - 6;
   const body = state.mode === "reader"
     ? readerLines(state, innerWidth, bodyHeight, theme, borders)
@@ -627,7 +652,7 @@ export async function runTui(
     (io.color ?? Boolean(output.isTTY && env.TERM !== "dumb"));
   const unicode = io.unicode ?? env.TERM !== "dumb";
   if (typeof client.requireCapabilities === "function") {
-    await client.requireCapabilities("spaces-v1", "scoped-content-v1", ...(io.previewId ? ["live-buffer-previews-v1"] : []));
+    await client.requireCapabilities("spaces-v1", "scoped-content-v1", "terminal-scroll-blocks-v1", ...(io.previewId ? ["live-buffer-previews-v1"] : []));
   }
   const [initialDocuments, initialWorkspaces, initialReviewRequests, spaces] =
     await Promise.all([
@@ -657,7 +682,9 @@ export async function runTui(
   let appliedViewportRevision = -1;
   let scrollRefreshRequested = false;
   let scrollRefreshRunning = false;
+  let renderGeneration = 0;
   let inputBuffer = "";
+  let escapeTimer: NodeJS.Timeout | undefined;
   let previousFrame: string[] | undefined;
   const currentScope = (): { spaceId?: string } =>
     state.selectedSpace === undefined ? {} : { spaceId: state.selectedSpace };
@@ -674,6 +701,7 @@ export async function runTui(
   const scopeContextMatches = (context: ScopeContext): boolean =>
     context.generation === state.scopeGeneration &&
     context.scope.spaceId === state.selectedSpace;
+  let previousSize = "";
 
   const previewFor = (id: string): string | undefined => id === io.documentId ? io.previewId : undefined;
   const rememberPreview = (info: PreviewInfo | undefined): void => {
@@ -706,6 +734,10 @@ export async function runTui(
     applyPreviewViewport();
     const width = output.columns ?? 100;
     const height = output.rows ?? 30;
+    const size = `${width}:${height}`;
+    if (size !== previousSize) previousFrame = undefined;
+    previousSize = size;
+    state = clampReaderScroll(state, height, width);
     const frame = renderTui(state, width, height, { color, unicode });
     const lines = frame.split("\n");
     if (!previousFrame) {
@@ -730,15 +762,48 @@ export async function runTui(
     finished = true;
     input.off("data", onData);
     process.off("SIGWINCH", onResize);
+    output.off("resize", onResize);
     eventController.abort();
     if (resizeTimer) {
       clearTimeout(resizeTimer);
     }
+    if (escapeTimer) clearTimeout(escapeTimer);
     if (input.isTTY) {
       input.setRawMode(Boolean(wasRaw));
     }
     input.pause();
-    output.write("\u001b[?1006l\u001b[?1000l\u001b[?25h\u001b[?1049l");
+    output.write("\u001b[?1007l\u001b[?1006l\u001b[?1002l\u001b[?1000l\u001b[?25h\u001b[?1049l");
+  };
+
+  const renderCurrentReader = async (
+    context: ScopeContext = scopeContext(),
+    viewportBeforeRender = appliedViewportRevision,
+  ): Promise<boolean> => {
+    const reader = state.reader;
+    if (!reader || finished || !scopeContextMatches(context)) return false;
+    const width = readerRenderWidth(output.columns ?? 100, reader.wide);
+    const generation = ++renderGeneration;
+    const previewId = previewFor(reader.document.id);
+    const rendered = await client.renderDocument(
+      reader.document.id, "terminal", width, { color, unicode, overflow: "scroll" }, context.scope, previewId,
+    );
+    if (
+      finished || generation !== renderGeneration || !scopeContextMatches(context) ||
+      state.reader?.document.id !== reader.document.id || state.reader.wide !== reader.wide ||
+      previewFor(reader.document.id) !== previewId ||
+      readerRenderWidth(output.columns ?? 100, state.reader.wide) !== width
+    ) return false;
+    renderedWidth = width;
+    renderedRevision = rendered.document.revision;
+    const scroll = state.scroll;
+    state = refreshTuiReader(
+      state, rendered.document, rendered.content, rendered.backend, rendered.warnings,
+      rendered.changeReview, rendered.sourceMap, rendered.sourceWitness, rendered.blocks,
+    );
+    state = { ...state, scroll };
+    rememberRenderedPreview(rendered.preview, viewportBeforeRender);
+    draw();
+    return true;
   };
 
   const execute = async (
@@ -777,18 +842,20 @@ export async function runTui(
         return;
       }
       if (effect.type === "open") {
+        renderGeneration += 1;
+        const width = readerRenderWidth(output.columns ?? 100);
         const rendered = await client.renderDocument(
           effect.documentId,
           "terminal",
-          readerRenderWidth(output.columns ?? 100),
-          { color, unicode },
+          width,
+          { color, unicode, overflow: "scroll" },
           scope,
           previewFor(effect.documentId),
         );
-        if (!scopeContextMatches(context)) {
+        if (finished || !scopeContextMatches(context)) {
           return;
         }
-        renderedWidth = readerRenderWidth(output.columns ?? 100);
+        renderedWidth = width;
         renderedRevision = rendered.document.revision;
         state = applyTuiReader(
           state,
@@ -799,14 +866,21 @@ export async function runTui(
           rendered.changeReview,
           rendered.sourceMap,
           rendered.sourceWitness,
+          rendered.blocks,
         );
         appliedViewportRevision = -1;
         rememberRenderedPreview(rendered.preview, -1);
         draw();
+        if (readerRenderWidth(output.columns ?? 100, state.reader?.wide) !== width) {
+          await renderCurrentReader(context);
+        }
         if (!previewFor(effect.documentId)) await client.act(effect.documentId, "opened", scope);
         if (!scopeContextMatches(context)) {
           return;
         }
+      } else if (effect.type === "rerender") {
+        if (state.reader?.document.id === effect.documentId) await renderCurrentReader(context);
+        return;
       } else if (effect.type === "action") {
         await client.act(effect.documentId, effect.action, scope);
         if (!scopeContextMatches(context)) {
@@ -944,12 +1018,9 @@ export async function runTui(
     }
   };
 
-  const onData = (chunk: Buffer | string): void => {
-    inputBuffer += chunk.toString();
-    const decoded = decodeInput(inputBuffer);
-    inputBuffer = decoded.remainder;
+  const dispatchInput = (events: TuiInputEvent[]): void => {
     let changed = false;
-    for (const inputEvent of decoded.events) {
+    for (const inputEvent of events) {
       if (finished) {
         return;
       }
@@ -961,7 +1032,7 @@ export async function runTui(
             output.rows ?? 30,
           )
         : handleTuiKey(state, inputEvent.key);
-      state = clampReaderScroll(transition.state, output.rows ?? 30);
+      state = clampReaderScroll(transition.state, output.rows ?? 30, output.columns ?? 100);
       changed = true;
       const context = scopeContext();
       for (const effect of transition.effects) {
@@ -973,18 +1044,30 @@ export async function runTui(
     }
   };
 
+  const onData = (chunk: Buffer | string): void => {
+    if (escapeTimer) clearTimeout(escapeTimer);
+    inputBuffer += chunk.toString();
+    const decoded = decodeInput(inputBuffer);
+    inputBuffer = decoded.remainder;
+    dispatchInput(decoded.events);
+    if (inputBuffer === "\u001b") {
+      escapeTimer = setTimeout(() => {
+        inputBuffer = "";
+        dispatchInput([{ type: "key", key: "escape" }]);
+      }, 50);
+    }
+  };
+
   const onResize = (): void => {
     draw();
     if (!state.reader) {
       return;
     }
-    const nextWidth = readerRenderWidth(output.columns ?? 100);
-    if (nextWidth === renderedWidth) {
-      return;
-    }
     if (resizeTimer) {
       clearTimeout(resizeTimer);
     }
+    const nextWidth = readerRenderWidth(output.columns ?? 100, state.reader.wide);
+    if (nextWidth === renderedWidth) return;
     resizeTimer = setTimeout(() => {
       const documentId = state.reader?.document.id;
       if (!documentId || finished) {
@@ -993,33 +1076,7 @@ export async function runTui(
       const context = scopeContext();
       processing = processing.then(async () => {
         try {
-          const viewportBeforeRender = appliedViewportRevision;
-          const rendered = await client.renderDocument(
-            documentId,
-            "terminal",
-            nextWidth,
-            { color, unicode },
-            context.scope,
-            previewFor(documentId),
-          );
-          if (!scopeContextMatches(context)) {
-            return;
-          }
-          renderedWidth = nextWidth;
-          renderedRevision = rendered.document.revision;
-          const scroll = state.scroll;
-          state = refreshTuiReader(
-            state,
-            rendered.document,
-            rendered.content,
-            rendered.backend,
-            rendered.warnings,
-            rendered.changeReview,
-            rendered.sourceMap,
-          );
-          state = { ...state, scroll };
-          rememberRenderedPreview(rendered.preview, viewportBeforeRender);
-          draw();
+          if (state.reader?.document.id === documentId) await renderCurrentReader(context);
         } catch (error) {
           if (!scopeContextMatches(context)) {
             return;
@@ -1034,7 +1091,7 @@ export async function runTui(
     }, 80);
   };
 
-  output.write("\u001b[?1049h\u001b[?25l\u001b[?1000h\u001b[?1006h");
+  output.write("\u001b[?1049h\u001b[?25l\u001b[?1000h\u001b[?1002h\u001b[?1006h\u001b[?1007h");
   if (input.isTTY) {
     input.setRawMode(true);
   }
@@ -1048,6 +1105,7 @@ export async function runTui(
   input.resume();
   input.on("data", onData);
   process.on("SIGWINCH", onResize);
+  output.on("resize", onResize);
   draw();
   const scheduleCatalogRefresh = (): void => {
     const context = scopeContext();
@@ -1075,7 +1133,7 @@ export async function runTui(
             workspaces,
             reviewRequests,
           );
-          if (refreshReader && readerDocumentId) {
+          if (refreshReader && readerDocumentId && state.reader?.document.id === readerDocumentId) {
             const document = documents.find(({ id }) => id === readerDocumentId);
             if (document?.missingAt) {
               renderedRevision = document.revision;
@@ -1085,48 +1143,20 @@ export async function runTui(
                 output.rows ?? 30,
               );
             } else if (document) {
-              const width = readerRenderWidth(output.columns ?? 100);
-              const rendered = await client.renderDocument(
-                readerDocumentId,
-                "terminal",
-                width,
-                { color, unicode },
-                context.scope,
-                previewFor(readerDocumentId),
-              );
-              if (!scopeContextMatches(context)) {
-                return;
-              }
-              renderedWidth = width;
-              renderedRevision = rendered.document.revision;
-              state = refreshTuiReader(
-                state,
-                rendered.document,
-                rendered.content,
-                rendered.backend,
-                rendered.warnings,
-                rendered.changeReview,
-                rendered.sourceMap,
-                rendered.sourceWitness,
-              );
+              if (!await renderCurrentReader(context, viewportBeforeRender)) return;
               if (typeof client.listFeedback === "function") {
                 const feedbackItems = await listAllFeedback(
                   client,
-                  rendered.document.id,
+                  readerDocumentId,
                   context.scope,
                 );
-                if (state.reader?.document.id === rendered.document.id) {
+                if (scopeContextMatches(context) && state.reader?.document.id === readerDocumentId) {
                   state = {
                     ...state,
                     reader: { ...state.reader, feedbackHistory: feedbackItems },
                   };
                 }
               }
-              state = clampReaderScroll(
-                { ...state, scroll },
-                output.rows ?? 30,
-              );
-              rememberRenderedPreview(rendered.preview, viewportBeforeRender);
             }
           }
           draw();
@@ -1438,7 +1468,7 @@ function handleQueueKey(state: TuiState, key: string): TuiTransition {
 function handleReaderKey(state: TuiState, key: string): TuiTransition {
   if (key === "b" || key === "escape") {
     return {
-      state: { ...state, mode: "queue", reader: undefined, scroll: 0 },
+      state: { ...state, mode: "queue", reader: undefined, scroll: 0, horizontalScroll: 0 },
       effects: [],
     };
   }
@@ -1474,9 +1504,33 @@ function handleReaderKey(state: TuiState, key: string): TuiTransition {
           changeView: state.reader.changeView === "diff" ? "document" : "diff",
         },
         scroll: 0,
+        horizontalScroll: 0,
       },
       effects: [],
     };
+  }
+  if (state.reader?.changeView === "document") {
+    if (key === "w" && !state.reader.document.missingAt) {
+      return {
+        state: {
+          ...state,
+          reader: { ...state.reader, wide: !state.reader.wide },
+          horizontalScroll: 0,
+        },
+        effects: [{ type: "rerender", documentId: state.reader.document.id }],
+      };
+    }
+    if (key === "right" || key === "l" || key === "left" || key === "h" || key === "0") {
+      return {
+        state: {
+          ...state,
+          horizontalScroll: key === "0" ? 0 : Math.max(
+            0, state.horizontalScroll + (key === "right" || key === "l" ? 8 : -8),
+          ),
+        },
+        effects: [],
+      };
+    }
   }
   if (state.reader?.changeView === "diff" && state.reader.changeReview) {
     const reader = state.reader;
@@ -2212,7 +2266,7 @@ export function scrollTuiReaderToProgress(state: TuiState, progress: number, ter
   return { ...state, scroll: Math.round(clamp(progress, 0, 1) * maximum) };
 }
 
-function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
+function clampReaderScroll(state: TuiState, terminalHeight: number, width?: number): TuiState {
   if (!state.reader) {
     return state;
   }
@@ -2220,12 +2274,17 @@ function clampReaderScroll(state: TuiState, terminalHeight: number): TuiState {
   const bodyHeight = safeHeight - 6;
   const headerLength = state.message ? 4 : 3;
   const available = Math.max(1, bodyHeight - headerLength);
-  const contentLines = sanitizeTerminalText(state.reader.content).split("\n").length;
-  const warningLines = state.reader.warnings.length > 0
-    ? state.reader.warnings.length + 1
-    : 0;
-  const maximum = Math.max(0, contentLines + warningLines - available);
-  return { ...state, scroll: clamp(state.scroll, 0, maximum) };
+  const extras = documentReaderExtras(state, createTuiTheme(false));
+  const maximum = Math.max(0, state.reader.layout.lines.length + extras.before.length + extras.after.length - available);
+  const contentWidth = state.reader.wide ? state.reader.layout.maxWidth : state.reader.layout.maxWideWidth;
+  const innerWidth = terminalWidth(width ?? 100) - 2;
+  const viewportWidth = contentWidth > innerWidth ? Math.max(1, innerWidth - 2) : innerWidth;
+  return {
+    ...state,
+    scroll: clamp(state.scroll, 0, maximum),
+    horizontalScroll: width === undefined ? state.horizontalScroll
+      : clamp(state.horizontalScroll, 0, Math.max(0, contentWidth - viewportWidth)),
+  };
 }
 
 export function groupTuiQueue(
@@ -2463,6 +2522,9 @@ function renderWorkspaceTitle(
       ? "CHANGE REVIEWS"
       : "DOCUMENT INBOX";
   const left = `${theme.brand("mdmaid.desk")} ${theme.muted("/")} ${theme.styles.bold(section)}`;
+  if (width < 40) {
+    return `${theme.brand("mdmaid.desk")} ${theme.styles.bold(state.mode === "reader" ? "READER" : "INBOX")}`;
+  }
   const right = theme.done(`${unicode ? "●" : "*"} LIVE`);
   return spread(left, right, width);
 }
@@ -2474,6 +2536,45 @@ function renderShortcutBar(
   return shortcuts
     .map(([key, action]) => `${theme.accent(theme.styles.bold(key))} ${theme.muted(action)}`)
     .join(theme.muted("   "));
+}
+
+function tuiShortcuts(state: TuiState, width: number): Array<readonly [string, string]> {
+  if (state.annotationComposer || state.feedbackComposer || state.reviewComposer) {
+    const action = state.annotationComposer ? "save note" : state.feedbackComposer ? "save general feedback" : "submit";
+    return width < 60 ? [["ctrl-d", "save"], ["esc", "cancel"]]
+      : [["enter", "newline"], ["ctrl-d", action], ["esc", "cancel"]];
+  }
+  if (state.reader?.livePreview) {
+    return [["j/k", "scroll"], ["h/l", "pan"], ["b", "queue"], ["q", "return to editor"]];
+  }
+  if (state.mode === "queue") {
+    if (width < 60) return [["enter", "open"], ["/", "search"], ["q", "quit"]];
+    return state.contentMode === "archive"
+      ? [["j/k", "move"], ["space", "select"], ["A", "select all"], ["u", "restore"], ["X", "purge"], ["v", "documents"], ["q", "quit"]]
+      : [["j/k", "move"], ["enter", "open"], ["a", "archive"], ["X", "purge"], ["space", "select"], ["A", "all"], ["c", "content"], ["v", "archive"], ["p", "project"], ["x", "space"], ["/", "search"], ["q", "quit"]];
+  }
+  if (state.reader?.document.missingAt) {
+    return [["a", "archive"], ["X", "purge"], ["b", "queue"], ["q", "quit"]];
+  }
+  const pending = pendingReviewForDocument(state.reviewRequests, state.reader?.document.id ?? "");
+  if (state.reader?.changeView === "diff") {
+    if (width < 60) return [["p/n", "file"], ["j/k", "line"], ["b", "queue"]];
+    return [["p/n", "file"], ["j/k", "line"], ...(pending ? [["v", "range"]] as const : []),
+      ["m", "layout"], ["d", "document"], ["f", "line feedback"], ["t", "file feedback"],
+      ["g", "general"], ["s", "send"], ["z", "undo"], ...(pending ? [["y/c/x/o", "decide"]] as const : []), ["b", "queue"]];
+  }
+  const layout = ["w", state.reader?.wide ? "wrap" : "wide"] as const;
+  const contentWidth = state.reader?.wide ? state.reader.layout.maxWidth : state.reader?.layout.maxWideWidth ?? 0;
+  const pan = contentWidth > width;
+  if (width < 60) return [pan ? ["h/l", "pan"] : layout, ["b", "queue"], pan ? layout : ["q", "quit"]];
+  const shortcuts: Array<readonly [string, string]> = state.contentMode === "archive"
+    ? [["j/k", "scroll"], ["u", "restore"], ["X", "purge"], ["b", "queue"], ["q", "quit"]]
+    : pending
+      ? [["y", "approve"], ["c", "changes"], ["x", "reject"], ["o", "supersede"], ["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["b", "queue"]]
+      : [["[/]", "source row"], ["f", "comment row"], ["g", "general"], ["s", "send"], ["j/k", "scroll"], ["m", "read"], ["u", "unread"], ["a", "archive"], ["X", "purge"], ["b", "queue"]];
+  return pan
+    ? [["h/l", "pan"], ["j/k", "scroll"], ["b", "queue"], layout, ...shortcuts.filter(([key]) => key !== "j/k" && key !== "b")]
+    : [...shortcuts, layout, ["h/l", "pan"]];
 }
 
 function queueLines(
@@ -2590,55 +2691,15 @@ function handleQueueMouse(
   };
 }
 
-function footerKeyAt(state: TuiState, x: number): string | undefined {
-  if (state.searching || x < 2) {
-    return undefined;
-  }
-  const shortcuts: Array<readonly [string, string, string | undefined]> =
-    state.mode === "reader"
-      ? state.reader?.document.missingAt
-        ? [
-            ["a", "archive", "a"],
-            ["X", "purge", "X"],
-            ["b", "queue", "b"],
-            ["q", "quit", "q"],
-          ]
-        : state.contentMode === "archive"
-          ? [
-              ["j/k", "scroll", undefined],
-              ["u", "restore", "u"],
-              ["X", "purge", "X"],
-              ["b", "queue", "b"],
-              ["q", "quit", "q"],
-            ]
-          : [
-              ["j/k", "scroll", undefined],
-              ["m", "read", "m"],
-              ["u", "unread", "u"],
-              ["a", "archive", "a"],
-              ["X", "purge", "X"],
-              ["b", "queue", "b"],
-              ["q", "quit", "q"],
-            ]
-      : [
-          ["j/k", "move", undefined],
-          ["enter", "open", "enter"],
-          ["a", "archive", "a"],
-          ["X", "purge", "X"],
-          ["space", "select", " "],
-          ["A", "all", "A"],
-          ["c", "content", "c"],
-          ["v", "archive", "v"],
-          ["p", "project", "p"],
-          ["x", "space", "x"],
-          ["/", "search", "/"],
-          ["q", "quit", "q"],
-        ];
+function footerKeyAt(state: TuiState, x: number, width: number): string | undefined {
+  if (state.searching || x < 2 || x > width + 1) return undefined;
   let cursor = 2;
-  for (const [label, action, key] of shortcuts) {
+  for (const [label, action] of tuiShortcuts(state, width)) {
     const end = cursor + stringWidth(`${label} ${action}`);
     if (x >= cursor && x < end) {
-      return key;
+      if (label === "esc") return "escape";
+      if (label === "space") return " ";
+      return label !== "/" && label.includes("/") ? undefined : label;
     }
     cursor = end + 3;
   }
@@ -2981,56 +3042,12 @@ function renderDocumentCard(
   return [top, titleLine, metaLine, bottom].map((line) => fitLine(line, width));
 }
 
-function readerLines(
-  state: TuiState,
-  width: number,
-  height: number,
-  theme: TuiTheme,
-  borders: TuiBorders,
-): string[] {
-  if (!state.reader) {
-    return [theme.muted("Document is not loaded.")];
-  }
+function documentReaderExtras(state: TuiState, theme: TuiTheme): { before: string[]; after: string[] } {
+  if (!state.reader) return { before: [], after: [] };
   const { document } = state.reader;
-  const title = sanitizeTerminalText(document.title).replace(/\s+/g, " ");
-  const pill = document.missingAt
-    ? theme.accent("! SOURCE MISSING")
-    : statusStyle(theme, document.status)(
-        `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
-      );
-  const meta = [
-    document.workspaceId,
-    document.taskId,
-    document.kind,
-    state.reader.livePreview ? "unsaved preview" : documentStorageLabel(document.storage),
-    state.reader.backend,
-  ].filter((value): value is string => Boolean(value)).join(" · ");
-  const heading = spread(
-    `${pill}  ${theme.styles.bold(title)}`,
-    theme.muted(`revision ${document.revision}`),
-    width,
-  );
-  if (
-    state.reader.changeView === "diff" &&
-    state.reader.changeReview &&
-    state.reader.changeReview.files.length > 0
-  ) {
-    return changeReviewReaderLines(
-      state,
-      width,
-      height,
-      theme,
-      borders,
-      heading,
-      meta,
-    );
-  }
   const warningLines = state.reader.warnings.map((warning) =>
     theme.accent(`warning: ${sanitizeTerminalText(warning)}`),
   );
-  const content = sanitizeTerminalText(state.reader.content, {
-    preserveSgr: theme.color,
-  }).split("\n");
   const requests = state.reader?.livePreview ? [] : state.reviewRequests.filter(
     (request) => request.documentId === document.id,
   );
@@ -3108,21 +3125,109 @@ function readerLines(
         "",
       ]
     : [];
-  const all = [
-    ...(warningLines.length > 0 ? [...warningLines, ""] : []),
-    ...content,
-    ...(feedbackLines.length === 0 ? [] : ["", ...feedbackLines]),
-    ...(reviewLines.length > 0 ? ["", ...reviewLines] : []),
-    ...annotationLines,
-    ...feedbackComposerLines,
-    ...composerLines,
-  ];
+  return {
+    before: warningLines.length > 0 ? [...warningLines, ""] : [],
+    after: [
+      ...(feedbackLines.length === 0 ? [] : ["", ...feedbackLines]),
+      ...(reviewLines.length > 0 ? ["", ...reviewLines] : []),
+      ...annotationLines, ...feedbackComposerLines, ...composerLines,
+    ],
+  };
+}
+
+function prepareReaderLayout(content: string, blocks?: TerminalBlock[]): ReaderLayout {
+  const sections = isTerminalBlocks(blocks) && blocks.map((block) => block.content).join("\n\n") === content
+    ? blocks : [{ kind: "wide" as const, content }];
+  const lines: ReaderLine[] = [];
+  let maxWidth = 0;
+  let maxWideWidth = 0;
+  for (const section of sections) {
+    if (lines.length > 0) lines.push({ styled: "", plain: "", blockWidth: 0, wide: false });
+    const safe = sanitizeTerminalText(section.content, { preserveSgr: true });
+    const rows = safe.split("\n").map((styled) => ({ styled, plain: sanitizeTerminalText(styled) }));
+    const blockWidth = rows.reduce((maximum, row) => Math.max(maximum, stringWidth(row.plain)), 0);
+    maxWidth = Math.max(maxWidth, blockWidth);
+    if (section.kind === "wide") maxWideWidth = Math.max(maxWideWidth, blockWidth);
+    for (const row of rows) lines.push({ ...row, blockWidth, wide: section.kind === "wide" });
+  }
+  if (lines.length === 0) lines.push({ styled: "", plain: "", blockWidth: 0, wide: false });
+  return { lines, maxWidth, maxWideWidth };
+}
+
+function readerLines(
+  state: TuiState,
+  width: number,
+  height: number,
+  theme: TuiTheme,
+  borders: TuiBorders,
+): string[] {
+  if (!state.reader) {
+    return [theme.muted("Document is not loaded.")];
+  }
+  const { document } = state.reader;
+  const title = sanitizeTerminalText(document.title).replace(/\s+/g, " ");
+  const pill = document.missingAt
+    ? theme.accent("! SOURCE MISSING")
+    : statusStyle(theme, document.status)(
+        `${statusSymbol(document.status, borders.vertical === "│")} ${statusLabel(document.status).toUpperCase()}`,
+      );
+  const meta = [
+    document.workspaceId,
+    document.taskId,
+    document.kind,
+    state.reader.livePreview ? "unsaved preview" : documentStorageLabel(document.storage),
+    state.reader.backend,
+  ].filter((value): value is string => Boolean(value)).join(" · ");
+  const heading = spread(
+    `${pill}  ${theme.styles.bold(title)}`,
+    theme.muted(`revision ${document.revision}`),
+    width,
+  );
+  if (
+    state.reader.changeView === "diff" &&
+    state.reader.changeReview &&
+    state.reader.changeReview.files.length > 0
+  ) {
+    return changeReviewReaderLines(
+      state,
+      width,
+      height,
+      theme,
+      borders,
+      heading,
+      meta,
+    );
+  }
+  const extras = documentReaderExtras(state, theme);
+  const layout = state.reader.layout;
+  const length = extras.before.length + layout.lines.length + extras.after.length;
   const headerLength = state.message ? 4 : 3;
   const available = Math.max(1, height - headerLength);
-  const maxScroll = Math.max(0, all.length - available);
+  const maxScroll = Math.max(0, length - available);
   const scroll = clamp(state.scroll, 0, maxScroll);
-  const visible = all.slice(scroll, scroll + available);
-  const progress = `${scroll + 1}-${Math.min(all.length, scroll + available)} / ${all.length}`;
+  const contentWidth = state.reader.wide ? layout.maxWidth : layout.maxWideWidth;
+  const overflowing = contentWidth > width;
+  const viewportWidth = overflowing ? Math.max(1, width - 2) : width;
+  const horizontalScroll = clamp(state.horizontalScroll, 0, Math.max(0, contentWidth - viewportWidth));
+  const progress = `${scroll + 1}-${Math.min(length, scroll + available)} / ${length}`;
+  const visible: string[] = [];
+  for (let index = scroll; index < Math.min(length, scroll + available); index++) {
+    const bodyIndex = index - extras.before.length;
+    const line = layout.lines[bodyIndex];
+    if (!line) {
+      visible.push(fitLine(extras.before[index] ?? extras.after[bodyIndex - layout.lines.length] ?? "", width));
+      continue;
+    }
+    const text = theme.color ? line.styled : line.plain;
+    if (!(line.wide || state.reader.wide) || line.blockWidth <= width) {
+      visible.push(fitLine(text, width));
+      continue;
+    }
+    const offset = clamp(horizontalScroll, 0, Math.max(0, line.blockWidth - viewportWidth));
+    const left = offset > 0 ? (borders.vertical === "│" ? "‹" : "<") : " ";
+    const right = offset + viewportWidth < line.blockWidth ? (borders.vertical === "│" ? "›" : ">") : " ";
+    visible.push(`${theme.accent(left)}${fitLine(sliceReaderLine(text, offset, viewportWidth), viewportWidth)}${theme.accent(right)}`);
+  }
   const header = [
     heading,
     spread(
@@ -3134,10 +3239,12 @@ function readerLines(
   if (state.message) {
     header.push(theme.accent(`! ${sanitizeTerminalText(state.message)}`));
   }
-  header.push("");
+  header.push(overflowing
+    ? theme.muted(`h/l pan  ${horizontalScroll + 1}-${horizontalScroll + viewportWidth}/${contentWidth} · 0 start`)
+    : "");
   return [
     ...header,
-    ...visible.map((line) => fitLine(line, width)),
+    ...visible,
   ].slice(0, height);
 }
 
@@ -3754,6 +3861,35 @@ function fitLine(value: string, width: number): string {
   return `${fitted}${" ".repeat(Math.max(0, width - stringWidth(fitted)))}`;
 }
 
+const terminalGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Clip sanitized reader text by terminal cells, retaining SGR and whole graphemes. */
+function sliceReaderLine(value: string, start: number, width: number): string {
+  let column = 0;
+  let output = "";
+  let styled = false;
+  const end = start + width;
+  for (const part of value.split(/(\u001b\[[0-9;]*m)/)) {
+    if (column >= end) break;
+    if (part.startsWith("\u001b[")) {
+      output += part;
+      styled = true;
+      continue;
+    }
+    for (const { segment } of terminalGraphemes.segment(part)) {
+      if (column >= end) break;
+      const next = column + stringWidth(segment);
+      if (next > start) {
+        output += column < start || next > end
+          ? " ".repeat(Math.max(0, Math.min(next, end) - Math.max(column, start)))
+          : segment;
+      }
+      column = next;
+    }
+  }
+  return styled ? `${output}\u001b[0m` : output;
+}
+
 function spread(left: string, right: string, width: number): string {
   if (width <= 0) {
     return "";
@@ -3780,9 +3916,14 @@ function truncate(value: string, width: number): string {
   return `${sliceAnsi(safe, 0, width - 1)}…`;
 }
 
-function readerRenderWidth(width: number): number {
-  const safeWidth = clamp(Math.floor(width), 40, 1_000);
+function readerRenderWidth(width: number, wide = false): number {
+  if (wide) return 1_000;
+  const safeWidth = terminalWidth(width);
   return clamp(safeWidth - 2, 20, 1_000);
+}
+
+function terminalWidth(width: number): number {
+  return clamp(Number.isFinite(width) ? Math.floor(width) : 80, 2, 1_000);
 }
 
 interface DecodedInput {
@@ -3798,6 +3939,18 @@ function decodeInput(value: string): DecodedInput {
   const events: TuiInputEvent[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const rest = value.slice(index);
+    if (rest === "\u001b") return { events, remainder: rest };
+    if (rest.startsWith("\u001b[M")) {
+      if (rest.length < 6) return { events, remainder: rest };
+      const code = rest.charCodeAt(3) - 32;
+      const x = rest.charCodeAt(4) - 32;
+      const y = rest.charCodeAt(5) - 32;
+      const button = (code & 64) === 0 && (code & 3) === 3
+        ? "left-up" : decodeMouseButton(code, "M");
+      if (button) events.push({ type: "mouse", event: { button, x, y } });
+      index += 5;
+      continue;
+    }
     const mouse = rest.match(/^\u001b\[<(\d+);(\d+);(\d+)([Mm])/);
     if (mouse) {
       const code = Number(mouse[1]);
@@ -3814,12 +3967,16 @@ function decodeInput(value: string): DecodedInput {
     if (rest.startsWith("\u001b[<")) {
       return { events, remainder: rest };
     }
-    if (rest.startsWith("\u001b[A")) {
-      events.push({ type: "key", key: "up" });
-      index += 2;
-    } else if (rest.startsWith("\u001b[B")) {
-      events.push({ type: "key", key: "down" });
-      index += 2;
+    if (/^\u001b\[(?:[0-9;]*)?$/.test(rest) && rest.length > 1) {
+      return { events, remainder: rest };
+    }
+    const arrow = rest.match(/^\u001b(?:O|\[(?:1(?:;\d+)?)?)([ABCD])/);
+    if (arrow) {
+      const directions: Record<string, string> = { A: "up", B: "down", C: "right", D: "left" };
+      events.push({ type: "key", key: directions[arrow[1]!]! });
+      index += arrow[0].length - 1;
+    } else if (rest === "\u001bO") {
+      return { events, remainder: rest };
     } else if (rest.startsWith("\u001b[5~")) {
       events.push({ type: "key", key: "pageup" });
       index += 3;
@@ -3850,13 +4007,18 @@ function decodeMouseButton(
   code: number,
   terminator: string | undefined,
 ): TuiMouseEvent["button"] | undefined {
-  if (!Number.isSafeInteger(code) || code < 0 || terminator !== "M") {
-    return undefined;
-  }
+  if (!Number.isSafeInteger(code) || code < 0 || code > 127) return undefined;
+  if (terminator === "m") return (code & 3) === 0 ? "left-up" : undefined;
+  if (terminator !== "M") return undefined;
   if ((code & 64) !== 0) {
-    return (code & 1) === 0 ? "wheel-up" : "wheel-down";
+    if ((code & 32) !== 0) return undefined;
+    const button = code & 3;
+    if (button === 2 || (button === 0 && (code & 4) !== 0)) return "wheel-left";
+    if (button === 3 || (button === 1 && (code & 4) !== 0)) return "wheel-right";
+    return button === 0 ? "wheel-up" : "wheel-down";
   }
-  return (code & 3) === 0 ? "left" : undefined;
+  if ((code & 3) !== 0) return undefined;
+  return (code & 32) !== 0 ? "left-drag" : "left";
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

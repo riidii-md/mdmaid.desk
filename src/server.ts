@@ -51,6 +51,7 @@ import {
 } from "./live-sources.js";
 import { WEB_STYLES } from "./web-styles.js";
 import { sanitizeTerminalText } from "./terminal-text.js";
+import { renderTerminalDocument } from "./terminal-layout.js";
 import {
   parseChangeReviewDiffs,
 } from "./change-review.js";
@@ -298,6 +299,7 @@ async function handleRequest(
           "document-feedback-v1",
           "live-buffer-previews-v1",
           "preview-scroll-v1",
+          "terminal-scroll-blocks-v1",
         ],
       },
     });
@@ -944,7 +946,12 @@ async function handleRequest(
       "unicode",
       true,
     );
-    const rendered = await renderMarkdownToTuiWithSourceMap(content, {
+    const overflow = url.searchParams.get("overflow");
+    if (overflow !== null && overflow !== "scroll") {
+      throw new HttpError(400, "invalid_overflow", "Unknown terminal overflow mode");
+    }
+    const renderer = overflow === "scroll" ? renderTerminalDocument : renderMarkdownToTuiWithSourceMap;
+    const rendered = await renderer(content, {
       backend: "beautiful-mermaid",
       color,
       unicode,
@@ -965,8 +972,9 @@ async function handleRequest(
         backend: rendered.backend,
         warnings: rendered.warnings.map((warning) => sanitizeTerminalText(warning)),
         sourceWitness,
-          ...(preview ? { preview: preview.info } : {}),
+        ...(preview ? { preview: preview.info } : {}),
         sourceMap: rendered.sourceMap,
+        ...("blocks" in rendered ? { blocks: rendered.blocks } : {}),
         ...(changeReview === undefined ? {} : { changeReview }),
       },
     });

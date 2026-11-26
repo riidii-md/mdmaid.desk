@@ -152,6 +152,20 @@ export type RenderTarget = "web" | "terminal";
 export interface TerminalRenderPreferences {
   color?: boolean;
   unicode?: boolean;
+  overflow?: "scroll";
+}
+
+export interface TerminalBlock {
+  kind: "flow" | "wide";
+  content: string;
+}
+
+export function isTerminalBlocks(value: unknown): value is TerminalBlock[] {
+  return Array.isArray(value) && value.length <= 65_536 && value.every(
+    (block: unknown) => typeof block === "object" && block !== null &&
+      "kind" in block && (block.kind === "flow" || block.kind === "wide") &&
+      "content" in block && typeof block.content === "string",
+  );
 }
 
 export interface WebRender {
@@ -173,6 +187,7 @@ export interface TerminalRender {
   warnings: string[];
   sourceWitness: string;
   sourceMap: MarkdownSourceMapV1;
+  blocks?: TerminalBlock[];
   changeReview?: ChangeReviewDiff;
 }
 
