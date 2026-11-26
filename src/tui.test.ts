@@ -5,17 +5,19 @@ import { stripVTControlCharacters } from "node:util";
 import test from "node:test";
 import stringWidth from "string-width";
 import { createMarkdownSourceMap } from "mdmaid";
+import { renderTerminalDocument } from "./terminal-layout.js";
 
 import type {
   CatalogEvent,
   CatalogSubscriptionOptions,
 } from "./api-client.js";
-import { DeskApiClient, DeskApiError } from "./api-client.js";
+import { DaemonHealthCompatibilityError, DeskApiClient, DeskApiError } from "./api-client.js";
 import type {
   PublicDocument,
   PublicFeedbackSubmission,
   PublicReviewRequest,
   PublicWorkspace,
+  TerminalBlock,
 } from "./api-types.js";
 import { documentStorageLabel } from "./api-types.js";
 import { parseChangeReviewDiffs } from "./change-review.js";
@@ -393,6 +395,111 @@ test("comments on a source row and submits feedback without a pending decision",
   assert.equal(effect.input.documentId, documents[1]!.id);
   assert.equal(effect.input.comments[0]?.anchor.kind, "markdown-selection-v1");
   assert.equal(effect.input.comments[0]?.message, "Clarify this");
+});
+
+test("fits phone terminals and keeps reading controls visible", () => {
+  const queue = createTuiState(documents, workspaces);
+  const reader = applyTuiReader(queue, documents[0]!, "Phone reader", "source", []);
+  for (const width of [20, 24, 32, 40, 60, 100]) {
+    for (const color of [false, true]) {
+      for (const state of [queue, reader]) {
+        const frame = renderTui(state, width, 24, { color });
+        assert.equal(frame.split("\n").length, 24);
+        for (const line of frame.split("\n")) {
+          assert.equal(stringWidth(line), width, `frame must fit ${width} columns`);
+        }
+      }
+    }
+  }
+  assert.match(renderTui(reader, 32, 24), /w wide/);
+  assert.match(renderTui(reader, 32, 24), /b queue/);
+  assert.match(renderTui(queue, 32, 24), /enter open/);
+});
+
+test("pans wide content without changing its geometry or scrolling the shell", () => {
+  let reader = applyTuiReader(
+    createTuiState(documents, workspaces), documents[0]!,
+    `\u001b[31m${"左".repeat(8)}${"-".repeat(48)}RIGHT EDGE\u001b[39m\nshort`,
+    "beautiful-mermaid", [],
+  );
+  reader = handleTuiKey(reader, "w").state;
+  for (let index = 0; index < 30; index += 1) {
+    reader = handleTuiKey(reader, "right").state;
+  }
+  const frame = renderTui(reader, 32, 24, { color: true });
+  assert.match(frame, /RIGHT EDGE/);
+  assert.match(frame, /h\/l/);
+  assert.match(frame, /Daemon plan/);
+  assert.match(frame, /\u001b\[31m/);
+  for (const line of frame.split("\n")) assert.equal(stringWidth(line), 32);
+
+  reader = handleTuiKey(reader, "0").state;
+  assert.match(renderTui(reader, 32, 24), /左左左左左左左左/);
+  reader = handleTuiKey(reader, "l").state;
+  assert.doesNotMatch(renderTui(reader, 32, 24), /左左左左左左左左/);
+  reader = handleTuiKey(reader, "h").state;
+  assert.match(renderTui(reader, 32, 24), /左左左左左左左左/);
+  reader = handleTuiKey(reader, "left").state;
+  assert.match(renderTui(reader, 32, 24), /左左左左左左左左/);
+
+  const fresh = applyTuiReader(reader, documents[1]!, "fresh", "source", []);
+  assert.match(renderTui(fresh, 32, 24), /fresh/);
+  assert.match(renderTui(fresh, 32, 24), /w wide/);
+});
+
+test("phone mouse targets match the visible compact controls", () => {
+  const queue = createTuiState(documents, workspaces);
+  assert.equal(handleTuiMouse(queue, {
+    button: "left", x: footerColumn(queue, 32, "/ search"), y: 27,
+  }, 32, 28).state.searching, true);
+  const reader = applyTuiReader(queue, documents[0]!, "content", "source", []);
+  const wide = handleTuiMouse(reader, {
+    button: "left", x: footerColumn(reader, 32, "w wide"), y: 27,
+  }, 32, 28);
+  assert.equal(wide.state.reader?.wide, true);
+  assert.deepEqual(wide.effects, [{ type: "rerender", documentId: documents[0]!.id }]);
+  assert.equal(handleTuiMouse(wide.state, {
+    button: "left", x: footerColumn(wide.state, 32, "b queue"), y: 27,
+  }, 32, 28).state.mode, "queue");
+});
+
+test("horizontal clipping preserves grapheme boundaries and terminal cell alignment", () => {
+  const reader = applyTuiReader(createTuiState(documents, workspaces), documents[0]!,
+    `\u001b[31m${"界".repeat(25)}\u001b[39m\n${"👩‍💻é".repeat(20)}`, "source", []);
+  const frame = renderTui({ ...reader, horizontalScroll: 1 }, 32, 24, { color: true });
+  const plain = stripVTControlCharacters(frame).split("\n");
+  assert.ok(plain[6]?.startsWith("│‹ 界"), "a clipped half of a wide character occupies a blank cell");
+  assert.ok(plain[7]?.startsWith("│‹ é👩‍💻"), "emoji and combining characters stay whole");
+  for (const line of frame.split("\n")) assert.equal(stringWidth(line), 32);
+});
+
+test("pans wide blocks by default while keeping surrounding prose fixed", async () => {
+  const result = await renderTerminalDocument([
+    "Prose stays at the left.", "", "```mermaid", "flowchart LR",
+    "A[First service] --> B[Last service]", "```", "", "After the diagram.",
+  ].join("\n"), { width: 30 });
+  let reader = applyTuiReader(createTuiState(documents, workspaces), documents[0]!,
+    result.output, result.backend, result.warnings, undefined, undefined, undefined, result.blocks);
+  const before = renderTui(reader, 32, 30);
+  assert.match(before, /h\/l pan/);
+  reader = handleTuiKey(reader, "right").state;
+  const after = renderTui(reader, 32, 30);
+  assert.match(after, /│Prose stays at the left\./);
+  assert.match(after, /│After the diagram\./);
+  assert.notEqual(after, before);
+  assert.equal(reader.reader?.wide, false, "no manual wide-view toggle is needed");
+});
+
+test("scrolling a large document does not parse or measure its content again", () => {
+  const content = Array.from({ length: 3000 }, (_, index) => `line ${index}: ${"text ".repeat(15)}`).join("\n");
+  let reader = applyTuiReader(createTuiState(documents, workspaces), documents[0]!, content, "source", []);
+  Object.defineProperty(reader.reader, "content", {
+    get: () => { throw new Error("document content was read again during scrolling"); },
+  });
+  for (let index = 0; index < 50; index++) {
+    reader = handleTuiKey(reader, "j").state;
+    assert.equal(renderTui(reader, 80, 30).split("\n").length, 30);
+  }
 });
 
 test("targets only new live-source revisions at the open TUI reader", () => {
@@ -980,7 +1087,7 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
 
   const markedRead = handleTuiMouse(
     reader,
-    { button: "left", x: 17, y: 23 },
+    { button: "left", x: footerColumn(reader, 100, "m read"), y: 23 },
     100,
     24,
   );
@@ -995,7 +1102,7 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
   );
   const archiveConfirmation = handleTuiMouse(
     queue,
-    { button: "left", x: 28, y: 27 },
+    { button: "left", x: footerColumn(queue, 128, "a archive"), y: 27 },
     128,
     28,
   );
@@ -1008,7 +1115,7 @@ test("supports mouse navigation, direct actions, wheel, and page scrolling", () 
     },
   ]);
   assert.equal(
-    handleTuiMouse(queue, { button: "left", x: 120, y: 27 }, 128, 28)
+    handleTuiMouse(queue, { button: "left", x: footerColumn(queue, 128, "/ search"), y: 27 }, 128, 28)
       .state.searching,
     true,
   );
@@ -1027,6 +1134,57 @@ test("switches Spaces fail-closed before requesting scoped reload", () => {
   assert.deepEqual(switched.effects, [{ type: "reload" }]);
   assert.match(renderTui(switched.state, 128, 28), /Work/);
 });
+
+test("drags the reader in both directions without activating controls", () => {
+  const original = applyTuiReader(createTuiState(documents, workspaces), documents[0]!,
+    Array.from({ length: 50 }, (_, index) => `line ${index}: ${"wide text ".repeat(24)}`).join("\n"), "source", []);
+  let reader = handleTuiMouse(original, { button: "left", x: 24, y: 15 }, 160, 24).state;
+  let dragged = handleTuiMouse(reader, { button: "left-drag", x: 19, y: 12 }, 160, 24);
+  assert.equal(dragged.state.scroll, 3);
+  assert.equal(dragged.state.horizontalScroll, 5);
+  assert.deepEqual(dragged.effects, []);
+  reader = handleTuiMouse(dragged.state, { button: "left-drag", x: 17, y: 10 }, 160, 24).state;
+  assert.equal(reader.scroll, 5);
+  assert.equal(reader.horizontalScroll, 7);
+  const released = handleTuiMouse(reader, { button: "left-up", x: footerColumn(reader, 160, "m read"), y: 23 }, 160, 24);
+  assert.deepEqual(released.effects, [], "releasing over the footer must not mark a document read");
+  dragged = handleTuiMouse(released.state, { button: "left-drag", x: 10, y: 8 }, 160, 24);
+  assert.equal(dragged.state.scroll, 5, "a released gesture cannot keep scrolling");
+  assert.equal(dragged.state.horizontalScroll, 7);
+  reader = handleTuiMouse(original, { button: "left", x: 24, y: 15 }, 160, 24).state;
+  const footer = handleTuiMouse(reader, { button: "left-drag", x: footerColumn(reader, 160, "m read"), y: 23 }, 160, 24);
+  assert.deepEqual(footer.effects, []);
+});
+
+test("horizontal wheel events pan wide blocks without moving the queue", () => {
+  const queue = createTuiState(documents, workspaces);
+  assert.equal(handleTuiMouse(queue, { button: "wheel-right", x: 10, y: 10 }, 80, 24).state, queue);
+  const reader = applyTuiReader(queue, documents[0]!, "long line ".repeat(30), "source", []);
+  const right = handleTuiMouse(reader, { button: "wheel-right", x: 10, y: 10 }, 80, 24).state;
+  assert.equal(right.horizontalScroll, 8);
+  assert.equal(right.scroll, 0);
+  const left = handleTuiMouse(right, { button: "wheel-left", x: 10, y: 10 }, 80, 24).state;
+  assert.equal(left.horizontalScroll, 0);
+});
+
+test("dragging prose does not pan a different wide block", () => {
+  const blocks: TerminalBlock[] = [{ kind: "flow", content: "Ordinary text." },
+    { kind: "wide", content: "wide block ".repeat(12) }];
+  const reader = applyTuiReader(createTuiState(documents, workspaces), documents[0]!,
+    blocks.map((block) => block.content).join("\n\n"), "source", [], undefined, undefined, undefined, blocks);
+  const prose = handleTuiMouse(reader, { button: "left", x: 20, y: 7 }, 32, 24).state;
+  const draggedProse = handleTuiMouse(prose, { button: "left-drag", x: 10, y: 7 }, 32, 24).state;
+  assert.equal(draggedProse.horizontalScroll, 0);
+  const wide = handleTuiMouse(reader, { button: "left", x: 20, y: 9 }, 32, 24).state;
+  assert.equal(handleTuiMouse(wide, { button: "left-drag", x: 10, y: 9 }, 32, 24).state.horizontalScroll, 10);
+});
+
+function footerColumn(state: ReturnType<typeof createTuiState>, width: number, label: string): number {
+  const footer = stripVTControlCharacters(renderTui(state, width, 28)).split("\n").at(-2)!;
+  const index = footer.indexOf(label);
+  assert.ok(index >= 0, `footer must show ${label}`);
+  return index + 1;
+}
 
 test("preserves selection and allows only safe document styling", () => {
   let state = createTuiState(documents, workspaces);
@@ -1150,6 +1308,21 @@ test("removes empty projects and clears their active TUI filter", () => {
   assert.deepEqual(refreshed.visibleDocuments, [documents[1]]);
 });
 
+test("requires scrollable-block support before opening a terminal session", async (t) => {
+  const requests: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    requests.push(String(url));
+    return new Response(JSON.stringify({ data: {
+      service: "mdmaid.desk", status: "ok", version: 1,
+      capabilities: ["spaces-v1", "scoped-content-v1"],
+    } }), { headers: { "content-type": "application/json" } });
+  });
+  const client = new DeskApiClient("http://127.0.0.1:12345", "test-token");
+  await assert.rejects(runTui(client), (error: unknown) =>
+    error instanceof DaemonHealthCompatibilityError && /terminal-scroll-blocks-v1.*restart/.test(error.message));
+  assert.equal(requests.length, 1, "an older daemon must be rejected before reading the queue");
+});
+
 test("runs the interactive TUI through render, events, actions, and clean exit", async () => {
   const input = new PassThrough();
   const output = new PassThrough();
@@ -1268,10 +1441,10 @@ test("runs the interactive TUI through render, events, actions, and clean exit",
   assert.match(terminal, /Rendered revision 2 by mdmaid/);
   assert.match(terminal, /\u001b\[\?1049h/);
   assert.match(terminal, /\u001b\[\?1049l/);
-  assert.match(terminal, /\u001b\[\?1000h\u001b\[\?1006h/);
-  assert.match(terminal, /\u001b\[\?1006l\u001b\[\?1000l/);
+  assert.match(terminal, /\u001b\[\?1000h\u001b\[\?1002h\u001b\[\?1006h\u001b\[\?1007h/);
+  assert.match(terminal, /\u001b\[\?1007l\u001b\[\?1006l\u001b\[\?1002l\u001b\[\?1000l/);
   assert.equal(terminal.match(/\u001b\[2J/g)?.length, 1);
-  assert.deepEqual(renderPreferences, { color: true, unicode: true });
+  assert.deepEqual(renderPreferences, { color: true, unicode: true, overflow: "scroll" });
 });
 
 test("discards a delayed TUI reload after switching to another Space", async () => {
@@ -1332,6 +1505,148 @@ test("discards a delayed TUI reload after switching to another Space", async () 
   assert.match(terminal, /All current/);
   assert.doesNotMatch(terminal, /Work stale/);
 });
+
+test("renders real tables and diagrams with horizontal scrolling enabled by default", async (t) => {
+  const markdown = [
+    "| Name | State | Details | Owner | Kind | Risk | Tests | Next |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| service | ready | Inspect the entire table | team | plan | low | pass | ship |", "",
+    "```mermaid", "flowchart LR", "A[First service] --> B[RIGHT EDGE]", "```",
+  ].join("\n");
+  const renders: Array<{ width: number; content: string }> = [];
+  const harness = await startPhoneTui(async (width) => {
+    const result = await renderTerminalDocument(markdown, { width, color: false });
+    renders.push({ width, content: result.output });
+    return { content: result.output, blocks: result.blocks };
+  });
+  t.after(harness.close);
+  harness.input.write("\r");
+  await eventually(() => harness.actions.length === 1);
+  assert.equal(renders[0]?.width, 30);
+  await eventually(() => harness.terminal().includes("h/l pan"));
+  assert.match(renders[0]!.content, /Inspect the entire table/);
+  assert.ok(renders[0]?.content.split("\n").some((line) => line.includes("First service") && line.includes("RIGHT EDGE")), "wide diagrams retain aligned nodes on the same row");
+  const beforePan = harness.terminal().length;
+  harness.input.write("\u001b");
+  harness.input.write("[C");
+  harness.input.write("l".repeat(3));
+  await eventually(() => harness.terminal().slice(beforePan).includes("RIGHT EDGE"));
+  assert.equal(renders.length, 1, "panning uses the existing rendering without a mode toggle");
+  harness.input.write("w");
+  await eventually(() => renders.length === 2);
+  assert.equal(renders[1]?.width, 1000);
+  harness.input.write("w");
+  await eventually(() => renders.length === 3);
+  assert.equal(renders[2]?.width, 30);
+  assert.equal(harness.actions.length, 1, "layout changes never mark a revision opened again");
+  const beforeEscape = harness.terminal().length;
+  harness.input.write("\u001b");
+  await eventually(() => harness.terminal().slice(beforeEscape).includes("INBOX"));
+});
+
+test("rerenders at the latest phone width and ignores a resize response after returning to the queue", async (t) => {
+  const widths: number[] = [];
+  const pending: { release?: (content: string) => void } = {};
+  const releaseRender = (content: string): void => { pending.release?.(content); };
+  const harness = await startPhoneTui(async (width) => {
+    widths.push(width);
+    if (width === 22) return new Promise<string>((resolve) => { pending.release = resolve; });
+    return `rendered at ${width}`;
+  });
+  t.after(async () => { releaseRender("cancelled"); await harness.close(); });
+  harness.input.write("\r");
+  await eventually(() => harness.actions.length === 1);
+  harness.output.columns = 24;
+  harness.output.emit("resize");
+  await eventually(() => pending.release !== undefined);
+  harness.output.columns = 40;
+  harness.output.emit("resize");
+  releaseRender("obsolete narrow rendering");
+  await eventually(() => widths.includes(38));
+  assert.doesNotMatch(harness.terminal(), /obsolete narrow rendering/);
+  assert.match(harness.terminal(), /rendered at 38/);
+
+  delete pending.release;
+  harness.output.columns = 24;
+  harness.output.emit("resize");
+  await eventually(() => pending.release !== undefined);
+  harness.input.write("b");
+  releaseRender("late reader must stay closed");
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  assert.doesNotMatch(harness.terminal(), /late reader must stay closed/);
+});
+
+test("accepts mobile drag events, application arrows, and horizontal wheels over SSH", async (t) => {
+  const harness = await startPhoneTui(async () => Array.from({ length: 50 }, (_, index) =>
+    `line ${index}: ${"wide text ".repeat(12)}`).join("\n"));
+  t.after(harness.close);
+  harness.input.write("\r");
+  await eventually(() => harness.actions.length === 1);
+  let position = harness.terminal().length;
+  harness.input.write("\u001bO");
+  harness.input.write("B");
+  await eventually(() => harness.terminal().slice(position).includes("2-16 / 50"));
+  position = harness.terminal().length;
+  harness.input.write("\u001b[1;2B");
+  await eventually(() => harness.terminal().slice(position).includes("3-17 / 50"));
+  position = harness.terminal().length;
+  harness.input.write("\u001bOA");
+  await eventually(() => harness.terminal().slice(position).includes("2-16 / 50"));
+  position = harness.terminal().length;
+  harness.input.write("\u001b[<0;20;15M\u001b[<32;18;");
+  harness.input.write("11M\u001b[<0;18;11m");
+  await eventually(() => harness.terminal().slice(position).includes("6-20 / 50"));
+  position = harness.terminal().length;
+  harness.input.write("\u001b[<67;18;11M");
+  await eventually(() => harness.terminal().slice(position).includes("h/l pan  11-"));
+  assert.equal(harness.actions.length, 1);
+});
+
+test("accepts legacy mouse scrolling from clients that do not send SGR events", async (t) => {
+  const harness = await startPhoneTui(async () => Array.from({ length: 50 }, (_, index) =>
+    `line ${index}: ${"wide text ".repeat(12)}`).join("\n"));
+  t.after(harness.close);
+  harness.input.write("\r");
+  await eventually(() => harness.actions.length === 1);
+  const mouse = (code: number, x: number, y: number): string =>
+    `\u001b[M${String.fromCharCode(code + 32, x + 32, y + 32)}`;
+  let position = harness.terminal().length;
+  const press = mouse(0, 20, 15);
+  harness.input.write(press.slice(0, 4));
+  harness.input.write(press.slice(4) + mouse(32, 18, 12) + mouse(3, 18, 12));
+  await eventually(() => harness.terminal().slice(position).includes("4-18 / 50"));
+  position = harness.terminal().length;
+  harness.input.write(mouse(65, 18, 12));
+  await eventually(() => harness.terminal().slice(position).includes("7-21 / 50"));
+  assert.equal(harness.actions.length, 1);
+});
+
+async function startPhoneTui(render: (width: number) => Promise<string | { content: string; blocks: TerminalBlock[] }>) {
+  const input = new PassThrough();
+  const output = Object.assign(new PassThrough(), { columns: 32, rows: 24, isTTY: true });
+  let terminal = "";
+  const actions: string[] = [];
+  output.on("data", (chunk: Buffer) => { terminal += chunk.toString(); });
+  let subscribed = false;
+  const client = {
+    listDocuments: async () => documents,
+    listWorkspaces: async () => workspaces,
+    listReviewRequests: async () => [],
+    renderDocument: async (_id: string, _target: string, width: number) => {
+      const result = await render(width);
+      return { document: documents[0]!, ...(typeof result === "string" ? { content: result } : result),
+        backend: "beautiful-mermaid", warnings: [] };
+    },
+    act: async (_id: string, action: string) => { actions.push(action); return documents[0]!; },
+    subscribeCatalog: async (_listener: unknown, options: CatalogSubscriptionOptions) => {
+      subscribed = true;
+      await new Promise<void>((resolve) => options.signal?.addEventListener("abort", () => resolve(), { once: true }));
+    },
+  } as unknown as DeskApiClient;
+  const running = runTui(client, { input: input as unknown as ReadStream, output: output as unknown as WriteStream, color: false });
+  await eventually(() => subscribed);
+  return { input, output, actions, terminal: () => terminal, close: async () => { input.write("q"); await running; } };
+}
 
 test("opens a safe missing-source reader when a source disappears during render", async () => {
   const input = new PassThrough();
@@ -1407,7 +1722,7 @@ async function eventually(predicate: () => boolean): Promise<void> {
     if (predicate()) {
       return;
     }
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
   assert.fail("condition was not reached");
 }

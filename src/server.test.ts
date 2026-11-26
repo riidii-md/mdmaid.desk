@@ -129,6 +129,7 @@ test("serves health publicly and protects catalog APIs", async () => {
           "document-feedback-v1",
           "live-buffer-previews-v1",
           "preview-scroll-v1",
+          "terminal-scroll-blocks-v1",
         ],
       },
     });
@@ -530,6 +531,17 @@ test("renders authorized Markdown for web and terminal targets", async () => {
       `/api/v1/documents/${value.document.id}/render?target=terminal&color=rainbow`,
     );
     assert.equal(invalidPreference.status, 400);
+    const scrolling = await authorized(value,
+      `/api/v1/documents/${value.document.id}/render?target=terminal&width=20&overflow=scroll`,
+    );
+    const scrollBody = await scrolling.json() as { data: { content: string; blocks: Array<{ kind: string; content: string }> } };
+    assert.equal(scrolling.status, 200);
+    assert.ok(scrollBody.data.blocks.some((block) => block.kind === "wide" && block.content.includes("Queue")));
+    assert.equal(scrollBody.data.content, scrollBody.data.blocks.map((block) => block.content).join("\n\n"));
+    const invalidOverflow = await authorized(value,
+      `/api/v1/documents/${value.document.id}/render?target=terminal&overflow=invalid`,
+    );
+    assert.equal(invalidOverflow.status, 400);
   } finally {
     await closeFixture(value);
   }

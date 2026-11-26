@@ -36,6 +36,7 @@ import type {
 import { isPreviewInfo, type PreviewInfo } from "./preview-sessions.js";
 import { isChangeReviewDiff } from "./change-review.js";
 import type { MermaidValidationReport } from "./mermaid-validation.js";
+import { isTerminalBlocks } from "./api-types.js";
 
 interface ErrorEnvelope {
   error: {
@@ -470,6 +471,7 @@ export class DeskApiClient {
       if (preferences.unicode !== undefined) {
         query.set("unicode", String(preferences.unicode));
       }
+      if (preferences.overflow !== undefined) query.set("overflow", preferences.overflow);
     }
     addScope(query, scope);
     const value = await this.#request(
@@ -921,6 +923,8 @@ function isTerminalRender(value: unknown): value is TerminalRender {
     /^witness-[a-f0-9]{64}$/.test(value.sourceWitness) &&
     isMarkdownSourceMap(value.sourceMap) &&
     (value.preview === undefined || isPreviewInfo(value.preview)) &&
+    (value.blocks === undefined || (isTerminalBlocks(value.blocks) &&
+      value.blocks.map((block) => block.content).join("\n\n") === value.content)) &&
     (value.changeReview === undefined || isChangeReviewDiff(value.changeReview)) &&
     isPublicDocument(value.document)
   );

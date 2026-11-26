@@ -389,6 +389,20 @@ node dist/cli.js tui
 The TUI reuses the running web daemon when available, so both clients share
 catalog invalidations and reading state. Keys are shown in its footer; the main flow
 uses `j`/`k`, `Enter`, `/`, `m`, `u`, `a`, `b`, and `q`.
+The layout follows the current terminal width, including narrow phone SSH
+sessions, and rerenders when the terminal is resized. Tables, diagrams, and
+code keep their width automatically; use `h`/`l` or the left/right arrow keys
+to pan across them, and `0` to return to the left edge. Ordinary paragraphs
+wrap to the screen and stay fixed while wide blocks move. Edge markers and
+a column range show where you are. The title and controls stay fixed.
+Press `w` to also view prose on a wide canvas, and again to restore fitted
+prose. Opening another document starts with fitted prose and scrollable blocks.
+The reader also accepts touch or trackpad gestures forwarded by the terminal:
+drag up/down to scroll, or left/right over a wide block to pan. Wheel gestures
+work in both directions. Gestures handled locally as text selection or terminal
+scrollback need to be switched to terminal input in the SSH app.
+After upgrading, restart an older running daemon with `mdmaid-desk daemon stop`
+and `mdmaid-desk daemon start` to enable the scrollable-block rendering API.
 The queue starts grouped by project; press `g` to cycle through project, tag,
 and one ordered-list view. Press `x` to cycle All and named Spaces.
 Pending review requests add `r` for the Actions view and `y`, `c`, or `x` for

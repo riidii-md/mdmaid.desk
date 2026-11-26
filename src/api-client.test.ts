@@ -138,6 +138,7 @@ test("uses the versioned daemon API for terminal client operations", async () =>
         "document-feedback-v1",
         "live-buffer-previews-v1",
         "preview-scroll-v1",
+        "terminal-scroll-blocks-v1",
       ],
     });
     assert.deepEqual(await client.listSpaces(), []);
@@ -207,6 +208,7 @@ test("uses the versioned daemon API for terminal client operations", async () =>
     const rendered = await client.renderDocument(document.id, "terminal", 78, {
       color: true,
       unicode: false,
+      overflow: "scroll",
     });
     assert.match(rendered.content, /Terminal plan/);
     assert.match(rendered.content, /\u001b\[[0-9;]*m/);
@@ -226,6 +228,7 @@ test("uses the versioned daemon API for terminal client operations", async () =>
       { items: [feedback] },
     );
     assert.deepEqual(await client.listReviewRequests(), []);
+    assert.ok(rendered.blocks?.some((block) => block.kind === "flow"));
     assert.equal((await client.act(document.id, "opened")).status, "reading");
     assert.equal((await client.act(document.id, "read")).status, "done");
 
