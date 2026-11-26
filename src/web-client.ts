@@ -3768,7 +3768,6 @@ async function boot(): Promise<void> {
     const sequence = ++renderSequence;
     readerReady = false;
     updateExportAvailability();
-    exportStatus.textContent = "";
     const selected = state.documents.find((item) => item.id === id);
     renderBrowserTitle();
     renderReaderMetadata(selected);
@@ -3937,6 +3936,7 @@ async function boot(): Promise<void> {
   }
 
   async function openDocument(id: string, pushHistory = true): Promise<void> {
+    exportStatus.textContent = "";
     if (state.selectedId !== id) {
       feedbackComments = [];
       feedbackHistory = [];

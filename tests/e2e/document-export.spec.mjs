@@ -162,15 +162,93 @@ test("finishes an HTML download when a live refresh arrives during preparation",
 });
 
 test("reports a missing picture without downloading or printing an incomplete document", async ({ page, desk }) => {
+  // Reader controls become available before /opened finishes. Hold that request
+  // so the initial live refresh arrives after the export has reported its error.
+  let releaseOpened;
+  const openedGate = new Promise((resolve) => { releaseOpened = resolve; });
+  await page.route("**/api/v1/documents/*/opened", async (route) => {
+    await openedGate;
+    await route.continue();
+  });
+  try {
+    await openDocument(page, desk);
+    await rm(desk.picture);
+    let downloads = 0;
+    page.on("download", () => downloads++);
+    await page.getByRole("button", { name: "download HTML" }).click();
+    await expect(page.locator("#export-status")).toContainText("unavailable");
+    const refreshed = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === `/api/v1/documents/${desk.document.id}/render`,
+    );
+    releaseOpened();
+    await refreshed;
+    await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
+    await expect(page.locator("#export-status")).toContainText("unavailable");
+    await expect(page.locator(".document-export")).toHaveCount(0);
+    expect(downloads).toBe(0);
+
+    await page.locator("#reader-back").click();
+    await expect(page.locator("#queue-panel")).toBeVisible();
+    await page.goBack();
+    await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
+    await expect(page.locator("#export-status")).toBeEmpty();
+  } finally {
+    releaseOpened();
+  }
+});
+
+test("keeps an export error after a live refresh deferred during preparation", async ({ page, context, desk }) => {
+  await context.addInitScript(() => {
+    window.catalogEvents = 0;
+    const NativeEventSource = window.EventSource;
+    window.EventSource = class extends NativeEventSource {
+      constructor(...args) {
+        super(...args);
+        this.addEventListener("catalog-invalidated", () => window.catalogEvents++);
+      }
+    };
+  });
   await openDocument(page, desk);
+  await expect(page.locator("#live-status")).toHaveText(/connected/);
   await rm(desk.picture);
-  let downloads = 0;
-  page.on("download", () => downloads++);
-  await page.getByRole("button", { name: "download HTML" }).click();
-  await expect(page.locator("#export-status")).toContainText("unavailable");
-  await expect(page.locator(".document-export")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
-  expect(downloads).toBe(0);
+  let releaseMedia;
+  const mediaGate = new Promise((resolve) => { releaseMedia = resolve; });
+  let mediaRequested;
+  const requested = new Promise((resolve) => { mediaRequested = resolve; });
+  await page.route("**/media/**", async (route) => {
+    mediaRequested();
+    await mediaGate;
+    await route.continue();
+  });
+  try {
+    let downloads = 0;
+    page.on("download", () => downloads++);
+    await page.getByRole("button", { name: "download HTML" }).click();
+    await requested;
+    const before = await page.evaluate(() => window.catalogEvents);
+    await writeFile(desk.path, `${await readFile(desk.path, "utf8")}\n\nUpdated while export failed.\n`);
+    const updated = await page.request.post(`${desk.server.url}/api/v1/documents`, {
+      headers: { authorization: `Bearer ${desk.server.token}` },
+      data: {
+        workspaceId: "test", path: desk.path, kind: "change-review", title,
+        attention: "review", tags: ["export-test"],
+      },
+    });
+    expect(updated.ok()).toBe(true);
+    await expect.poll(() => page.evaluate(() => window.catalogEvents)).toBeGreaterThan(before);
+    const refreshed = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === `/api/v1/documents/${desk.document.id}/render`,
+    );
+    releaseMedia();
+    await refreshed;
+    await expect(page.getByRole("button", { name: "download HTML" })).toBeEnabled();
+    await expect(page.locator("#reader-content")).toContainText("Updated while export failed.");
+    await expect(page.locator("#export-status")).toContainText("unavailable");
+    await expect(page.locator(".document-export")).toHaveCount(0);
+    expect(downloads).toBe(0);
+  } finally {
+    releaseMedia();
+  }
 });
 
 test("disables exports when the document source is missing", async ({ page, desk }) => {
